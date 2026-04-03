@@ -1,53 +1,103 @@
+use std::io::{self, Read, Write};
+
 // According to ClickHouse protocol spec.
 // It uses VarInt encoding (LEB-128)
 // The VarUint goes max cap of 9 bytes (9 * 7 data bit == 63-bits. We use 1 bit per each byte as continuation flag)
 // https://github.com/ClickHouse/ClickHouse/blob/master/src/IO/VarInt.h#L11
 static MAX_UVARINT_BYTES_LEN: u8 = 9;
-pub fn encode(mut x: u64) -> Vec<u8> {
-    let mut res: Vec<u8> = Vec::new();
-    while x != 0 {
-        let mut curr: u8 = 0;
-        let data = (x & 0x7F) as u8;
-        x >>= 7;
-        curr |= data;
-        if x != 0 {
-            curr |= 0x80;
+
+pub trait ProtoWrite: Write {
+    fn write_varuint(&mut self, mut x: u64) -> io::Result<()> {
+        loop {
+            let mut curr: u8 = 0;
+            let data = (x & 0x7F) as u8;
+            x >>= 7;
+            curr |= data;
+            if x != 0 {
+                curr |= 0x80;
+            }
+
+            self.write(&[curr])?;
+            if x == 0 {
+                break;
+            }
         }
-        res.push(curr);
+        Ok(())
     }
-    res
+
+    fn write_string(&self, s: &str) -> io::Result<()> {
+        unimplemented!();
+    }
 }
 
-pub fn decode(v: &[u8]) -> u64 {
-    let mut res: u64 = 0;
-    let mut shift = 0;
-    for x in v {
-        if x == &0u8 {
-            continue;
-        }
+impl<W: Write> ProtoWrite for W {}
 
-        let mut data = (x & 0x7F) as u64;
-        data <<= shift;
-        shift += 7;
-        res |= data;
+pub trait ProtoRead: Read {
+    fn read_varuint(&mut self) -> io::Result<u64> {
+        let mut res: u64 = 0;
+        let mut shift = 0;
+        let mut buf: Vec<u8> = vec![0; 1];
+
+        loop {
+            self.read_exact(&mut buf)?;
+
+            if buf.is_empty() {
+                break;
+            }
+
+            let x = buf[0];
+
+            let mut data = (x & 0x7F) as u64;
+            let cont_bit = (x & 0x80) as u8;
+            data <<= shift;
+            shift += 7;
+            res |= data;
+
+            if cont_bit == 0u8 {
+                break;
+            }
+        }
+        Ok(res)
     }
-    res
+
+    fn read_string(&self) -> io::Result<String> {
+        unimplemented!();
+    }
 }
+
+impl<R: Read> ProtoRead for R {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    /// Helper: encode a value into a Vec<u8> via ProtoWrite
+    fn encode(x: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_varuint(x).unwrap();
+        buf
+    }
+
+    /// Helper: decode from a byte slice via ProtoRead
+    fn decode(bytes: &[u8]) -> u64 {
+        let mut cursor = Cursor::new(bytes);
+        cursor.read_varuint().unwrap()
+    }
 
     #[test]
     fn test_zero() {
         let encoded = encode(0);
-        assert_eq!(encoded, vec![]);
-        assert_eq!(decode(&encoded), 0);
+        assert_eq!(
+            encoded,
+            vec![0],
+            "encoded should be zero bytes but {encoded:?}"
+        );
+        assert_eq!(decode(&encoded), 0,);
     }
 
     #[test]
     fn test_single_byte_values() {
-        // Values 1..=127 fit in 1 byte (7 data bits)
         for x in 1..=127u64 {
             let encoded = encode(x);
             assert_eq!(encoded.len(), 1, "value {x} should encode to 1 byte");
@@ -57,20 +107,16 @@ mod tests {
 
     #[test]
     fn test_two_byte_values() {
-        // Values 128..=16383 need 2 bytes (14 data bits)
         let cases = [128, 255, 256, 1000, 16383];
         for x in cases {
             let encoded = encode(x);
             assert_eq!(encoded.len(), 2, "value {x} should encode to 2 bytes");
-            println!("x{} {:?}", x, encoded);
             assert_eq!(decode(&encoded), x, "roundtrip failed for {x}");
         }
     }
 
     #[test]
     fn test_byte_boundaries() {
-        // Test values right at each byte-count boundary: 2^7, 2^14, ..., 2^63
-        // n bytes encodes up to (2^(7*n) - 1)
         for n in 1..=9u32 {
             let bits = 7 * n;
             let max_for_n = if bits >= 64 {
@@ -87,7 +133,6 @@ mod tests {
             );
             assert_eq!(decode(&encoded), max_for_n);
 
-            // One above the boundary needs n+1 bytes (except at 9 bytes which is the max)
             if n < 9 {
                 let one_above = max_for_n + 1;
                 let encoded = encode(one_above);
@@ -119,7 +164,6 @@ mod tests {
 
     #[test]
     fn test_known_encodings() {
-        // Verify actual byte sequences against LEB-128 spec
         assert_eq!(encode(1), vec![0x01]);
         assert_eq!(encode(127), vec![0x7F]);
         assert_eq!(encode(128), vec![0x80, 0x01]);
@@ -128,12 +172,27 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_ignores_trailing_bytes() {
-        // decode processes all bytes given — verify behavior with extra bytes
-        let mut bytes = encode(23);
-        let original_len = bytes.len();
-        bytes.push(0x00);
-        // Extra zero byte doesn't change value since data bits are 0
-        assert_eq!(decode(&bytes), 23);
+    fn test_sequential_writes_and_reads() {
+        let values: Vec<u64> = vec![0, 1, 127, 128, 16383, 16384, u64::MAX >> 1, u64::MAX];
+        let mut buf = Vec::new();
+        for &v in &values {
+            buf.write_varuint(v).unwrap();
+        }
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        for &expected in &values {
+            assert_eq!(cursor.read_varuint().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_read_consumes_only_varint_bytes() {
+        let mut buf = Vec::new();
+        buf.write_varuint(300).unwrap();
+        buf.write_varuint(42).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        assert_eq!(cursor.read_varuint().unwrap(), 300);
+        assert_eq!(cursor.read_varuint().unwrap(), 42);
     }
 }
