@@ -1,4 +1,7 @@
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    vec,
+};
 
 // According to ClickHouse protocol spec.
 // It uses VarInt encoding (LEB-128)
@@ -25,8 +28,49 @@ pub trait ProtoWrite: Write {
         Ok(())
     }
 
-    fn write_string(&self, s: &str) -> io::Result<()> {
-        unimplemented!();
+    fn write_string(&mut self, s: &str) -> io::Result<()> {
+        self.write_len(s.len())?;
+        let _ = self.write(s.as_bytes())?;
+        Ok(())
+    }
+
+    fn write_len(&mut self, x: usize) -> io::Result<()> {
+        self.write_varuint(x as u64)
+    }
+
+    fn write_u8(&mut self, x: u8) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_u16(&mut self, x: u16) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_u32(&mut self, x: u32) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_u64(&mut self, x: u64) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_i32(&mut self, x: i32) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_i64(&mut self, x: i64) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_bool(&mut self, x: bool) -> io::Result<()> {
+        let d = x as u8;
+        self.write_u8(d)
     }
 }
 
@@ -60,8 +104,66 @@ pub trait ProtoRead: Read {
         Ok(res)
     }
 
-    fn read_string(&self) -> io::Result<String> {
-        unimplemented!();
+    fn read_string(&mut self) -> io::Result<String> {
+        let l = self.read_len()?;
+        let mut buf: Vec<u8> = vec![0; l];
+
+        self.read_exact(&mut buf)?;
+
+        Ok(String::from_utf8(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?)
+    }
+
+    fn read_len(&mut self) -> io::Result<usize> {
+        let u = self.read_varuint()?;
+        Ok(u as usize)
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        let mut buf: Vec<u8> = vec![0; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_u16(&mut self) -> io::Result<u16> {
+        let mut buf: Vec<u8> = vec![0; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_le_bytes([buf[0], buf[1]]))
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let mut buf: Vec<u8> = vec![0; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        let mut buf: Vec<u8> = vec![0; 8];
+        self.read_exact(&mut buf)?;
+        Ok(u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]))
+    }
+
+    fn read_i32(&mut self) -> io::Result<i32> {
+        let mut buf: Vec<u8> = vec![0; 4];
+        self.read_exact(&mut buf)?;
+        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+    }
+
+    fn read_i64(&mut self) -> io::Result<i64> {
+        let mut buf: Vec<u8> = vec![0; 8];
+        self.read_exact(&mut buf)?;
+        Ok(i64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]))
+    }
+
+    fn read_bool(&mut self) -> io::Result<bool> {
+        let mut buf: Vec<u8> = vec![0; 1];
+        self.read_exact(&mut buf)?;
+        let b = buf[0] == 0u8;
+        Ok(b)
     }
 }
 
