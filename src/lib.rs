@@ -162,7 +162,7 @@ pub trait ProtoRead: Read {
     fn read_bool(&mut self) -> io::Result<bool> {
         let mut buf: Vec<u8> = vec![0; 1];
         self.read_exact(&mut buf)?;
-        let b = buf[0] == 0u8;
+        let b = buf[0] != 0u8;
         Ok(b)
     }
 }
@@ -296,5 +296,218 @@ mod tests {
         let mut cursor = Cursor::new(buf.as_slice());
         assert_eq!(cursor.read_varuint().unwrap(), 300);
         assert_eq!(cursor.read_varuint().unwrap(), 42);
+    }
+
+    // -- u8 --
+
+    #[test]
+    fn test_u8_roundtrip() {
+        for x in [0u8, 1, 127, 128, 255] {
+            let mut buf = Vec::new();
+            buf.write_u8(x).unwrap();
+            assert_eq!(buf.len(), 1);
+            assert_eq!(Cursor::new(buf.as_slice()).read_u8().unwrap(), x);
+        }
+    }
+
+    // -- u16 --
+
+    #[test]
+    fn test_u16_roundtrip() {
+        for x in [0u16, 1, 255, 256, 0x00FF, 0xFF00, u16::MAX] {
+            let mut buf = Vec::new();
+            buf.write_u16(x).unwrap();
+            assert_eq!(buf.len(), 2);
+            assert_eq!(Cursor::new(buf.as_slice()).read_u16().unwrap(), x);
+        }
+    }
+
+    #[test]
+    fn test_u16_little_endian() {
+        let mut buf = Vec::new();
+        buf.write_u16(0x0102).unwrap();
+        assert_eq!(buf, vec![0x02, 0x01]);
+    }
+
+    // -- u32 --
+
+    #[test]
+    fn test_u32_roundtrip() {
+        for x in [0u32, 1, 255, 256, 65535, 65536, u32::MAX] {
+            let mut buf = Vec::new();
+            buf.write_u32(x).unwrap();
+            assert_eq!(buf.len(), 4);
+            assert_eq!(Cursor::new(buf.as_slice()).read_u32().unwrap(), x);
+        }
+    }
+
+    #[test]
+    fn test_u32_little_endian() {
+        let mut buf = Vec::new();
+        buf.write_u32(0x01020304).unwrap();
+        assert_eq!(buf, vec![0x04, 0x03, 0x02, 0x01]);
+    }
+
+    // -- u64 --
+
+    #[test]
+    fn test_u64_roundtrip() {
+        for x in [0u64, 1, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            let mut buf = Vec::new();
+            buf.write_u64(x).unwrap();
+            assert_eq!(buf.len(), 8);
+            assert_eq!(Cursor::new(buf.as_slice()).read_u64().unwrap(), x);
+        }
+    }
+
+    #[test]
+    fn test_u64_little_endian() {
+        let mut buf = Vec::new();
+        buf.write_u64(0x0102030405060708).unwrap();
+        assert_eq!(buf, vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    // -- i32 --
+
+    #[test]
+    fn test_i32_roundtrip() {
+        for x in [0i32, 1, -1, i32::MIN, i32::MAX, 127, -128] {
+            let mut buf = Vec::new();
+            buf.write_i32(x).unwrap();
+            assert_eq!(buf.len(), 4);
+            assert_eq!(Cursor::new(buf.as_slice()).read_i32().unwrap(), x);
+        }
+    }
+
+    #[test]
+    fn test_i32_negative_little_endian() {
+        let mut buf = Vec::new();
+        buf.write_i32(-1).unwrap();
+        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    // -- i64 --
+
+    #[test]
+    fn test_i64_roundtrip() {
+        for x in [
+            0i64,
+            1,
+            -1,
+            i64::MIN,
+            i64::MAX,
+            i32::MIN as i64,
+            i32::MAX as i64,
+        ] {
+            let mut buf = Vec::new();
+            buf.write_i64(x).unwrap();
+            assert_eq!(buf.len(), 8);
+            assert_eq!(Cursor::new(buf.as_slice()).read_i64().unwrap(), x);
+        }
+    }
+
+    // -- bool --
+
+    #[test]
+    fn test_bool_roundtrip() {
+        let mut buf = Vec::new();
+        buf.write_bool(true).unwrap();
+        buf.write_bool(false).unwrap();
+        assert_eq!(buf.len(), 2);
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        assert_eq!(cursor.read_bool().unwrap(), true);
+        assert_eq!(cursor.read_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_bool_encoding() {
+        let mut buf = Vec::new();
+        buf.write_bool(true).unwrap();
+        assert_eq!(buf, vec![0x01]);
+
+        buf.clear();
+        buf.write_bool(false).unwrap();
+        assert_eq!(buf, vec![0x00]);
+    }
+
+    // -- string --
+
+    #[test]
+    fn test_string_roundtrip() {
+        let bindings = "a".repeat(1000);
+        let cases = ["", "hello", "clickhouse", bindings.as_str()];
+        for s in cases {
+            let mut buf = Vec::new();
+            buf.write_string(s).unwrap();
+            let mut cursor = Cursor::new(buf.as_slice());
+            assert_eq!(cursor.read_string().unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn test_string_utf8() {
+        let s = "日本語テスト";
+        let mut buf = Vec::new();
+        buf.write_string(s).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        assert_eq!(cursor.read_string().unwrap(), s);
+    }
+
+    #[test]
+    fn test_string_encoding_format() {
+        // String is length-prefixed: varuint(len) + raw bytes
+        let mut buf = Vec::new();
+        buf.write_string("abc").unwrap();
+        assert_eq!(buf[0], 3); // length prefix
+        assert_eq!(&buf[1..], b"abc");
+    }
+
+    #[test]
+    fn test_sequential_strings() {
+        let strings = vec!["hello", "world", "", "clickhouse"];
+        let mut buf = Vec::new();
+        for s in &strings {
+            buf.write_string(s).unwrap();
+        }
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        for s in &strings {
+            assert_eq!(cursor.read_string().unwrap(), *s);
+        }
+    }
+
+    #[test]
+    fn test_read_string_invalid_utf8() {
+        let mut buf = Vec::new();
+        buf.write_varuint(3).unwrap(); // length = 3
+        buf.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // invalid UTF-8
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let err = cursor.read_string().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // -- mixed types sequential --
+
+    #[test]
+    fn test_mixed_types_sequential() {
+        let mut buf = Vec::new();
+        buf.write_varuint(42).unwrap();
+        buf.write_string("hello").unwrap();
+        buf.write_u32(0xDEADBEEF).unwrap();
+        buf.write_bool(true).unwrap();
+        buf.write_i64(-999).unwrap();
+        buf.write_u8(0xFF).unwrap();
+        buf.write_u16(1234).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        assert_eq!(cursor.read_varuint().unwrap(), 42);
+        assert_eq!(cursor.read_string().unwrap(), "hello");
+        assert_eq!(cursor.read_u32().unwrap(), 0xDEADBEEF);
+        assert_eq!(cursor.read_bool().unwrap(), true);
+        assert_eq!(cursor.read_i64().unwrap(), -999);
+        assert_eq!(cursor.read_u8().unwrap(), 0xFF);
+        assert_eq!(cursor.read_u16().unwrap(), 1234);
     }
 }
