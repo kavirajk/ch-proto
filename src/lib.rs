@@ -1,3 +1,6 @@
+mod feature;
+mod packet;
+
 use std::{
     io::{self, Read, Write},
     vec,
