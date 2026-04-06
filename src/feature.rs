@@ -1,7 +1,9 @@
 pub struct Feature(u32);
 
 impl Feature {
-    pub const CLIENT_INFO: Feature = Feature(54032);
+    pub const TIMEZONE: Feature = Feature(54058);
+    pub const DISPLAY_NAME: Feature = Feature(54372);
+    pub const VERSION_PATCH: Feature = Feature(54401);
 }
 
 impl Feature {
