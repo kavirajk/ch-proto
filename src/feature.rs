@@ -10,4 +10,8 @@ impl Feature {
     pub fn in_version(self, version: u32) -> bool {
         version >= self.0
     }
+
+    pub fn version(self) -> u32 {
+        self.0
+    }
 }

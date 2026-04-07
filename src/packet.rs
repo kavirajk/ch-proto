@@ -1,3 +1,7 @@
+use std::io::{self, Error};
+
+use crate::{exception::ServerException, hello::ServerHello};
+
 pub enum ServerPacket {
     /// Name, version, revision.
     Hello = 0,
@@ -38,6 +42,42 @@ pub enum ServerPacket {
     TimezoneUpdate = 17,
     /// Return challenge for SSH signature signing
     SSHChallenge = 18,
+}
+
+impl TryFrom<u8> for ServerPacket {
+    type Error = io::Error;
+    fn try_from(value: u8) -> io::Result<Self> {
+        match value {
+            0 => Ok(ServerPacket::Hello),
+            1 => Ok(ServerPacket::Data),
+            2 => Ok(ServerPacket::Exception),
+            3 => Ok(ServerPacket::Progress),
+            4 => Ok(ServerPacket::Pong),
+            5 => Ok(ServerPacket::EndOfStream),
+            6 => Ok(ServerPacket::ProfileInfo),
+            7 => Ok(ServerPacket::Totals),
+            8 => Ok(ServerPacket::Extremes),
+            9 => Ok(ServerPacket::TablesStatusResponse),
+            10 => Ok(ServerPacket::Log),
+            11 => Ok(ServerPacket::TableColumns),
+            12 => Ok(ServerPacket::PartUUIDs),
+            13 => Ok(ServerPacket::ReadTaskRequest),
+            14 => Ok(ServerPacket::ProfileEvents),
+            15 => Ok(ServerPacket::MergeTreeAllRangesAnnouncement),
+            16 => Ok(ServerPacket::MergeTreeReadTaskRequest),
+            17 => Ok(ServerPacket::TimezoneUpdate),
+            18 => Ok(ServerPacket::SSHChallenge),
+            _ => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decoded unrecognized server response type {value}"),
+            )),
+        }
+    }
+}
+
+pub enum ServerResponse {
+    Hello(ServerHello),
+    Exception(ServerException),
 }
 
 pub enum ClientPacket {

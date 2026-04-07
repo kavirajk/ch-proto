@@ -9,3 +9,7 @@ criterion = "0.8.2"
 [[bench]]
 name = "varint"
 harness = false
+
+[[bench]]
+name = "hello"
+harness = false

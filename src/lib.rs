@@ -1,9 +1,6 @@
+pub mod connection;
+pub mod exception;
 mod feature;
-mod hello;
+pub mod hello;
 mod packet;
-mod proto;
-
-use std::{
-    io::{self, Read, Write},
-    vec,
-};
+pub mod proto;
