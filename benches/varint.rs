@@ -1,5 +1,5 @@
-use ch_proto::{ProtoRead, ProtoWrite};
-use criterion::{Criterion, criterion_group, criterion_main};
+use ch_proto::proto::{ProtoRead, ProtoWrite};
+use criterion::{criterion_group, criterion_main, Criterion};
 use std::io::Cursor;
 
 fn bench_write_varuint(c: &mut Criterion) {
@@ -113,43 +113,71 @@ fn bench_read_fixed(c: &mut Criterion) {
     let mut u8_buf = Vec::new();
     u8_buf.write_u8(0xFF).unwrap();
     group.bench_function("u8", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(u8_buf.as_slice())).read_u8().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(u8_buf.as_slice()))
+                .read_u8()
+                .unwrap()
+        })
     });
 
     let mut u16_buf = Vec::new();
     u16_buf.write_u16(0x1234).unwrap();
     group.bench_function("u16", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(u16_buf.as_slice())).read_u16().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(u16_buf.as_slice()))
+                .read_u16()
+                .unwrap()
+        })
     });
 
     let mut u32_buf = Vec::new();
     u32_buf.write_u32(0xDEADBEEF).unwrap();
     group.bench_function("u32", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(u32_buf.as_slice())).read_u32().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(u32_buf.as_slice()))
+                .read_u32()
+                .unwrap()
+        })
     });
 
     let mut u64_buf = Vec::new();
     u64_buf.write_u64(u64::MAX).unwrap();
     group.bench_function("u64", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(u64_buf.as_slice())).read_u64().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(u64_buf.as_slice()))
+                .read_u64()
+                .unwrap()
+        })
     });
 
     let mut i32_buf = Vec::new();
     i32_buf.write_i32(-1).unwrap();
     group.bench_function("i32", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(i32_buf.as_slice())).read_i32().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(i32_buf.as_slice()))
+                .read_i32()
+                .unwrap()
+        })
     });
 
     let mut i64_buf = Vec::new();
     i64_buf.write_i64(i64::MIN).unwrap();
     group.bench_function("i64", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(i64_buf.as_slice())).read_i64().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(i64_buf.as_slice()))
+                .read_i64()
+                .unwrap()
+        })
     });
 
     let mut bool_buf = Vec::new();
     bool_buf.write_bool(true).unwrap();
     group.bench_function("bool", |b| {
-        b.iter(|| Cursor::new(std::hint::black_box(bool_buf.as_slice())).read_bool().unwrap())
+        b.iter(|| {
+            Cursor::new(std::hint::black_box(bool_buf.as_slice()))
+                .read_bool()
+                .unwrap()
+        })
     });
 
     group.finish();
