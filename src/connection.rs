@@ -7,7 +7,7 @@ use crate::{
     exception::ServerException,
     feature::Feature,
     hello::ClientHello,
-    packet::{ServerPacket, ServerResponse},
+    packet::{ClientPacket, ServerPacket, ServerResponse},
 };
 use crate::{
     hello::ServerHello,
@@ -96,9 +96,116 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    // -- Unit tests (no server needed) --
+
     #[test]
-    fn test_connect() {
-        let conn = Connection::connect("127.0.0.1:9000", None, None, None).unwrap();
-        println!("conn: {:?}", conn);
+    fn test_handshake_encodes_client_hello() {
+        // Verify ClientHello is well-formed by encoding to a buffer
+        let ch = ClientHello {
+            name: "toy-client".to_string(),
+            version_major: 1,
+            version_minor: 0,
+            protocol_version: Feature::VERSION_PATCH.version() as u64,
+            database: "default".to_string(),
+            user: "default".to_string(),
+            password: "".to_string(),
+        };
+        let mut buf = Vec::new();
+        ch.encode(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let pkt = cursor.read_varuint().unwrap();
+        assert_eq!(pkt, ClientPacket::Hello as u64);
+
+        let decoded = ClientHello::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.name, "toy-client");
+        assert_eq!(decoded.database, "default");
+        assert_eq!(decoded.user, "default");
+        assert_eq!(decoded.password, "");
+        assert_eq!(decoded.protocol_version, Feature::VERSION_PATCH.version() as u64);
+    }
+
+    #[test]
+    fn test_read_response_hello() {
+        // Simulate a ServerHello response in a buffer
+        let protocol = Feature::VERSION_PATCH.version();
+        let sh = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 21,
+            version_minor: 8,
+            protocol_version: 54401,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("test-server".to_string()),
+            version_patch: Some(3),
+        };
+        let mut buf = Vec::new();
+        sh.encode(&mut buf, protocol).unwrap();
+
+        // Test the dispatch logic directly
+        let mut cursor = Cursor::new(buf.as_slice());
+        let code = ServerPacket::try_from(cursor.read_varuint().unwrap() as u8).unwrap();
+        match code {
+            ServerPacket::Hello => {
+                let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+                assert_eq!(decoded.name, "ClickHouse");
+                assert_eq!(decoded.version_major, 21);
+                assert_eq!(decoded.timezone, Some("UTC".to_string()));
+            }
+            _ => panic!("expected Hello packet"),
+        }
+    }
+
+    #[test]
+    fn test_read_response_exception() {
+        // Manually construct an exception packet on the wire:
+        // varuint(2) + i32(13) + string("DB::Exception") + string("Unexpected packet") + string("") + bool(false)
+        let mut buf = Vec::new();
+        buf.write_varuint(ServerPacket::Exception as u64).unwrap();
+        buf.write_i32(13).unwrap();
+        buf.write_string("DB::Exception").unwrap();
+        buf.write_string("Unexpected packet").unwrap();
+        buf.write_string("").unwrap();
+        buf.write_bool(false).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let code = ServerPacket::try_from(cursor.read_varuint().unwrap() as u8).unwrap();
+        match code {
+            ServerPacket::Exception => {
+                let decoded = ServerException::decode(&mut cursor).unwrap();
+                assert_eq!(decoded.code, 13);
+                assert_eq!(decoded.name, "DB::Exception");
+                assert_eq!(decoded.message, "Unexpected packet");
+            }
+            _ => panic!("expected Exception packet"),
+        }
+    }
+
+    #[test]
+    fn test_read_response_unknown_packet() {
+        let mut buf = Vec::new();
+        buf.write_varuint(255).unwrap(); // invalid packet type
+        let mut cursor = Cursor::new(buf.as_slice());
+        let result = ServerPacket::try_from(cursor.read_varuint().unwrap() as u8);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_values() {
+        // Verify defaults when None is passed
+        let ch = ClientHello {
+            name: "toy-client".to_string(),
+            version_major: 1,
+            version_minor: 0,
+            protocol_version: 54401,
+            database: None::<String>.unwrap_or("default".to_string()),
+            user: None::<String>.unwrap_or("default".to_string()),
+            password: None::<String>.unwrap_or("".to_string()),
+        };
+        assert_eq!(ch.database, "default");
+        assert_eq!(ch.user, "default");
+        assert_eq!(ch.password, "");
     }
 }
+

@@ -1,4 +1,5 @@
 use ch_proto::{
+    exception::ServerException,
     hello::{ClientHello, ServerHello},
     proto::{ProtoRead, ProtoWrite},
 };
@@ -115,5 +116,113 @@ fn bench_server_hello(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_client_hello, bench_server_hello);
+fn make_exception() -> ServerException {
+    ServerException {
+        code: 13,
+        name: "DB::Exception".to_string(),
+        message: "Unexpected packet from client (no user in Hello package)".to_string(),
+        stack_trace: "0. DB::Exception::Exception()\n1. DB::TCPHandler::runImpl()".to_string(),
+        nested: false,
+    }
+}
+
+fn make_exception_short() -> ServerException {
+    ServerException {
+        code: 0,
+        name: "E".to_string(),
+        message: "err".to_string(),
+        stack_trace: "".to_string(),
+        nested: false,
+    }
+}
+
+fn bench_exception(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exception");
+    let mut exc = make_exception();
+
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(256);
+            exc.encode(std::hint::black_box(&mut buf)).unwrap();
+            buf
+        })
+    });
+
+    let mut encoded = Vec::new();
+    exc.encode(&mut encoded).unwrap();
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(&encoded[1..]));
+            ServerException::decode(&mut cursor).unwrap()
+        })
+    });
+
+    group.bench_function("roundtrip", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(256);
+            exc.encode(std::hint::black_box(&mut buf)).unwrap();
+            let mut cursor = Cursor::new(&buf[1..]);
+            ServerException::decode(&mut cursor).unwrap()
+        })
+    });
+
+    let mut short_exc = make_exception_short();
+    let mut short_encoded = Vec::new();
+    short_exc.encode(&mut short_encoded).unwrap();
+    group.bench_function("decode_short", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(&short_encoded[1..]));
+            ServerException::decode(&mut cursor).unwrap()
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_packet_dispatch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("packet_dispatch");
+
+    // ServerHello packet
+    let hello = make_server_hello();
+    let protocol = 54460u32;
+    let mut hello_buf = Vec::new();
+    hello.encode(&mut hello_buf, protocol).unwrap();
+
+    group.bench_function("dispatch_hello", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(hello_buf.as_slice()));
+            let pkt_type = cursor.read_varuint().unwrap() as u8;
+            match pkt_type {
+                0 => ServerHello::decode(&mut cursor, protocol).unwrap(),
+                _ => panic!(),
+            }
+        })
+    });
+
+    // Exception packet
+    let mut exc = make_exception();
+    let mut exc_buf = Vec::new();
+    exc.encode(&mut exc_buf).unwrap();
+
+    group.bench_function("dispatch_exception", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(exc_buf.as_slice()));
+            let pkt_type = cursor.read_varuint().unwrap() as u8;
+            match pkt_type {
+                2 => ServerException::decode(&mut cursor).unwrap(),
+                _ => panic!(),
+            }
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_client_hello,
+    bench_server_hello,
+    bench_exception,
+    bench_packet_dispatch,
+);
 criterion_main!(benches);
