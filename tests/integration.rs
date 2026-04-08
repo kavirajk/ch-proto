@@ -7,9 +7,8 @@ const ADDR: &str = "127.0.0.1:9000";
 
 /// Ensure ClickHouse is reachable before running tests that depend on it.
 fn require_server() {
-    Connection::connect(ADDR, None, None, None).expect(
-        "ClickHouse server not running at 127.0.0.1:9000 — start it with `make up`",
-    );
+    Connection::connect(ADDR, None, None, None)
+        .expect("ClickHouse server not running at 127.0.0.1:9000 — start it with `make up`");
 }
 
 #[test]
@@ -64,4 +63,42 @@ fn test_multiple_connections() {
     let conn2 = Connection::connect(ADDR, None, None, None).unwrap();
     println!("conn1: {conn1:?}");
     println!("conn2: {conn2:?}");
+}
+
+#[test]
+fn test_ping() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    conn.ping().unwrap();
+}
+
+#[test]
+fn test_ping_multiple() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    for _ in 0..10 {
+        conn.ping().unwrap();
+    }
+}
+
+#[test]
+fn test_ping_after_reconnect() {
+    require_server();
+    let mut conn1 = Connection::connect(ADDR, None, None, None).unwrap();
+    conn1.ping().unwrap();
+    drop(conn1);
+
+    let mut conn2 = Connection::connect(ADDR, None, None, None).unwrap();
+    conn2.ping().unwrap();
+}
+
+#[test]
+fn test_ping_multiple_connections() {
+    require_server();
+    let mut conn1 = Connection::connect(ADDR, None, None, None).unwrap();
+    let mut conn2 = Connection::connect(ADDR, None, None, None).unwrap();
+    conn1.ping().unwrap();
+    conn2.ping().unwrap();
+    conn1.ping().unwrap();
+    conn2.ping().unwrap();
 }

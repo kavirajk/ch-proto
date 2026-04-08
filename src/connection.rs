@@ -37,7 +37,7 @@ impl Connection {
             database: database.map(String::from),
             user: user.map(String::from),
             password: password.map(String::from),
-            protocol: Feature::VERSION_PATCH.version() as u64,
+            protocol: Feature::ADDENDUM.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)
@@ -62,16 +62,42 @@ impl Connection {
                 self.protocol = u64::min(ch.protocol_version, sh.protocol_version);
 
                 // send final ammendum message. Just an empty string (ClickHouse call it quota_key)
-                self.inner.write_string("")?;
+                if Feature::ADDENDUM.in_version(self.protocol as u32) {
+                    self.inner.write_string("")?;
+                    self.inner.flush()?;
+                }
+
                 Ok(())
             }
             ServerResponse::Exception(e) => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 format!("exception occurred {e:?}"),
             )),
+            _ => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                "expected ServerHello response but got unexpeced response",
+            )),
         }
 
         // Ok(())
+    }
+
+    pub fn ping(&mut self) -> Result<()> {
+        // according to the spec just send varuint(4) and expect varuint(4)
+        // src/Client/Connection.cpp
+        self.inner.write_varuint(ClientPacket::Ping as u64)?;
+        self.inner.flush()?;
+        match self.read_response()? {
+            ServerResponse::Pong => Ok(()),
+            ServerResponse::Exception(e) => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                format!("exception occurred {e:?}"),
+            )),
+            _ => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                "expected ServerHello response but got unexpeced response",
+            )),
+        }
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
@@ -85,6 +111,7 @@ impl Connection {
             ServerPacket::Exception => Ok(ServerResponse::Exception(ServerException::decode(
                 &mut self.inner,
             )?)),
+            ServerPacket::Pong => Ok(ServerResponse::Pong),
             _ => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 "unhandled server packet type (yet) {code}",
@@ -124,7 +151,10 @@ mod tests {
         assert_eq!(decoded.database, "default");
         assert_eq!(decoded.user, "default");
         assert_eq!(decoded.password, "");
-        assert_eq!(decoded.protocol_version, Feature::VERSION_PATCH.version() as u64);
+        assert_eq!(
+            decoded.protocol_version,
+            Feature::VERSION_PATCH.version() as u64
+        );
     }
 
     #[test]
@@ -207,5 +237,34 @@ mod tests {
         assert_eq!(ch.user, "default");
         assert_eq!(ch.password, "");
     }
-}
 
+    #[test]
+    fn test_ping_packet_wire_format() {
+        let mut buf = Vec::new();
+        buf.write_varuint(ClientPacket::Ping as u64).unwrap();
+        // Ping is just a single varuint byte with value 4
+        assert_eq!(buf, vec![0x04]);
+    }
+
+    #[test]
+    fn test_pong_packet_dispatch() {
+        let mut buf = Vec::new();
+        buf.write_varuint(ServerPacket::Pong as u64).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let code = ServerPacket::try_from(cursor.read_varuint().unwrap() as u8).unwrap();
+        match code {
+            ServerPacket::Pong => {} // expected
+            _ => panic!("expected Pong packet"),
+        }
+    }
+
+    #[test]
+    fn test_pong_is_payload_less() {
+        // Pong is just the packet type byte — no payload
+        let mut buf = Vec::new();
+        buf.write_varuint(ServerPacket::Pong as u64).unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], 0x04);
+    }
+}

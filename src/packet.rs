@@ -78,6 +78,7 @@ impl TryFrom<u8> for ServerPacket {
 pub enum ServerResponse {
     Hello(ServerHello),
     Exception(ServerException),
+    Pong,
 }
 
 pub enum ClientPacket {

@@ -85,10 +85,6 @@ pub trait ProtoRead: Read {
         loop {
             self.read_exact(&mut buf)?;
 
-            if buf.is_empty() {
-                break;
-            }
-
             let x = buf[0];
 
             let mut data = (x & 0x7F) as u64;

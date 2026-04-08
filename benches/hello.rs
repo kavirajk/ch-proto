@@ -215,6 +215,55 @@ fn bench_packet_dispatch(c: &mut Criterion) {
         })
     });
 
+    // Pong packet
+    let mut pong_buf = Vec::new();
+    pong_buf.write_varuint(4).unwrap(); // ServerPacket::Pong
+    group.bench_function("dispatch_pong", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(pong_buf.as_slice()));
+            let pkt_type = cursor.read_varuint().unwrap() as u8;
+            assert_eq!(pkt_type, 4);
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_ping(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ping");
+
+    // Encode ping packet
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            let mut buf = Vec::with_capacity(1);
+            buf.write_varuint(std::hint::black_box(4u64)).unwrap();
+            buf
+        })
+    });
+
+    // Decode pong packet
+    let mut pong_buf = Vec::new();
+    pong_buf.write_varuint(4).unwrap();
+    group.bench_function("decode_pong", |b| {
+        b.iter(|| {
+            let mut cursor = Cursor::new(std::hint::black_box(pong_buf.as_slice()));
+            cursor.read_varuint().unwrap()
+        })
+    });
+
+    // Full ping/pong roundtrip (encode ping + decode pong, no network)
+    group.bench_function("roundtrip_wire", |b| {
+        b.iter(|| {
+            let mut ping_buf = Vec::with_capacity(1);
+            ping_buf.write_varuint(std::hint::black_box(4u64)).unwrap();
+
+            let mut pong_buf = Vec::with_capacity(1);
+            pong_buf.write_varuint(4u64).unwrap();
+            let mut cursor = Cursor::new(pong_buf.as_slice());
+            cursor.read_varuint().unwrap()
+        })
+    });
+
     group.finish();
 }
 
@@ -224,5 +273,6 @@ criterion_group!(
     bench_server_hello,
     bench_exception,
     bench_packet_dispatch,
+    bench_ping,
 );
 criterion_main!(benches);

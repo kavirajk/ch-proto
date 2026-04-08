@@ -4,6 +4,7 @@ impl Feature {
     pub const TIMEZONE: Feature = Feature(54058);
     pub const DISPLAY_NAME: Feature = Feature(54372);
     pub const VERSION_PATCH: Feature = Feature(54401);
+    pub const ADDENDUM: Feature = Feature(54458);
 }
 
 impl Feature {
