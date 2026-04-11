@@ -2,15 +2,16 @@ use std::io::Result;
 
 use crate::{client_info::ClientInfo, feature::Feature, packet::ClientPacket, proto::ProtoWrite};
 
+// Fields are ordered to match wire encoding order.
 pub struct Query {
     query_id: String,
-    body: String,
-    cluster_secret: String,
-    client_info: ClientInfo,
+    client_info: ClientInfo,        // feature-gated: WRITE_CLIENT_INFO
+    settings: Vec<Setting>,         // feature-gated: SETTINGS_SERIALIZED_AS_STRINGS
+    cluster_secret: String,         // feature-gated: INTERSERVER_SECRET
     stage: Stage,
-    settings: Vec<Setting>,
-    params: Vec<Param>,
-    Compression: bool,
+    compression: bool,
+    body: String,
+    params: Vec<Param>,             // feature-gated: PARAMETERS
 
     protocol_version: u64,
 }
@@ -35,7 +36,7 @@ impl Query {
         }
 
         w.write_varuint(self.stage as u64)?;
-        w.write_varuint(self.Compression as u64)?;
+        w.write_varuint(self.compression as u64)?;
         w.write_string(&self.body)?;
 
         if Feature::PARAMETERS.in_version(self.protocol_version as u32) {
