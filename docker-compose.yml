@@ -7,7 +7,7 @@ services:
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: 1
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
       interval: 1s
       timeout: 1s
       retries: 30

@@ -42,16 +42,15 @@ impl ClientHello {
     }
 }
 
+// Fields are ordered to match wire encoding order.
 pub struct ServerHello {
     pub name: String,
     pub version_major: u64,
     pub version_minor: u64,
     pub protocol_version: u64,
-
-    // following things are optional depending on protocol version
-    pub timezone: Option<String>,
-    pub display_name: Option<String>,
-    pub version_patch: Option<u64>,
+    pub timezone: Option<String>,     // feature-gated: TIMEZONE
+    pub display_name: Option<String>, // feature-gated: DISPLAY_NAME
+    pub version_patch: Option<u64>,   // feature-gated: VERSION_PATCH
 }
 
 impl ServerHello {

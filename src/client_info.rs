@@ -30,14 +30,14 @@ pub struct ClientInfo {
     version_minor: u64,
     protocol_version: u64,
 
-    quota_key: String,             // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
-    distributed_depth: i32,        // feature-gated: DISTRIBUTED_DEPTH
-    version_patch: u64,            // feature-gated: VERSION_PATCH (TCP only)
+    quota_key: String,      // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
+    distributed_depth: i32, // feature-gated: DISTRIBUTED_DEPTH
+    version_patch: u64,     // feature-gated: VERSION_PATCH (TCP only)
     // Skip tracing for now        // feature-gated: OPEN_TELEMETRY
     // span: SpanContext,
-    collaborate_with_initiator: bool,           // feature-gated: PARALLEL_REPLICAS
+    collaborate_with_initiator: bool, // feature-gated: PARALLEL_REPLICAS
     obsolete_count_participating_replicas: u64, // feature-gated: PARALLEL_REPLICAS
-    count_current_replicas: u64,                // feature-gated: PARALLEL_REPLICAS
+    count_current_replicas: u64,      // feature-gated: PARALLEL_REPLICAS
 }
 
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
@@ -65,9 +65,9 @@ impl TryFrom<u8> for QueryKind {
 }
 
 impl ClientInfo {
-    pub fn decode(r: &mut impl ProtoRead) -> Result<ClientInfo> {
-        Ok(())
-    }
+    // pub fn decode(r: &mut impl ProtoRead) -> Result<ClientInfo> {
+    //     Ok(())
+    // }
     pub fn encode(&mut self, w: &mut impl ProtoWrite) -> Result<()> {
         w.write_u8(self.query_kind as u8)?;
         if self.query_kind == QueryKind::NoQuery {
