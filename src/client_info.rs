@@ -12,36 +12,36 @@ static QUERY_INTERFACE_TCP: u8 = 1;
 // query specific information.
 // Fields are ordered to match wire encoding order.
 pub struct ClientInfo {
-    query_kind: QueryKind,
+    pub query_kind: QueryKind,
 
-    initial_user: String,
-    initial_query_id: String,
-    initial_address: String,
-    initial_time: Option<i64>, // feature-gated: INITIAL_QUERY_START_TIME
+    pub initial_user: String,
+    pub initial_query_id: String,
+    pub initial_address: String,
+    pub initial_time: Option<i64>, // feature-gated: INITIAL_QUERY_START_TIME
 
     // we will always use query_interface value 1 (TCP)
     // there are other enums. but we don't bother
-    query_interface: u8,
+    pub query_interface: u8,
 
-    os_user: String,
-    client_hostname: String,
-    client_name: String,
-    version_major: u64,
-    version_minor: u64,
-    protocol_version: u64,
+    pub os_user: String,
+    pub client_hostname: String,
+    pub client_name: String,
+    pub version_major: u64,
+    pub version_minor: u64,
+    pub protocol_version: u64,
 
-    quota_key: Option<String>, // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
-    distributed_depth: Option<i32>, // feature-gated: DISTRIBUTED_DEPTH
-    version_patch: Option<u64>, // feature-gated: VERSION_PATCH (TCP only)
+    pub quota_key: Option<String>, // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
+    pub distributed_depth: Option<i32>, // feature-gated: DISTRIBUTED_DEPTH
+    pub version_patch: Option<u64>, // feature-gated: VERSION_PATCH (TCP only)
 
     // Skip tracing for now        // feature-gated: OPEN_TELEMETRY
     // span: SpanContext,
-    collaborate_with_initiator: Option<bool>, // feature-gated: PARALLEL_REPLICAS
-    obsolete_count_participating_replicas: Option<u64>, // feature-gated: PARALLEL_REPLICAS
-    count_current_replicas: Option<u64>,      // feature-gated: PARALLEL_REPLICAS
+    pub collaborate_with_initiator: Option<bool>, // feature-gated: PARALLEL_REPLICAS
+    pub obsolete_count_participating_replicas: Option<u64>, // feature-gated: PARALLEL_REPLICAS
+    pub count_current_replicas: Option<u64>,      // feature-gated: PARALLEL_REPLICAS
 }
 
-#[derive(Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum QueryKind {
     /// Uninitialized object.
     NoQuery = 0,
@@ -254,5 +254,194 @@ impl ClientInfo {
         // skip FEATURE::QUERY_AND_LINE_NUMBER and Feature::JWT
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    const PROTOCOL_ALL_FEATURES: u32 = 54460;
+    const PROTOCOL_MINIMAL: u32 = 54058;
+
+    fn make_client_info_full() -> ClientInfo {
+        ClientInfo {
+            query_kind: QueryKind::InitialQuery,
+            initial_user: "default".to_string(),
+            initial_query_id: "query-123".to_string(),
+            initial_address: "127.0.0.1:9000".to_string(),
+            initial_time: Some(1234567890),
+            query_interface: QUERY_INTERFACE_TCP,
+            os_user: "kavi".to_string(),
+            client_hostname: "localhost".to_string(),
+            client_name: "toy-client".to_string(),
+            version_major: 1,
+            version_minor: 0,
+            protocol_version: PROTOCOL_ALL_FEATURES as u64,
+            quota_key: Some("".to_string()),
+            distributed_depth: Some(0),
+            version_patch: Some(3),
+            collaborate_with_initiator: Some(false),
+            obsolete_count_participating_replicas: Some(0),
+            count_current_replicas: Some(0),
+        }
+    }
+
+    fn make_client_info_minimal() -> ClientInfo {
+        ClientInfo {
+            query_kind: QueryKind::InitialQuery,
+            initial_user: "default".to_string(),
+            initial_query_id: "q-1".to_string(),
+            initial_address: "".to_string(),
+            initial_time: None,
+            query_interface: QUERY_INTERFACE_TCP,
+            os_user: "user".to_string(),
+            client_hostname: "host".to_string(),
+            client_name: "client".to_string(),
+            version_major: 1,
+            version_minor: 0,
+            protocol_version: PROTOCOL_MINIMAL as u64,
+            quota_key: None,
+            distributed_depth: None,
+            version_patch: None,
+            collaborate_with_initiator: None,
+            obsolete_count_participating_replicas: None,
+            count_current_replicas: None,
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_all_features() {
+        let ci = make_client_info_full();
+        let mut buf = Vec::new();
+        ci.encode(&mut buf, PROTOCOL_ALL_FEATURES).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = ClientInfo::decode(&mut cursor, PROTOCOL_ALL_FEATURES).unwrap();
+
+        assert_eq!(decoded.query_kind, QueryKind::InitialQuery);
+        assert_eq!(decoded.initial_user, "default");
+        assert_eq!(decoded.initial_query_id, "query-123");
+        assert_eq!(decoded.initial_address, "127.0.0.1:9000");
+        assert_eq!(decoded.initial_time, Some(1234567890));
+        assert_eq!(decoded.query_interface, QUERY_INTERFACE_TCP);
+        assert_eq!(decoded.os_user, "kavi");
+        assert_eq!(decoded.client_hostname, "localhost");
+        assert_eq!(decoded.client_name, "toy-client");
+        assert_eq!(decoded.version_major, 1);
+        assert_eq!(decoded.version_minor, 0);
+        assert_eq!(decoded.quota_key, Some("".to_string()));
+        assert_eq!(decoded.distributed_depth, Some(0));
+        assert_eq!(decoded.version_patch, Some(3));
+        assert_eq!(decoded.collaborate_with_initiator, Some(false));
+        assert_eq!(decoded.obsolete_count_participating_replicas, Some(0));
+        assert_eq!(decoded.count_current_replicas, Some(0));
+    }
+
+    #[test]
+    fn test_roundtrip_minimal_protocol() {
+        let ci = make_client_info_minimal();
+        let mut buf = Vec::new();
+        ci.encode(&mut buf, PROTOCOL_MINIMAL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = ClientInfo::decode(&mut cursor, PROTOCOL_MINIMAL).unwrap();
+
+        assert_eq!(decoded.query_kind, QueryKind::InitialQuery);
+        assert_eq!(decoded.initial_user, "default");
+        assert_eq!(decoded.initial_time, None);
+        assert_eq!(decoded.quota_key, None);
+        assert_eq!(decoded.distributed_depth, None);
+        assert_eq!(decoded.version_patch, None);
+        assert_eq!(decoded.collaborate_with_initiator, None);
+    }
+
+    #[test]
+    fn test_wire_size_varies_with_protocol() {
+        let ci_full = make_client_info_full();
+        let ci_min = make_client_info_minimal();
+
+        let mut buf_full = Vec::new();
+        ci_full.encode(&mut buf_full, PROTOCOL_ALL_FEATURES).unwrap();
+
+        let mut buf_min = Vec::new();
+        ci_min.encode(&mut buf_min, PROTOCOL_MINIMAL).unwrap();
+
+        assert!(buf_full.len() > buf_min.len());
+    }
+
+    #[test]
+    fn test_no_query_encodes_only_kind() {
+        let ci = ClientInfo {
+            query_kind: QueryKind::NoQuery,
+            initial_user: "".to_string(),
+            initial_query_id: "".to_string(),
+            initial_address: "".to_string(),
+            initial_time: None,
+            query_interface: QUERY_INTERFACE_TCP,
+            os_user: "".to_string(),
+            client_hostname: "".to_string(),
+            client_name: "".to_string(),
+            version_major: 0,
+            version_minor: 0,
+            protocol_version: 0,
+            quota_key: None,
+            distributed_depth: None,
+            version_patch: None,
+            collaborate_with_initiator: None,
+            obsolete_count_participating_replicas: None,
+            count_current_replicas: None,
+        };
+        let mut buf = Vec::new();
+        ci.encode(&mut buf, PROTOCOL_ALL_FEATURES).unwrap();
+        // NoQuery should write only the query_kind byte
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], 0);
+    }
+
+    #[test]
+    fn test_query_kind_roundtrip() {
+        for (val, expected) in [(0u8, QueryKind::NoQuery), (1, QueryKind::InitialQuery), (2, QueryKind::SecondaryQuery)] {
+            let qk = QueryKind::try_from(val).unwrap();
+            assert_eq!(qk, expected);
+        }
+    }
+
+    #[test]
+    fn test_query_kind_invalid() {
+        let result = QueryKind::try_from(99u8);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_telemetry_skip_no_trace() {
+        // Encode with OTEL feature, no trace (just 0 byte)
+        let ci = make_client_info_full();
+        let mut buf = Vec::new();
+        ci.encode(&mut buf, PROTOCOL_ALL_FEATURES).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = ClientInfo::decode(&mut cursor, PROTOCOL_ALL_FEATURES).unwrap();
+        // Should decode successfully — OTEL section consumed correctly
+        assert_eq!(decoded.initial_user, "default");
+    }
+
+    #[test]
+    fn test_unicode_fields() {
+        let mut ci = make_client_info_full();
+        ci.initial_user = "пользователь".to_string();
+        ci.client_name = "клиент".to_string();
+        ci.os_user = "用户".to_string();
+
+        let mut buf = Vec::new();
+        ci.encode(&mut buf, PROTOCOL_ALL_FEATURES).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = ClientInfo::decode(&mut cursor, PROTOCOL_ALL_FEATURES).unwrap();
+
+        assert_eq!(decoded.initial_user, "пользователь");
+        assert_eq!(decoded.client_name, "клиент");
+        assert_eq!(decoded.os_user, "用户");
     }
 }
