@@ -1,6 +1,11 @@
-use std::io::Result;
+use std::io::{self, Error, ErrorKind, Result};
 
-use crate::{client_info::ClientInfo, feature::Feature, packet::ClientPacket, proto::ProtoWrite};
+use crate::{
+    client_info::ClientInfo,
+    feature::Feature,
+    packet::ClientPacket,
+    proto::{ProtoRead, ProtoWrite},
+};
 
 // Fields are ordered to match wire encoding order.
 pub struct Query {
@@ -17,21 +22,86 @@ pub struct Query {
 }
 
 impl Query {
-    fn encode(&mut self, w: &mut impl ProtoWrite) -> Result<()> {
-        w.write_varuint(ClientPacket::Query as u64)?;
-        w.write_string(&self.query_id)?;
-        if Feature::WRITE_CLIENT_INFO.in_version(self.protocol_version as u32) {
-            self.client_info.encode(w, self.protocol_version as u32)?;
+    pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> Result<Query> {
+        let query_id = r.read_string()?;
+
+        let client_info = if Feature::WRITE_CLIENT_INFO.in_version(protocol) {
+            ClientInfo::decode(r, protocol)?
+        } else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("protocol {protocol} too old: WRITE_CLIENT_INFO required"),
+            ));
+        };
+
+        // Settings: read until empty key
+        let mut settings = Vec::new();
+        if Feature::SETTINGS_SERIALIZED_AS_STRINGS.in_version(protocol) {
+            loop {
+                let s = Setting::decode(r)?;
+                if s.key.is_empty() {
+                    break;
+                }
+                settings.push(s);
+            }
+        } else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("protocol {protocol} too old: SETTINGS_SERIALIZED_AS_STRINGS required"),
+            ));
         }
 
-        if Feature::SETTINGS_SERIALIZED_AS_STRINGS.in_version(self.protocol_version as u32) {
-            for s in &mut self.settings {
+        let cluster_secret = if Feature::INTERSERVER_SECRET.in_version(protocol) {
+            r.read_string()?
+        } else {
+            String::new()
+        };
+
+        let stage = Stage::try_from(r.read_varuint()?)?;
+        let compression = r.read_varuint()? != 0;
+        let body = r.read_string()?;
+
+        let mut params = Vec::new();
+        if Feature::PARAMETERS.in_version(protocol) {
+            loop {
+                let p = Param::decode(r)?;
+                if p.key.is_empty() {
+                    break;
+                }
+                params.push(p);
+            }
+        }
+
+        Ok(Query {
+            query_id,
+            client_info,
+            settings,
+            cluster_secret,
+            stage,
+            compression,
+            body,
+            params,
+            protocol_version: protocol as u64,
+        })
+    }
+
+    pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
+        let protocol = self.protocol_version as u32;
+
+        w.write_varuint(ClientPacket::Query as u64)?;
+        w.write_string(&self.query_id)?;
+        if Feature::WRITE_CLIENT_INFO.in_version(protocol) {
+            self.client_info.encode(w, protocol)?;
+        }
+
+        if Feature::SETTINGS_SERIALIZED_AS_STRINGS.in_version(protocol) {
+            for s in &self.settings {
                 s.encode(w)?;
             }
         }
         w.write_string("")?; // empty string denotes end of settings
 
-        if Feature::INTERSERVER_SECRET.in_version(self.protocol_version as u32) {
+        if Feature::INTERSERVER_SECRET.in_version(protocol) {
             w.write_string(&self.cluster_secret)?;
         }
 
@@ -39,8 +109,8 @@ impl Query {
         w.write_varuint(self.compression as u64)?;
         w.write_string(&self.body)?;
 
-        if Feature::PARAMETERS.in_version(self.protocol_version as u32) {
-            for p in &mut self.params {
+        if Feature::PARAMETERS.in_version(protocol) {
+            for p in &self.params {
                 p.encode(w)?;
             }
             w.write_string("")?; // empty string marks end of params
@@ -66,7 +136,7 @@ pub struct Setting {
 }
 
 impl Setting {
-    fn encode(&mut self, w: &mut impl ProtoWrite) -> Result<()> {
+    pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
         w.write_string(&self.key)?;
         let mut flags: u64 = 0;
         if self.important {
@@ -83,6 +153,20 @@ impl Setting {
 
         Ok(())
     }
+
+    pub fn decode(r: &mut impl ProtoRead) -> Result<Setting> {
+        let key = r.read_string()?;
+        let flags = r.read_varuint()?;
+        let value = r.read_string()?;
+
+        Ok(Setting {
+            key,
+            value,
+            important: flags & SettingsFlag::Important as u64 != 0,
+            custom: flags & SettingsFlag::Custom as u64 != 0,
+            obsolete: flags & SettingsFlag::Obsolete as u64 != 0,
+        })
+    }
 }
 
 pub struct Param {
@@ -91,19 +175,27 @@ pub struct Param {
 }
 
 impl Param {
-    fn encode(&mut self, w: &mut impl ProtoWrite) -> Result<()> {
-        let mut set = Setting {
+    pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
+        Setting {
             key: self.key.clone(),
             value: self.value.clone(),
             custom: true,
             obsolete: false,
             important: false,
-        };
-        set.encode(w)
+        }
+        .encode(w)
+    }
+
+    pub fn decode(r: &mut impl ProtoRead) -> Result<Param> {
+        let s = Setting::decode(r)?;
+        Ok(Param {
+            key: s.key,
+            value: s.value,
+        })
     }
 }
 
-// State tells till what stage query has to be executed?
+// Stage tells till what stage query has to be executed?
 #[derive(Copy, Clone)]
 pub enum Stage {
     // Server just returns the columns (schema)
@@ -112,4 +204,19 @@ pub enum Stage {
     WithMergeableState = 1,
     // Normal for client. Server completes the whole query and return the results
     Complete = 2,
+}
+
+impl TryFrom<u64> for Stage {
+    type Error = io::Error;
+    fn try_from(value: u64) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Stage::FetchColumns),
+            1 => Ok(Stage::WithMergeableState),
+            2 => Ok(Stage::Complete),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("received invalid Stage {value}"),
+            )),
+        }
+    }
 }
