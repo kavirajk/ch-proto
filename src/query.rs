@@ -5,13 +5,13 @@ use crate::{client_info::ClientInfo, feature::Feature, packet::ClientPacket, pro
 // Fields are ordered to match wire encoding order.
 pub struct Query {
     query_id: String,
-    client_info: ClientInfo,        // feature-gated: WRITE_CLIENT_INFO
-    settings: Vec<Setting>,         // feature-gated: SETTINGS_SERIALIZED_AS_STRINGS
-    cluster_secret: String,         // feature-gated: INTERSERVER_SECRET
+    client_info: ClientInfo, // feature-gated: WRITE_CLIENT_INFO
+    settings: Vec<Setting>,  // feature-gated: SETTINGS_SERIALIZED_AS_STRINGS
+    cluster_secret: String,  // feature-gated: INTERSERVER_SECRET
     stage: Stage,
     compression: bool,
     body: String,
-    params: Vec<Param>,             // feature-gated: PARAMETERS
+    params: Vec<Param>, // feature-gated: PARAMETERS
 
     protocol_version: u64,
 }
@@ -21,7 +21,7 @@ impl Query {
         w.write_varuint(ClientPacket::Query as u64)?;
         w.write_string(&self.query_id)?;
         if Feature::WRITE_CLIENT_INFO.in_version(self.protocol_version as u32) {
-            self.client_info.encode(w)?;
+            self.client_info.encode(w, self.protocol_version as u32)?;
         }
 
         if Feature::SETTINGS_SERIALIZED_AS_STRINGS.in_version(self.protocol_version as u32) {
