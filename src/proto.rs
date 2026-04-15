@@ -80,7 +80,7 @@ pub trait ProtoRead: Read {
     fn read_varuint(&mut self) -> io::Result<u64> {
         let mut res: u64 = 0;
         let mut shift = 0;
-        let mut buf: Vec<u8> = vec![0; 1];
+        let mut buf = [0; 1];
 
         loop {
             self.read_exact(&mut buf)?;
@@ -116,25 +116,25 @@ pub trait ProtoRead: Read {
     }
 
     fn read_u8(&mut self) -> io::Result<u8> {
-        let mut buf: Vec<u8> = vec![0; 1];
+        let mut buf = [0; 1];
         self.read_exact(&mut buf)?;
         Ok(buf[0])
     }
 
     fn read_u16(&mut self) -> io::Result<u16> {
-        let mut buf: Vec<u8> = vec![0; 2];
+        let mut buf = [0; 2];
         self.read_exact(&mut buf)?;
         Ok(u16::from_le_bytes([buf[0], buf[1]]))
     }
 
     fn read_u32(&mut self) -> io::Result<u32> {
-        let mut buf: Vec<u8> = vec![0; 4];
+        let mut buf = [0; 4];
         self.read_exact(&mut buf)?;
         Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
     fn read_u64(&mut self) -> io::Result<u64> {
-        let mut buf: Vec<u8> = vec![0; 8];
+        let mut buf = [0; 8];
         self.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -142,13 +142,13 @@ pub trait ProtoRead: Read {
     }
 
     fn read_i32(&mut self) -> io::Result<i32> {
-        let mut buf: Vec<u8> = vec![0; 4];
+        let mut buf = [0; 4];
         self.read_exact(&mut buf)?;
         Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
     fn read_i64(&mut self) -> io::Result<i64> {
-        let mut buf: Vec<u8> = vec![0; 8];
+        let mut buf = [0; 8];
         self.read_exact(&mut buf)?;
         Ok(i64::from_le_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
@@ -156,7 +156,7 @@ pub trait ProtoRead: Read {
     }
 
     fn read_bool(&mut self) -> io::Result<bool> {
-        let mut buf: Vec<u8> = vec![0; 1];
+        let mut buf = [0; 1];
         self.read_exact(&mut buf)?;
         let b = buf[0] != 0u8;
         Ok(b)
