@@ -1,6 +1,7 @@
 pub struct Feature(u32);
 
 impl Feature {
+    pub const BLOCK_INFO: Feature = Feature(51903);
     pub const TIMEZONE: Feature = Feature(54058);
     pub const QUOTA_KEY_IN_CLIENT_INFO: Feature = Feature(54060);
     pub const DISPLAY_NAME: Feature = Feature(54372);

@@ -100,6 +100,10 @@ impl Connection {
         }
     }
 
+    // pub fn query<T>(&mut self) -> Result<T> {
+    //
+    // }
+
     fn read_response(&mut self) -> Result<ServerResponse> {
         let code = ServerPacket::try_from(self.inner.read_varuint()? as u8)?;
 

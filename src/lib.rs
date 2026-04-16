@@ -1,6 +1,9 @@
+pub mod block;
 pub mod client_info;
+pub mod column;
 pub mod connection;
 pub mod exception;
+pub mod external_table;
 mod feature;
 pub mod hello;
 mod packet;
