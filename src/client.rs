@@ -3,15 +3,13 @@ use std::{
     net::TcpStream,
 };
 
-use crate::{
+use crate::proto::{
+    block::Block,
     exception::ServerException,
     feature::Feature,
-    hello::ClientHello,
+    hello::{ClientHello, ServerHello},
     packet::{ClientPacket, ServerPacket, ServerResponse},
-};
-use crate::{
-    hello::ServerHello,
-    proto::{ProtoRead, ProtoWrite},
+    wire::{ProtoRead, ProtoWrite},
 };
 
 #[derive(Debug)]
@@ -100,9 +98,9 @@ impl Connection {
         }
     }
 
-    // pub fn query<T>(&mut self) -> Result<T> {
-    //
-    // }
+    pub fn query(&mut self) -> Result<Block> {
+        todo!()
+    }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
         let code = ServerPacket::try_from(self.inner.read_varuint()? as u8)?;

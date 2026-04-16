@@ -1,6 +1,6 @@
 use std::io::{Error, ErrorKind, Result};
 
-use crate::{column::Column, feature::Feature, proto::ProtoWrite};
+use super::{column::Column, feature::Feature, wire::ProtoWrite};
 
 // Block is the unit of data processing in ClickHouse.
 // It is group of some number of columns.

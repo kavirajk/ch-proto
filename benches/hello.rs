@@ -1,7 +1,7 @@
-use ch_proto::{
+use ch_proto::proto::{
     exception::ServerException,
     hello::{ClientHello, ServerHello},
-    proto::{ProtoRead, ProtoWrite},
+    wire::{ProtoRead, ProtoWrite},
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::io::Cursor;

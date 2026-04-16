@@ -1,7 +1,7 @@
-use ch_proto::{
+use ch_proto::proto::{
     client_info::{ClientInfo, QueryKind},
-    proto::{ProtoRead, ProtoWrite},
     query::{Param, Query, Setting, Stage},
+    wire::{ProtoRead, ProtoWrite},
 };
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::io::Cursor;

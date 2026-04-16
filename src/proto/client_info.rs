@@ -1,9 +1,8 @@
 use std::io::{self, Error, ErrorKind, Result};
 
-use crate::{
+use super::{
     feature::Feature,
-    proto::{self, ProtoRead, ProtoWrite},
-    query::Query,
+    wire::{ProtoRead, ProtoWrite},
 };
 
 static QUERY_INTERFACE_TCP: u8 = 1;

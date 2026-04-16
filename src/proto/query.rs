@@ -1,10 +1,10 @@
 use std::io::{self, Error, ErrorKind, Result};
 
-use crate::{
+use super::{
     client_info::ClientInfo,
     feature::Feature,
     packet::ClientPacket,
-    proto::{ProtoRead, ProtoWrite},
+    wire::{ProtoRead, ProtoWrite},
 };
 
 // Fields are ordered to match wire encoding order.
@@ -235,7 +235,7 @@ impl TryFrom<u64> for Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_info::{ClientInfo, QueryKind};
+    use crate::proto::client_info::{ClientInfo, QueryKind};
     use std::io::Cursor;
 
     const PROTOCOL: u32 = 54460;

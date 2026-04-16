@@ -1,8 +1,8 @@
 use std::io::Result;
 
-use crate::{
+use super::{
     packet::ServerPacket,
-    proto::{ProtoRead, ProtoWrite},
+    wire::{ProtoRead, ProtoWrite},
 };
 
 #[derive(Debug)]

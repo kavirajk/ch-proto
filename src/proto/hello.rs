@@ -1,7 +1,7 @@
-use crate::{
+use super::{
     feature::Feature,
     packet::{ClientPacket, ServerPacket},
-    proto::{ProtoRead, ProtoWrite},
+    wire::{ProtoRead, ProtoWrite},
 };
 
 use std::io::{self};

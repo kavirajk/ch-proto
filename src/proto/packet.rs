@@ -1,6 +1,6 @@
 use std::io::{self, Error};
 
-use crate::{exception::ServerException, hello::ServerHello};
+use super::{exception::ServerException, hello::ServerHello};
 
 pub enum ServerPacket {
     /// Name, version, revision.

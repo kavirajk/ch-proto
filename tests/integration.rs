@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use ch_proto::connection::Connection;
+use ch_proto::client::Connection;
 use std::io;
 
 const ADDR: &str = "127.0.0.1:9000";

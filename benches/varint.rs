@@ -1,4 +1,4 @@
-use ch_proto::proto::{ProtoRead, ProtoWrite};
+use ch_proto::proto::wire::{ProtoRead, ProtoWrite};
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::io::Cursor;
 

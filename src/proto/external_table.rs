@@ -1,6 +1,6 @@
 use std::io::Result;
 
-use crate::{block::Block, proto::ProtoWrite};
+use super::{block::Block, wire::ProtoWrite};
 
 // ExternalTable is a additional data that is sent from Client -> Server only for read-only queries
 // (SELECT)
