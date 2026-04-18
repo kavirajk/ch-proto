@@ -356,7 +356,7 @@ Not a standalone packet. Encoded inline as part of the Query message.
 | 2 | initial_user               | String  | universal    | always                             | User who initiated the query |
 | 3 | initial_query_id           | String  | universal    | always                             | Original query ID |
 | 4 | initial_address            | String  | universal    | always                             | Originating client socket address in `host:port` format. See §10.1. |
-| 5 | initial_time               | VarUInt | client       | INITIAL_QUERY_START_TIME (v54449)  | Query start time (microseconds) |
+| 5 | initial_time               | Int64   | client       | INITIAL_QUERY_START_TIME (v54449)  | Query start time (microseconds). Fixed-width 8 bytes, not VarUInt. See §10.2. |
 | 6 | query_interface            | UInt8   | universal    | always                             | 1=TCP, 2=HTTP |
 | 7 | os_user                    | String  | client       | if interface=TCP                   | OS username |
 | 8 | client_hostname            | String  | client       | if interface=TCP                   | Client machine hostname |
@@ -447,28 +447,29 @@ Compare to row-oriented protocols (MySQL, PostgreSQL): every row must be encoded
 **Direction:** Client -> Server or Server -> Client
 **Packet type:** `2` (client → server, `ClientPacket::Data`) or `1` (server → client, `ServerPacket::Data`)
 
-The wire format differs slightly between directions:
+The wire format is **symmetric** — both directions include a `table_name` prefix:
 
 **Client → Server** (used for INSERT data and external tables):
 ```
 [VarUInt: 2]                     packet type (ClientPacket::Data)
-[String: table_name]             external table name ("" for INSERT data)
+[String: table_name]             external table name ("" for INSERT data / end marker)
 [Block body]                     see below
 ```
 
 **Server → Client** (used for result blocks):
 ```
 [VarUInt: 1]                     packet type (ServerPacket::Data)
+[String: table_name]             almost always "" for query results
 [Block body]                     see below
 ```
 
-The client → server direction carries an extra `table_name` prefix. The server → client direction does not — result blocks have no table name.
+The `table_name` is present in **both** directions. On server → client, it is effectively always empty. See §10.4.
 
-#### table_name (client → server only)
+#### table_name
 
 | Field      | Type   | Role      | Condition               | Description |
 |------------|--------|-----------|-------------------------|-------------|
-| table_name | String | universal | TEMP_TABLES (v50264)    | External table name. Empty = end-of-data marker. |
+| table_name | String | universal | TEMP_TABLES (v50264)    | External table name. Client: empty = end-of-data marker. Server: always empty for query results. |
 
 #### BlockInfo
 
@@ -515,23 +516,23 @@ An empty block signals "end of data." It is used in two contexts:
 1. **Client -> Server:** As the empty ExternalTable to mark end of client data after a Query packet.
 2. **Server -> Client:** As the final block before EndOfStream (some server versions).
 
-An empty block has `num_columns=0` and `num_rows=0` with no column entries. The full wire encoding of an empty block (with BLOCK_INFO active) is:
+An empty block has `num_columns=0` and `num_rows=0` with no column entries. The full wire encoding of an empty Data packet (with BLOCK_INFO active), including the packet type and table_name, is:
 
 ```
-ClientData header (client -> server only):
-  [VarUInt: 0]                     table_name = "" (empty)
+[VarUInt: packet_type]              2 (client→server) or 1 (server→client)
+[VarUInt: 0]                        table_name = "" (empty)
 
 BlockInfo:
-  [VarUInt: 1] [UInt8: 0x00]      is_overflows = false
+  [VarUInt: 1] [UInt8: 0x00]       is_overflows = false
   [VarUInt: 2] [Int32: FF FF FF FF] bucket_number = -1
-  [VarUInt: 0]                     end of BlockInfo
+  [VarUInt: 0]                      end of BlockInfo
 
 Block body:
-  [VarUInt: 0]                     num_columns = 0
-  [VarUInt: 0]                     num_rows = 0
+  [VarUInt: 0]                      num_columns = 0
+  [VarUInt: 0]                      num_rows = 0
 ```
 
-Total: approximately 10 bytes. No column data follows.
+Total: 12 bytes. No column data follows.
 
 ---
 
@@ -616,5 +617,51 @@ in file "base/poco/Net/src/SocketAddress.cpp", line 350
 **Cause:** The server parses `initial_address` via Poco's `SocketAddress::init()`, which fails an assertion if the string is empty.
 
 **Fix:** Always send a valid `host:port` string, e.g., `"127.0.0.1:0"`. Port `0` is fine — the server uses this only for logging, not for actual connections.
+
+---
+
+### 10.2 `ClientInfo.initial_time` is Int64, not VarUInt
+
+**Symptom:** Server hangs or rejects Query with:
+```
+DB::Exception: Cannot read all data. Bytes read: 54. Bytes expected: 108.
+(CANNOT_READ_ALL_DATA)
+```
+
+**Cause:** `initial_time` is written as a **fixed-width Int64 (8 bytes, little-endian)** on the server side (`writeBinary(initial_query_start_time_microseconds, out)` in `ClientInfo.cpp`). Encoding it as VarUInt underruns the server's expected byte count by 7 bytes (VarUInt encodes `0` in 1 byte vs. 8 bytes for Int64).
+
+**Fix:** Use `write_i64` / `read_i64` for `initial_time`. Don't confuse this with other numeric fields in ClientInfo (`version_major`, `version_minor`, `protocol_version`, `distributed_depth`, etc.) which **are** VarUInt.
+
+**General rule:** Within ClientInfo specifically, timestamps are fixed-width; everything else numeric is VarUInt. Check the C++ server's `ClientInfo.cpp` for the authoritative encoding of each field.
+
+---
+
+### 10.3 `BlockInfo.bucket_number` default is `-1`, not `0`
+
+**Symptom:** Server misinterprets normal result blocks as belonging to aggregation bucket `0`, leading to incorrect distributed query behavior.
+
+**Cause:** `0` is a valid bucket number (first bucket in a two-level GROUP BY aggregation). The "no bucket" sentinel is `-1`.
+
+**Fix:** Default-construct `BlockInfo` with `bucket_number = -1`. Only set it to a non-negative value when actually emitting bucketed aggregation blocks (inter-server use only; external clients should always send `-1`).
+
+---
+
+### 10.4 Server → Client Data packet also carries `table_name`
+
+**Symptom:** Client hangs on read after query, or decodes garbage for column names/types.
+
+**Cause:** The Data packet wire format is **symmetric** — both directions include an empty `String` (table name) before the Block. The server's `sendData()` in `TCPHandler.cpp` writes `writeStringBinary("", *out)` after the packet type and before the Block payload. An earlier version of this spec incorrectly claimed only client→server had this prefix.
+
+**Fix:** When reading a `ServerPacket::Data`, read a string first (the table name, almost always empty for query results) before calling `Block::decode`. See section 6.11 for the corrected wire diagram.
+
+---
+
+### 10.5 Packet type codes are VarUInt, not u8
+
+**Symptom:** Works in testing (all current packet type codes are < 128, where VarUInt and u8 produce identical bytes), but future packet types ≥ 128 would silently break compatibility.
+
+**Cause:** Every ClickHouse C++ send/receive path uses `writeVarUInt(Protocol::...)` / `readVarUInt(...)` for packet type codes, not fixed-byte writes.
+
+**Fix:** Always use VarUInt encoding for packet type codes on both client and server sides. See section 6.0.
 
 ---
