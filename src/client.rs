@@ -173,6 +173,7 @@ impl Connection {
                 &mut self.inner,
             )?)),
             ServerPacket::Pong => Ok(ServerResponse::Pong),
+            // ServerPacket::Data => Ok(ServerResponse::Data(proto::block::Block))
             _ => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 "unhandled server packet type (yet) {code}",
