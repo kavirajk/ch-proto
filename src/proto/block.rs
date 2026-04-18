@@ -10,8 +10,8 @@ use super::{column::Column, feature::Feature, wire::ProtoWrite};
 // It has some metadata information
 pub struct Block {
     info: Option<BlockInfo>,
-    columns: Vec<Column>,
-    rows: usize,
+    pub columns: Vec<Column>,
+    pub rows: usize,
 }
 
 impl Block {
@@ -33,7 +33,10 @@ impl Block {
     }
     pub fn new() -> Self {
         Block {
-            info: None,
+            info: Some(BlockInfo {
+                overflows: false,
+                bucket_number: 0,
+            }),
             columns: vec![],
             rows: 0,
         }
@@ -60,7 +63,7 @@ impl BlockInfo {
         w.write_varuint(BlockInfoField::BucketNumber as u64)?;
         w.write_i32(self.bucket_number)?;
 
-        w.write_varuint(0); // end marker of block info
+        w.write_varuint(0)?; // end marker of block info
         Ok(())
     }
 }

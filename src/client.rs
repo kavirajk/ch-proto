@@ -3,13 +3,19 @@ use std::{
     net::TcpStream,
 };
 
-use crate::proto::{
+use crate::{
     block::Block,
-    exception::ServerException,
-    feature::Feature,
-    hello::{ClientHello, ServerHello},
-    packet::{ClientPacket, ServerPacket, ServerResponse},
-    wire::{ProtoRead, ProtoWrite},
+    proto::{
+        self,
+        client_info::{ClientInfo, QueryKind},
+        exception::ServerException,
+        external_table::ExternalTable,
+        feature::Feature,
+        hello::{ClientHello, ServerHello},
+        packet::{ClientPacket, ServerPacket, ServerResponse},
+        query::{Query, Stage},
+        wire::{ProtoRead, ProtoWrite},
+    },
 };
 
 #[derive(Debug)]
@@ -76,8 +82,6 @@ impl Connection {
                 "expected ServerHello response but got unexpeced response",
             )),
         }
-
-        // Ok(())
     }
 
     pub fn ping(&mut self) -> Result<()> {
@@ -98,8 +102,63 @@ impl Connection {
         }
     }
 
-    pub fn query(&mut self) -> Result<Block> {
-        todo!()
+    pub fn query(&mut self, sql: &str) -> Result<Block> {
+        let protocol = self.protocol as u32;
+        let query_id = uuid::Uuid::new_v4().to_string();
+
+        let q = Query {
+            query_id: query_id.clone(),
+            client_info: ClientInfo {
+                query_kind: QueryKind::InitialQuery,
+                initial_user: self.user.clone().unwrap_or("default".to_string()),
+                initial_query_id: query_id,
+                initial_address: "".to_string(),
+                initial_time: Some(0), // feature-gated: INITIAL_QUERY_START_TIME
+                query_interface: 1,    // TCP
+                os_user: std::env::var("USER").unwrap_or_default(),
+                client_hostname: hostname::get()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                client_name: "toy-client".to_string(),
+                version_major: 1,
+                version_minor: 0,
+                protocol_version: self.protocol,
+                quota_key: Some("".to_string()), // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
+                distributed_depth: Some(0),      // feature-gated: DISTRIBUTED_DEPTH
+                version_patch: Some(0),          // feature-gated: VERSION_PATCH
+                collaborate_with_initiator: Some(false), // feature-gated: PARALLEL_REPLICAS
+                obsolete_count_participating_replicas: Some(0),
+                count_current_replicas: Some(0),
+            },
+            settings: vec![],
+            cluster_secret: "".to_string(),
+            stage: Stage::Complete,
+            compression: false,
+            body: sql.to_string(),
+            params: vec![],
+            protocol_version: self.protocol,
+        };
+
+        q.encode(&mut self.inner)?;
+
+        // Send empty external table (marks end of client data)
+        ExternalTable::encode_empty(&mut self.inner, protocol)?;
+        self.inner.flush()?;
+
+        // Read response blocks
+        // TODO: handle streaming multiple blocks, progress, logs, etc.
+        match self.read_response()? {
+            ServerResponse::Data(block) => Ok(block.into()),
+            ServerResponse::Exception(e) => Err(Error::new(
+                io::ErrorKind::Other,
+                format!("query failed: {e:?}"),
+            )),
+            _ => Err(Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response to query",
+            )),
+        }
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {

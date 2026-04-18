@@ -102,3 +102,12 @@ fn test_ping_multiple_connections() {
     conn1.ping().unwrap();
     conn2.ping().unwrap();
 }
+
+#[test]
+fn test_simple_query() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    conn.ping().unwrap();
+    let block = conn.query("SELECT 1").unwrap();
+    println!("row_count {}", block.rows_count);
+}

@@ -1,6 +1,6 @@
 use std::io::{self, Error};
 
-use super::{exception::ServerException, hello::ServerHello};
+use super::{block::Block, exception::ServerException, hello::ServerHello};
 
 pub enum ServerPacket {
     /// Name, version, revision.
@@ -79,6 +79,7 @@ pub enum ServerResponse {
     Hello(ServerHello),
     Exception(ServerException),
     Pong,
+    Data(Block),
 }
 
 pub enum ClientPacket {

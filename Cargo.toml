@@ -20,3 +20,7 @@ harness = false
 [[bench]]
 name = "query"
 harness = false
+
+[dependencies]
+uuid = { version = "1.23.1", features = ["v4"] }
+hostname = "0.4"
