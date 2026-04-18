@@ -407,34 +407,66 @@ On the wire, a block is preceded by a ClientData header (client -> server) or di
 
 #### BlockInfo
 
-Present if BLOCK_INFO (v51903) is active. Uses field-tagged encoding (unique among all protocol structures):
+**Condition:** BLOCK_INFO (v51903)
 
+Unlike all other protocol structures, BlockInfo uses **field-tagged encoding** for forward compatibility. Each field is preceded by a VarUInt field ID. A field ID of `0` terminates the structure. Fields may appear in any order, and unknown field IDs should be skipped.
+
+| Field ID | Field         | Type  | Role         | Description |
+|----------|---------------|-------|--------------|-------------|
+| 1        | is_overflows  | UInt8 | inter-server | Overflow block from GROUP BY. Client sends `0` (false). |
+| 2        | bucket_number | Int32 | inter-server | Aggregation bucket. Client sends `-1` (no bucket). |
+| 0        | (terminator)  | —     | universal    | Marks end of BlockInfo. Always required. |
+
+Wire encoding:
 ```
-[VarUInt: field_id=1] [UInt8: is_overflows]     — false for normal blocks
-[VarUInt: field_id=2] [Int32: bucket_number]     — -1 for normal blocks
-[VarUInt: field_id=0]                            — end of BlockInfo
+[VarUInt: 1] [UInt8: is_overflows]
+[VarUInt: 2] [Int32: bucket_number]
+[VarUInt: 0]
 ```
 
 #### Block Body
 
-| # | Field       | Type    | Description |
-|---|-------------|---------|-------------|
-| 1 | block_info  | BlockInfo | See above (if BLOCK_INFO feature active) |
-| 2 | num_columns | VarUInt | Number of columns |
-| 3 | num_rows    | VarUInt | Number of rows |
-| 4 | columns     | Column[] | One entry per column (see below) |
+| # | Field       | Type      | Role      | Description |
+|---|-------------|-----------|-----------|-------------|
+| 1 | block_info  | BlockInfo | universal | See above. Present if BLOCK_INFO (v51903) active. |
+| 2 | num_columns | VarUInt   | universal | Number of columns |
+| 3 | num_rows    | VarUInt   | universal | Number of rows |
+| 4 | columns     | Column[]  | universal | One entry per column (see below). Not present if num_columns=0. |
 
 #### Column
 
-For each column:
+Repeated `num_columns` times:
 
-| # | Field       | Type    | Description |
-|---|-------------|---------|-------------|
-| 1 | name        | String  | Column name |
-| 2 | type        | String  | ClickHouse type name (e.g., "UInt64", "String") |
-| 3 | data        | bytes   | Type-specific binary encoding for all rows |
+| # | Field       | Type    | Role      | Description |
+|---|-------------|---------|-----------|-------------|
+| 1 | name        | String  | universal | Column name |
+| 2 | type        | String  | universal | ClickHouse type name (e.g., "UInt64", "String") |
+| 3 | data        | bytes   | universal | Type-specific binary encoding for all rows. See section 7. |
 
-An **empty block** (num_columns=0, num_rows=0) is used as an end-of-data signal.
+#### Empty Block
+
+An empty block signals "end of data." It is used in two contexts:
+
+1. **Client -> Server:** As the empty ExternalTable to mark end of client data after a Query packet.
+2. **Server -> Client:** As the final block before EndOfStream (some server versions).
+
+An empty block has `num_columns=0` and `num_rows=0` with no column entries. The full wire encoding of an empty block (with BLOCK_INFO active) is:
+
+```
+ClientData header (client -> server only):
+  [VarUInt: 0]                     table_name = "" (empty)
+
+BlockInfo:
+  [VarUInt: 1] [UInt8: 0x00]      is_overflows = false
+  [VarUInt: 2] [Int32: FF FF FF FF] bucket_number = -1
+  [VarUInt: 0]                     end of BlockInfo
+
+Block body:
+  [VarUInt: 0]                     num_columns = 0
+  [VarUInt: 0]                     num_rows = 0
+```
+
+Total: approximately 10 bytes. No column data follows.
 
 ---
 
