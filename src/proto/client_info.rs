@@ -71,7 +71,7 @@ impl ClientInfo {
         let initial_query_id = r.read_string()?;
         let initial_address = r.read_string()?;
         let initial_time = if Feature::INITIAL_QUERY_START_TIME.in_version(protocol) {
-            Some(r.read_varuint()? as i64)
+            Some(r.read_i64()?)
         } else {
             None
         };
@@ -169,12 +169,12 @@ impl ClientInfo {
         w.write_string(&self.initial_query_id)?;
         w.write_string(&self.initial_address)?;
         if Feature::INITIAL_QUERY_START_TIME.in_version(protocol) {
-            w.write_varuint(self.initial_time.ok_or_else(|| {
+            w.write_i64(self.initial_time.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("initial_time is required for this protocol ({protocol})"),
                 )
-            })? as u64)?;
+            })?)?;
         }
 
         w.write_u8(self.query_interface)?;
@@ -362,7 +362,9 @@ mod tests {
         let ci_min = make_client_info_minimal();
 
         let mut buf_full = Vec::new();
-        ci_full.encode(&mut buf_full, PROTOCOL_ALL_FEATURES).unwrap();
+        ci_full
+            .encode(&mut buf_full, PROTOCOL_ALL_FEATURES)
+            .unwrap();
 
         let mut buf_min = Vec::new();
         ci_min.encode(&mut buf_min, PROTOCOL_MINIMAL).unwrap();
@@ -401,7 +403,11 @@ mod tests {
 
     #[test]
     fn test_query_kind_roundtrip() {
-        for (val, expected) in [(0u8, QueryKind::NoQuery), (1, QueryKind::InitialQuery), (2, QueryKind::SecondaryQuery)] {
+        for (val, expected) in [
+            (0u8, QueryKind::NoQuery),
+            (1, QueryKind::InitialQuery),
+            (2, QueryKind::SecondaryQuery),
+        ] {
             let qk = QueryKind::try_from(val).unwrap();
             assert_eq!(qk, expected);
         }

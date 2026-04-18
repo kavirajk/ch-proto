@@ -236,41 +236,54 @@ Fields are listed in wire order. The `Type` column uses:
 - **inter-server** — only meaningful for server-to-server communication in distributed queries; external clients write a default value (empty string, 0, false)
 - **universal** — used by both external clients and inter-server communication
 
+### 6.0 Packet Envelope
+
+Every message on the wire follows the same outer structure:
+
+```
+[VarUInt: packet_type_code]    — always encoded as VarUInt
+[message body]                  — format depends on packet_type_code
+```
+
+This applies to **both directions** (client → server and server → client). Complete packet type code tables are in section 9.
+
+**Important:** The packet type is VarUInt, not a fixed-width byte. For values < 128 this produces the same single byte, but implementations must use VarUInt encoding to remain compatible if future packet types reach ≥128.
+
+The following message tables document only the **body** of each packet (the bytes after the packet type code). Field numbering starts at `1` for the first body field.
+
 ### 6.1 ClientHello
 
 **Direction:** Client -> Server
-**Packet type:** VarUInt `0`
+**Packet type:** `0`
 
-Sent as the first message after TCP connection. No feature gating — all fields are always present.
+Sent as the first message after TCP connection. No feature gating — all body fields are always present.
 
 | # | Field             | Type    | Role      | Description |
 |---|-------------------|---------|-----------|-------------|
-| 1 | packet_type       | VarUInt | universal | Always `0` |
-| 2 | client_name       | String  | universal | Client identifier (e.g., "clickhouse-client") |
-| 3 | version_major     | VarUInt | universal | Client major version |
-| 4 | version_minor     | VarUInt | universal | Client minor version |
-| 5 | protocol_version  | VarUInt | universal | Client's max supported protocol version |
-| 6 | database          | String  | universal | Default database name |
-| 7 | user              | String  | universal | Username for authentication |
-| 8 | password          | String  | universal | Password (plaintext) |
+| 1 | client_name       | String  | universal | Client identifier (e.g., "clickhouse-client") |
+| 2 | version_major     | VarUInt | universal | Client major version |
+| 3 | version_minor     | VarUInt | universal | Client minor version |
+| 4 | protocol_version  | VarUInt | universal | Client's max supported protocol version |
+| 5 | database          | String  | universal | Default database name |
+| 6 | user              | String  | universal | Username for authentication |
+| 7 | password          | String  | universal | Password (plaintext) |
 
 ### 6.2 ServerHello
 
 **Direction:** Server -> Client
-**Packet type:** VarUInt `0`
+**Packet type:** `0`
 
 Server's response to ClientHello on successful authentication.
 
 | # | Field             | Type    | Role      | Condition               | Description |
 |---|-------------------|---------|-----------|-------------------------|-------------|
-| 1 | packet_type       | VarUInt | universal | always                  | Always `0` |
-| 2 | server_name       | String  | universal | always                  | Server identifier (e.g., "ClickHouse") |
-| 3 | version_major     | VarUInt | universal | always                  | Server major version |
-| 4 | version_minor     | VarUInt | universal | always                  | Server minor version |
-| 5 | protocol_version  | VarUInt | universal | always                  | Server's protocol version |
-| 6 | timezone          | String  | universal | TIMEZONE (v54058)       | Server timezone (e.g., "UTC") |
-| 7 | display_name      | String  | universal | DISPLAY_NAME (v54372)   | Human-readable server name |
-| 8 | version_patch     | VarUInt | universal | VERSION_PATCH (v54401)  | Server patch version |
+| 1 | server_name       | String  | universal | always                  | Server identifier (e.g., "ClickHouse") |
+| 2 | version_major     | VarUInt | universal | always                  | Server major version |
+| 3 | version_minor     | VarUInt | universal | always                  | Server minor version |
+| 4 | protocol_version  | VarUInt | universal | always                  | Server's protocol version |
+| 5 | timezone          | String  | universal | TIMEZONE (v54058)       | Server timezone (e.g., "UTC") |
+| 6 | display_name      | String  | universal | DISPLAY_NAME (v54372)   | Human-readable server name |
+| 7 | version_patch     | VarUInt | universal | VERSION_PATCH (v54401)  | Server patch version |
 
 ### 6.3 Addendum
 
@@ -286,51 +299,49 @@ Not a distinct packet type. Sent as raw fields immediately after the handshake c
 ### 6.4 Ping
 
 **Direction:** Client -> Server
-**Packet type:** VarUInt `4`
+**Packet type:** `4`
 
-No payload. Single VarUInt byte `0x04`.
+No body. Just the packet envelope (single byte `0x04`).
 
 ### 6.5 Pong
 
 **Direction:** Server -> Client
-**Packet type:** VarUInt `4`
+**Packet type:** `4`
 
-No payload. Single VarUInt byte `0x04`.
+No body. Just the packet envelope (single byte `0x04`).
 
 ### 6.6 Exception
 
 **Direction:** Server -> Client
-**Packet type:** VarUInt `2`
+**Packet type:** `2`
 
 Sent when the server encounters an error during any phase.
 
 | # | Field       | Type    | Role      | Description |
 |---|-------------|---------|-----------|-------------|
-| 1 | packet_type | VarUInt | universal | Always `2` |
-| 2 | code        | Int32   | universal | Error code |
-| 3 | name        | String  | universal | Exception class (e.g., "DB::Exception") |
-| 4 | message     | String  | universal | Human-readable error message |
-| 5 | stack_trace | String  | universal | Server-side stack trace |
-| 6 | has_nested  | Bool    | universal | If true, another Exception follows immediately |
+| 1 | code        | Int32   | universal | Error code |
+| 2 | name        | String  | universal | Exception class (e.g., "DB::Exception") |
+| 3 | message     | String  | universal | Human-readable error message |
+| 4 | stack_trace | String  | universal | Server-side stack trace |
+| 5 | has_nested  | Bool    | universal | If true, another Exception follows immediately |
 
 If `has_nested` is true, the receiver should read another Exception structure immediately after (without a packet type prefix). This forms a chain of nested exceptions.
 
 ### 6.7 Query
 
 **Direction:** Client -> Server
-**Packet type:** VarUInt `1`
+**Packet type:** `1`
 
 | # | Field          | Type          | Role         | Condition                             | Description |
 |---|----------------|---------------|--------------|---------------------------------------|-------------|
-| 1 | packet_type    | VarUInt       | universal    | always                                | Always `1` |
-| 2 | query_id       | String        | universal    | always                                | Unique query identifier (UUID) |
-| 3 | client_info    | ClientInfo    | universal    | WRITE_CLIENT_INFO (v54420)            | See section 6.8 |
-| 4 | settings       | Setting[]     | universal    | SETTINGS_SERIALIZED_AS_STRINGS (v54429) | See section 6.9. Terminated by empty key. |
-| 5 | cluster_secret | String        | inter-server | INTERSERVER_SECRET (v54441)           | Cluster auth. Client sends empty string. |
-| 6 | stage          | VarUInt       | universal    | always                                | 0=FetchColumns, 1=WithMergeableState, 2=Complete |
-| 7 | compression    | VarUInt       | universal    | always                                | 0=disabled, 1=enabled |
-| 8 | query_body     | String        | universal    | always                                | SQL text |
-| 9 | parameters     | Parameter[]   | client       | PARAMETERS (v54459)                   | See section 6.10. Terminated by empty key. |
+| 1 | query_id       | String        | universal    | always                                | Unique query identifier (UUID) |
+| 2 | client_info    | ClientInfo    | universal    | WRITE_CLIENT_INFO (v54420)            | See section 6.8 |
+| 3 | settings       | Setting[]     | universal    | SETTINGS_SERIALIZED_AS_STRINGS (v54429) | See section 6.9. Terminated by empty key. |
+| 4 | cluster_secret | String        | inter-server | INTERSERVER_SECRET (v54441)           | Cluster auth. Client sends empty string. |
+| 5 | stage          | VarUInt       | universal    | always                                | 0=FetchColumns, 1=WithMergeableState, 2=Complete |
+| 6 | compression    | VarUInt       | universal    | always                                | 0=disabled, 1=enabled |
+| 7 | query_body     | String        | universal    | always                                | SQL text |
+| 8 | parameters     | Parameter[]   | client       | PARAMETERS (v54459)                   | See section 6.10. Terminated by empty key. |
 
 ### 6.8 ClientInfo
 
@@ -393,17 +404,71 @@ Query parameters (for parameterized queries like `SELECT {x:UInt64}`). Encoded i
 | 2 | flags | VarUInt | client | Always `0x02` (Custom) |
 | 3 | value | String  | client | Parameter value as string |
 
-### 6.11 Block
+### 6.11 Block (Data Packet)
 
-Data blocks are the unit of data transfer. They contain column metadata and columnar data. Used in both directions (client sends data for INSERT, server sends query results).
+A **Block** is the fundamental unit of data processing in ClickHouse — both internally within the query engine and on the wire. Understanding the Block is essential to understanding the protocol.
 
-On the wire, a block is preceded by a ClientData header (client -> server) or directly follows the packet type (server -> client).
+#### What is a Block?
 
-#### ClientData Header (client -> server only)
+A Block is a contiguous chunk of rows organized **columnar** — all values for column 1 are stored together, then all values for column 2, and so on. This is the same layout ClickHouse uses in memory and on disk:
 
-| # | Field      | Type   | Condition               | Description |
-|---|------------|--------|-------------------------|-------------|
-| 1 | table_name | String | TEMP_TABLES (v50264)    | External table name. Empty = end marker. |
+```
+Row-oriented (not used):           Columnar (used here):
+┌──────┬──────┬──────┐             ┌──────────┐
+│ row1 │ row1 │ row1 │             │ col1: v1 │
+│ col1 │ col2 │ col3 │             │ col1: v2 │
+├──────┼──────┼──────┤             │ col1: v3 │
+│ row2 │ row2 │ row2 │             ├──────────┤
+│ col1 │ col2 │ col3 │             │ col2: v1 │
+├──────┼──────┼──────┤             │ col2: v2 │
+│ row3 │ row3 │ row3 │             │ col2: v3 │
+│ col1 │ col2 │ col3 │             └──────────┘
+└──────┴──────┴──────┘             (and so on)
+```
+
+A Block contains only the **columns involved in the query**, not all columns of the underlying table. A `SELECT name, age FROM users` produces Blocks with 2 columns, not all columns of `users`.
+
+#### Why columnar on the wire?
+
+The columnar format is what gives the ClickHouse native protocol much of its performance advantage:
+
+1. **No serialization conversion.** The server's in-memory representation is columnar. The client's consumption of analytical results is typically column-wise (aggregations, exports to Parquet/Arrow, etc.). Sending data columnar avoids any row-oriented intermediate format. No transpose step on either side.
+
+2. **Better compression.** Values within a column are the same type and often have low cardinality or repetition (e.g., timestamps, enums, boolean flags). Column-by-column compression achieves much higher ratios than row-by-row compression of mixed types.
+
+3. **Vectorized processing.** The client can process entire columns with SIMD or batched operations without splitting and regrouping by type.
+
+4. **Streaming efficiency.** Large result sets are sent as multiple Blocks. Each Block is independent — the client can start processing column 1 of Block N while Block N+1 is still arriving on the socket.
+
+Compare to row-oriented protocols (MySQL, PostgreSQL): every row must be encoded as a heterogeneous tuple, typed field-by-field. For analytical workloads returning millions of rows, this serialization cost dominates.
+
+#### Block on the wire
+
+**Direction:** Client -> Server or Server -> Client
+**Packet type:** `2` (client → server, `ClientPacket::Data`) or `1` (server → client, `ServerPacket::Data`)
+
+The wire format differs slightly between directions:
+
+**Client → Server** (used for INSERT data and external tables):
+```
+[VarUInt: 2]                     packet type (ClientPacket::Data)
+[String: table_name]             external table name ("" for INSERT data)
+[Block body]                     see below
+```
+
+**Server → Client** (used for result blocks):
+```
+[VarUInt: 1]                     packet type (ServerPacket::Data)
+[Block body]                     see below
+```
+
+The client → server direction carries an extra `table_name` prefix. The server → client direction does not — result blocks have no table name.
+
+#### table_name (client → server only)
+
+| Field      | Type   | Role      | Condition               | Description |
+|------------|--------|-----------|-------------------------|-------------|
+| table_name | String | universal | TEMP_TABLES (v50264)    | External table name. Empty = end-of-data marker. |
 
 #### BlockInfo
 

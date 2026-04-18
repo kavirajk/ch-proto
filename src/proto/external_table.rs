@@ -1,5 +1,7 @@
 use std::io::Result;
 
+use crate::proto::packet::ClientPacket;
+
 use super::{
     block::Block,
     wire::{ProtoRead, ProtoWrite},
@@ -17,6 +19,7 @@ pub struct ExternalTable {
 
 impl ExternalTable {
     pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
+        w.write_varuint(ClientPacket::Data as u64)?;
         w.write_string(&self.table_name)?;
         self.block.encode(w, protocol)?;
         Ok(())
