@@ -344,7 +344,7 @@ Not a standalone packet. Encoded inline as part of the Query message.
 | 1 | query_kind                 | UInt8   | universal    | always                             | 0=NoQuery, 1=InitialQuery, 2=SecondaryQuery. Client sends `1`. `2` is inter-server only. |
 | 2 | initial_user               | String  | universal    | always                             | User who initiated the query |
 | 3 | initial_query_id           | String  | universal    | always                             | Original query ID |
-| 4 | initial_address            | String  | inter-server | always                             | Originating client address. Client sends empty string. |
+| 4 | initial_address            | String  | universal    | always                             | Originating client socket address in `host:port` format. See §10.1. |
 | 5 | initial_time               | VarUInt | client       | INITIAL_QUERY_START_TIME (v54449)  | Query start time (microseconds) |
 | 6 | query_interface            | UInt8   | universal    | always                             | 1=TCP, 2=HTTP |
 | 7 | os_user                    | String  | client       | if interface=TCP                   | OS username |
@@ -533,3 +533,23 @@ Total: approximately 10 bytes. No column data follows.
 | 16   | MergeTreeReadTaskRequest          | Parallel read task assignment |
 | 17   | TimezoneUpdate                    | Server timezone update |
 | 18   | SSHChallenge                      | SSH auth challenge |
+
+---
+
+## 10. Implementation Notes
+
+Discoveries and gotchas that aren't obvious from the wire format alone. Each entry documents the symptom, cause, and fix.
+
+### 10.1 `ClientInfo.initial_address` must be non-empty in `host:port` format
+
+**Symptom:** Server rejects Query with:
+```
+DB::Exception: Assertion violation: !hostAndPort.empty()
+in file "base/poco/Net/src/SocketAddress.cpp", line 350
+```
+
+**Cause:** The server parses `initial_address` via Poco's `SocketAddress::init()`, which fails an assertion if the string is empty.
+
+**Fix:** Always send a valid `host:port` string, e.g., `"127.0.0.1:0"`. Port `0` is fine — the server uses this only for logging, not for actual connections.
+
+---

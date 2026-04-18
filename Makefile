@@ -3,7 +3,7 @@ CLICKHOUSE_VERSION ?= 25.3-alpine
 .PHONY: up down test test-integration test-unit
 
 up:
-	CLICKHOUSE_VERSION=$(CLICKHOUSE_VERSION) docker compose up -d --wait
+	CLICKHOUSE_VERSION=$(CLICKHOUSE_VERSION) docker compose up -d --wait --remove-orphans --force-recreate
 
 down:
 	docker compose down

@@ -112,7 +112,7 @@ impl Connection {
                 query_kind: QueryKind::InitialQuery,
                 initial_user: self.user.clone().unwrap_or("default".to_string()),
                 initial_query_id: query_id,
-                initial_address: "".to_string(),
+                initial_address: "127.0.0.1:0".to_string(),
                 initial_time: Some(0), // feature-gated: INITIAL_QUERY_START_TIME
                 query_interface: 1,    // TCP
                 os_user: std::env::var("USER").unwrap_or_default(),
