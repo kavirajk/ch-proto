@@ -201,22 +201,41 @@ Both Ping and Pong are single VarUInt bytes with no payload.
 Client                              Server
   |--- Query packet ------------------>|
   |--- ExternalTable (data block) ---->|  (optional, for temp tables)
-  |--- Empty ExternalTable ----------->|  (end-of-data marker)
+  |--- Empty ExternalTable ----------->|  (end-of-client-data marker)
   |                                    |
-  |<--- Data block --------------------|  (0 or more)
-  |<--- Progress ----------------------|  (0 or more, interleaved)
-  |<--- EndOfStream -------------------|  (query complete)
+  |<--- Data (header) -----------------|  1st Data — schema, N cols, 0 rows
+  |<--- Progress ----------------------|  0 or more, interleaved
+  |<--- Log ---------------------------|  0 or more (if server logs enabled)
+  |<--- Data (result block) -----------|  0 or more — N cols, M rows each
+  |<--- Totals / Extremes / ProfileInfo|  0 or more (aggregation queries, profiling)
+  |<--- Data (empty block) ------------|  0 cols, 0 rows — boundary marker (NOT end)
+  |<--- Progress / ProfileEvents ------|  final updates
+  |<--- EndOfStream -------------------|  authoritative end of query
   |                                    |
   [Back to READY]
 ```
 
-Or on error:
+Source: see `TCPHandler::processOrdinaryQuery` in `src/Server/TCPHandler.cpp` for the server-side send sequence (around line 1608 for the header, line 1655 for result blocks, line 1685 for the empty block, line 1047 for EndOfStream).
+
+Or on error at any point during query execution:
 ```
   |<--- Exception ---------------------|
   [Back to READY or Disconnect]
 ```
 
-After sending the Query packet, the client must send at least one ExternalTable. An empty external table (empty table name + empty block) signals "no more client data." The server will not begin executing the query until it receives this end marker.
+**After sending the Query packet**, the client must send at least one ExternalTable. An empty external table (empty table name + empty block) signals "no more client data." The server will not begin executing the query until it receives this end marker.
+
+**Reading the response**: the client must loop, reading packets until `EndOfStream` (or `Exception`). The server interleaves several packet types during query execution, and a single client `read()` is insufficient to consume a complete response. See §6.11 for the distinction between the header block and subsequent row blocks.
+
+**Packets the client must handle during this phase:**
+- `Data` — result blocks (see §6.11 for header vs. row blocks)
+- `Progress` — execution metrics (rows read, bytes read, elapsed time)
+- `Exception` — server-side error; terminates the query
+- `EndOfStream` — query complete; transition back to READY
+- `Log` — server log lines (may be ignored)
+- `ProfileInfo`, `ProfileEvents` — profiling data (may be ignored)
+- `Totals`, `Extremes` — aggregation metadata blocks (same wire format as `Data`)
+- `TableColumns` — column defaults metadata (may be ignored)
 
 ---
 
@@ -509,12 +528,26 @@ Repeated `num_columns` times:
 | 2 | type        | String  | universal | ClickHouse type name (e.g., "UInt64", "String") |
 | 3 | data        | bytes   | universal | Type-specific binary encoding for all rows. See section 7. |
 
+#### Header block vs. result blocks
+
+All Data packets for a query use the same wire format. They differ only in their `num_columns` / `num_rows` values and their position in the response stream:
+
+| Variant        | `num_columns` | `num_rows` | Position           | Purpose |
+|----------------|---------------|------------|--------------------|---------|
+| **Header block**   | N > 0 | **0**     | First Data packet  | Announces the result schema: column names and types. Sent exactly once per query. |
+| **Result block**   | N > 0 | M > 0     | 0 or more after header | Actual result data, columnar. Same column order as the header. Streaming: large result sets arrive as multiple result blocks. |
+| **Empty block**    | 0     | 0         | Once near end      | Sent by server after all data — a boundary marker but **not** the query terminator. |
+
+The header block is the client's source of truth for column names and types; it is **required** to parse subsequent result blocks correctly (you cannot decode column data without knowing the types). A query that returns zero rows still sends a header block (N columns, 0 rows).
+
+Structurally, "header" vs. "result" vs. "empty" is purely a function of the contents — there is no distinct packet type or wire marker. A client that loops on `ServerPacket::Data` naturally handles all three; the only rule is **don't treat `num_rows = 0` as end-of-query**. Only `EndOfStream` (packet type 5) signals the end. See §10.6.
+
 #### Empty Block
 
 An empty block signals "end of data." It is used in two contexts:
 
 1. **Client -> Server:** As the empty ExternalTable to mark end of client data after a Query packet.
-2. **Server -> Client:** As the final block before EndOfStream (some server versions).
+2. **Server -> Client:** Rare — some server versions may emit one, but `EndOfStream` is the authoritative end marker.
 
 An empty block has `num_columns=0` and `num_rows=0` with no column entries. The full wire encoding of an empty Data packet (with BLOCK_INFO active), including the packet type and table_name, is:
 
@@ -663,5 +696,50 @@ DB::Exception: Cannot read all data. Bytes read: 54. Bytes expected: 108.
 **Cause:** Every ClickHouse C++ send/receive path uses `writeVarUInt(Protocol::...)` / `readVarUInt(...)` for packet type codes, not fixed-byte writes.
 
 **Fix:** Always use VarUInt encoding for packet type codes on both client and server sides. See section 6.0.
+
+---
+
+### 10.6 First Data packet after a query is the header (0 rows)
+
+**Symptom:** `SELECT 1` returns 1 column and **0 rows** instead of 1 row with value `1`.
+
+**Cause:** The server's response to a query is a **stream of packets**, not a single packet:
+
+```
+Data (header:  N cols, 0 rows)        ← schema announcement, no data
+Data (result:  N cols, M rows)        ← actual data (0 or more such blocks)
+...
+Data (empty:   0 cols, 0 rows)        ← boundary marker, still NOT the end
+EndOfStream                            ← authoritative end of query
+```
+
+A client that reads only one Data packet gets the header block — which correctly announces the columns but has zero rows. The actual data arrives in subsequent Data packets.
+
+`num_rows = 0` does **not** mean end-of-query. Only `EndOfStream` (packet type 5) signals the end of a query response. See server source: `TCPHandler::processOrdinaryQuery` in `src/Server/TCPHandler.cpp`.
+
+**Fix:** After sending the Query + empty ExternalTable, loop reading packets until you see `EndOfStream`:
+
+```rust
+let mut header: Option<Block> = None;
+loop {
+    match self.read_response()? {
+        ServerResponse::Data(block) => {
+            if header.is_none() {
+                header = Some(block);  // schema
+            } else {
+                // append block.rows to accumulated result
+            }
+        }
+        ServerResponse::EndOfStream => break,
+        ServerResponse::Exception(e) => return Err(...),
+        ServerResponse::Progress(_) => { /* ignore or aggregate */ }
+        ServerResponse::Log(_) => { /* ignore */ }
+        // ProfileInfo, ProfileEvents, Totals, Extremes, TableColumns: handle per need
+        _ => { /* unexpected */ }
+    }
+}
+```
+
+See §5.4 for the full list of packets the client must handle during the query phase.
 
 ---

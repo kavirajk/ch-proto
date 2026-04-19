@@ -162,11 +162,8 @@ impl Connection {
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
-        eprintln!("[dbg] read_response: reading packet type...");
         let code_byte = self.inner.read_varuint()? as u8;
-        eprintln!("[dbg] read_response: got packet type byte = {code_byte}");
         let code = ServerPacket::try_from(code_byte)?;
-        eprintln!("[dbg] read_response: packet type = {:?}", code_byte);
 
         match code {
             ServerPacket::Hello => Ok(ServerResponse::Hello(ServerHello::decode(
@@ -178,12 +175,8 @@ impl Connection {
             )?)),
             ServerPacket::Pong => Ok(ServerResponse::Pong),
             ServerPacket::Data => {
-                eprintln!("[dbg] Data: reading table_name...");
-                let tn = self.inner.read_string()?;
-                eprintln!("[dbg] Data: table_name = {:?}", tn);
-                eprintln!("[dbg] Data: reading block...");
+                let _tn = self.inner.read_string()?;
                 let b = proto::block::Block::decode(&mut self.inner, self.protocol as u32)?;
-                eprintln!("[dbg] Data: block decoded, rows={}, cols={}", b.rows, b.columns.len());
                 Ok(ServerResponse::Data(b))
             }
             _ => Err(Error::new(
