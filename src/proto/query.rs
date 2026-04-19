@@ -127,6 +127,7 @@ pub enum SettingsFlag {
     Obsolete = 0x04,
 }
 
+#[derive(Debug, Clone)]
 pub struct Setting {
     pub key: String,
     pub value: String,
@@ -180,6 +181,7 @@ impl Setting {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Param {
     pub key: String,
     pub value: String,
@@ -187,9 +189,13 @@ pub struct Param {
 
 impl Param {
     pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
+        // Server expects the value in single-quoted form (server calls
+        // readQuoted on it during Settings::toNameToNameMap). See SPEC.md §11.x.
+        // Escape single quotes in the value by doubling them.
+        let quoted = format!("'{}'", self.value.replace('\'', "''"));
         Setting {
             key: self.key.clone(),
-            value: self.value.clone(),
+            value: quoted,
             custom: true,
             obsolete: false,
             important: false,
@@ -199,15 +205,19 @@ impl Param {
 
     pub fn decode(r: &mut impl ProtoRead) -> Result<Param> {
         let s = Setting::decode(r)?;
-        Ok(Param {
-            key: s.key,
-            value: s.value,
-        })
+        // Param values go over the wire single-quoted (mirror of encode).
+        // Strip surrounding quotes and unescape doubled inner quotes.
+        let value = if s.value.len() >= 2 && s.value.starts_with('\'') && s.value.ends_with('\'') {
+            s.value[1..s.value.len() - 1].replace("''", "'")
+        } else {
+            s.value
+        };
+        Ok(Param { key: s.key, value })
     }
 }
 
 // Stage tells till what stage query has to be executed?
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Stage {
     // Server just returns the columns (schema)
     FetchColumns = 0,

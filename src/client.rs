@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     block::Block,
-    query_result::QueryResult,
+    options::QueryOptions,
     proto::{
         self,
         client_info::{ClientInfo, QueryKind},
@@ -20,6 +20,7 @@ use crate::{
         table_columns::TableColumns,
         wire::{ProtoRead, ProtoWrite},
     },
+    query_result::QueryResult,
 };
 
 #[derive(Debug)]
@@ -45,7 +46,8 @@ impl Connection {
             database: database.map(String::from),
             user: user.map(String::from),
             password: password.map(String::from),
-            protocol: Feature::ADDENDUM.version() as u64,
+            // Client declares max supported protocol; negotiated down by server during handshake.
+            protocol: Feature::PARAMETERS.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)
@@ -107,8 +109,15 @@ impl Connection {
     }
 
     pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
+        self.query_with(sql, QueryOptions::new())
+    }
+
+    pub fn query_with(&mut self, sql: &str, opts: QueryOptions) -> Result<QueryResult> {
         let protocol = self.protocol as u32;
-        let query_id = uuid::Uuid::new_v4().to_string();
+        let query_id = opts
+            .query_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let q = Query {
             query_id: query_id.clone(),
@@ -135,18 +144,21 @@ impl Connection {
                 obsolete_count_participating_replicas: Some(0),
                 count_current_replicas: Some(0),
             },
-            settings: vec![],
+            settings: opts.settings,
             cluster_secret: "".to_string(),
-            stage: Stage::Complete,
-            compression: false,
+            stage: opts.stage.unwrap_or(Stage::Complete),
+            compression: opts.compression.unwrap_or(false),
             body: sql.to_string(),
-            params: vec![],
+            params: opts.params,
             protocol_version: self.protocol,
         };
 
         q.encode(&mut self.inner)?;
 
-        // Send empty Data packet (marks end of client data)
+        // External tables first (if any), then the empty Data marker for end-of-client-data
+        for table in &opts.external_tables {
+            table.encode(&mut self.inner, protocol)?;
+        }
         ExternalTable::encode_empty(&mut self.inner, protocol)?;
         self.inner.flush()?;
 

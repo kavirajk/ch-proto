@@ -6,7 +6,7 @@ use super::{
 };
 
 // Column represents a single column in ClickHouse term.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
     pub data_type: String,
@@ -30,7 +30,7 @@ pub enum Serialization {
 
 // ColumnData is in-memory representation of a single column data in ClickHouse terms
 // Every value has single type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ColumnData {
     Uint8(Vec<u8>),
     Uint16(Vec<u16>),

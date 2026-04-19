@@ -1065,3 +1065,40 @@ The same reasoning applies to `Totals`, `Extremes`, `TableColumns`, `Progress`, 
 **Fix:** Decode the column according to the wire type declared in each packet, not based on an assumed fixed type. Clients that want a unified representation can widen to a signed 64-bit integer, accepting that unsigned values at or above 2^63 either need explicit handling or are treated as a decode error.
 
 A simpler alternative is to store the `value` column as raw bytes plus the type string, deferring interpretation to the caller.
+
+---
+
+### 11.14 Query parameter values must be single-quoted on the wire
+
+**Symptom:** A query like `SELECT {x:UInt32}` with a parameter `x = 42` fails with:
+```
+DB::Exception: Substitution `x` is not set
+```
+even though the client sent a parameter named `x`.
+
+**Cause:** Query parameters are transported as custom settings in the Query packet's settings list (§7.9), with the `Custom` flag (`0x02`) set. When the server converts those settings into the query parameter map, it unwraps each value using single-quote-delimited string parsing. A bare value (e.g., `42`) fails this unwrap and the parameter is dropped silently — the server then reports "Substitution is not set" for the named parameter at query-execution time.
+
+**Fix:** Wrap the parameter value in single quotes on encode, and unwrap them on decode. Inner single quotes must be escaped by doubling (`'` → `''`). Examples:
+
+| Logical value | Wire value     |
+|---------------|----------------|
+| `42`          | `'42'`         |
+| `hello`       | `'hello'`      |
+| `it's`        | `'it''s'`      |
+| empty string  | `''`           |
+
+This quoting is internal to the parameter transport — the query SQL and parameter names are not affected. Only the parameter **value** string needs this treatment.
+
+---
+
+### 11.15 Client must declare a protocol version at or above each feature it needs
+
+**Symptom:** A client feature works against `cargo test` unit tests and against some server versions but silently fails with older-looking behavior — e.g., query parameters appear to be sent but the server doesn't find them; the request succeeds minus the parameter-dependent feature.
+
+**Cause:** The negotiated protocol version is `min(client_declared, server_declared)`. Every feature is gated by a minimum version (§4.3). A client that declares a max version below the feature's gate will not emit that feature on the wire — even if the server supports it.
+
+For example, declaring the client's max version as `Feature::ADDENDUM.version()` (54458) means `Feature::PARAMETERS` (54459) is never active — parameters are silently omitted from the Query packet body because the feature check fails at encode time.
+
+**Fix:** The client's declared `protocol_version` in ClientHello (§7.1) must be at least the maximum version of any feature the client wants to use. In practice, declare the highest version supported by the implementation (i.e., the "Status" line of this spec) and let version negotiation pick the actual working version.
+
+This is a **silent failure mode**: no error is emitted during encoding, and the server often accepts the malformed packet and simply executes the query without the expected feature data. Hard to debug without diffing against known-good packet captures.

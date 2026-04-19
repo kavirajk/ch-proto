@@ -12,6 +12,7 @@ use super::{
 // 1. Column -> Whole Vec<T> of single column values
 // 2. Block -> Horizontal split of j
 // It has some metadata information
+#[derive(Debug, Clone)]
 pub struct Block {
     pub info: Option<BlockInfo>,
     pub columns: Vec<Column>,

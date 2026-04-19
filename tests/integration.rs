@@ -1,6 +1,8 @@
 #![cfg(feature = "integration")]
 
 use ch_proto::client::Connection;
+use ch_proto::options::QueryOptions;
+use ch_proto::proto::query::Stage;
 use std::io;
 
 const ADDR: &str = "127.0.0.1:9000";
@@ -128,4 +130,109 @@ fn test_simple_query() {
     if let Some(pi) = &result.profile {
         println!("profile: {:?}", pi);
     }
+}
+
+// -- QueryOptions tests --
+
+#[test]
+fn test_query_with_custom_id() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_query_id("my-custom-query-id-123");
+    let result = conn.query_with("SELECT 1", opts).unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+#[test]
+fn test_query_with_stage_complete() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_stage(Stage::Complete);
+    let result = conn.query_with("SELECT 1", opts).unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+#[test]
+fn test_query_with_stage_fetch_columns() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_stage(Stage::FetchColumns);
+    // Just ensure the query completes without error. The effect of
+    // FetchColumns depends on query planning and is not strictly observable
+    // for trivial queries.
+    let _ = conn.query_with("SELECT 1", opts).unwrap();
+}
+
+#[test]
+fn test_query_with_single_setting() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_setting("max_threads", "1");
+    let result = conn.query_with("SELECT 1", opts).unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+#[test]
+fn test_query_with_multiple_settings() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new()
+        .with_setting("max_threads", "2")
+        .with_setting("max_memory_usage", "1000000000");
+    let result = conn.query_with("SELECT 1", opts).unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+#[test]
+fn test_query_with_param() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_param("x", "42");
+    let result = conn.query_with("SELECT {x:UInt32}", opts).unwrap();
+
+    assert_eq!(result.row_count(), 1);
+    // Verify the value came back as 42.
+    let first_block = &result.rows[0];
+    match &first_block.columns[0].data {
+        ch_proto::proto::column::ColumnData::Uint32(v) => assert_eq!(v[0], 42),
+        other => panic!("expected Uint32 column, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_query_with_multiple_params() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new()
+        .with_param("a", "10")
+        .with_param("b", "20");
+    // UInt32 + UInt32 promotes to UInt64 server-side.
+    let result = conn
+        .query_with("SELECT {a:UInt32} + {b:UInt32}", opts)
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Uint64(v) => assert_eq!(v[0], 30),
+        other => panic!("expected Uint64 column, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_query_with_missing_param() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // No parameter binding — server should reject.
+    let opts = QueryOptions::new();
+    let result = conn.query_with("SELECT {x:UInt32}", opts);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_query_default_options() {
+    // query() delegates to query_with(QueryOptions::new()); should be identical behavior.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let a = conn.query("SELECT 1").unwrap();
+    let b = conn.query_with("SELECT 1", QueryOptions::new()).unwrap();
+    assert_eq!(a.row_count(), b.row_count());
 }

@@ -10,11 +10,10 @@ use super::{
 // ExternalTable is a additional data that is sent from Client -> Server only for read-only queries
 // (SELECT)
 // It doesn't make sense for Server -> Client nor Client -> Server for INSERT queries
+#[derive(Debug, Clone)]
 pub struct ExternalTable {
-    table_name: String,
-    // only one block (multiple columns are allowed per table?)
-    // if you want more blocks, make it separate external table?
-    block: Block,
+    pub table_name: String,
+    pub block: Block,
 }
 
 impl ExternalTable {
