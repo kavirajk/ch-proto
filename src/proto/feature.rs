@@ -16,6 +16,8 @@ impl Feature {
     pub const CUSTOM_SERIALIZATION: Feature = Feature(54454);
     pub const ADDENDUM: Feature = Feature(54458);
     pub const PARAMETERS: Feature = Feature(54459);
+    pub const SERVER_QUERY_TIME_IN_PROGRESS: Feature = Feature(54460);
+    pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
 }
 
 impl Feature {

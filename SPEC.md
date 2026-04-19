@@ -132,16 +132,20 @@ When a feature is active, its associated fields **must** be present on the wire.
 | QUOTA_KEY_IN_CLIENT_INFO        | 54060   | ClientInfo           | Quota key for resource limiting |
 | DISPLAY_NAME                    | 54372   | ServerHello          | Server display name |
 | VERSION_PATCH                   | 54401   | ServerHello, ClientInfo | Patch version number |
-| WRITE_CLIENT_INFO               | 54420   | Query                | ClientInfo block in query |
+| SERVER_LOGS                     | 54406   | Log                  | Server sends Log packets (when `send_logs_level` is set) |
+| WRITE_CLIENT_INFO               | 54420   | Query, Progress      | ClientInfo block in Query; `wrote_rows`/`wrote_bytes` in Progress |
 | SETTINGS_SERIALIZED_AS_STRINGS  | 54429   | Query                | Settings as string key-value pairs |
 | INTERSERVER_SECRET              | 54441   | Query                | Cluster authentication secret |
 | OPEN_TELEMETRY                  | 54442   | ClientInfo           | OpenTelemetry trace context |
 | DISTRIBUTED_DEPTH               | 54448   | ClientInfo           | Distributed query nesting depth |
 | INITIAL_QUERY_START_TIME        | 54449   | ClientInfo           | Query start timestamp |
+| PROFILE_EVENTS                  | 54451   | ProfileEvents        | Server sends ProfileEvents packets |
 | PARALLEL_REPLICAS               | 54453   | ClientInfo           | Parallel replica coordination |
 | CUSTOM_SERIALIZATION            | 54454   | Block (Column)       | Per-column serialization flag; enables sparse/dictionary/etc. on-wire formats |
 | ADDENDUM                        | 54458   | Handshake            | Post-handshake addendum (quota key) |
 | PARAMETERS                      | 54459   | Query                | Parameterized query support |
+| SERVER_QUERY_TIME_IN_PROGRESS   | 54460   | Progress             | `elapsed_ns` field in Progress |
+| ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo          | `applied_aggregation` and `rows_before_aggregation` fields in ProfileInfo |
 
 ---
 
@@ -670,6 +674,163 @@ Same structure as the header but with `num_rows = 1` and 1 byte of column data.
 01                      Column[0].data: one UInt8 byte = 1
 ```
 
+### 7.12 Progress
+
+**Direction:** Server → Client
+**Packet type:** `3`
+**Referenced by:** §6.4 (query phase)
+
+Progress packets are emitted by the server periodically during query execution to report throughput. A client may aggregate these for a progress bar, logging, or metrics — or ignore them entirely. The packet is sent between Data packets in the response stream and does **not** signal end-of-stream.
+
+All fields are VarUInt.
+
+| # | Field        | Type    | Role      | Condition                                 | Description |
+|---|--------------|---------|-----------|-------------------------------------------|-------------|
+| 1 | rows         | VarUInt | universal | always                                    | Rows processed so far |
+| 2 | bytes        | VarUInt | universal | always                                    | Bytes processed so far |
+| 3 | total_rows   | VarUInt | universal | always                                    | Estimated total rows to process (may be 0 if unknown) |
+| 4 | wrote_rows   | VarUInt | universal | WRITE_CLIENT_INFO (v54420)                | Rows written (for INSERT queries) |
+| 5 | wrote_bytes  | VarUInt | universal | WRITE_CLIENT_INFO (v54420)                | Bytes written (for INSERT queries) |
+| 6 | elapsed_ns   | VarUInt | universal | SERVER_QUERY_TIME_IN_PROGRESS (v54460)    | Elapsed nanoseconds since query start |
+
+Multiple Progress packets may be sent during one query; each contains **cumulative** totals, not deltas.
+
+### 7.13 ProfileInfo
+
+**Direction:** Server → Client
+**Packet type:** `6`
+**Referenced by:** §6.4 (query phase)
+
+Sent near the end of query execution to report post-execution statistics, particularly around LIMIT clauses. Unlike Progress (cumulative during execution), ProfileInfo is sent **once** per query.
+
+| # | Field                          | Type    | Role      | Condition                            | Description |
+|---|--------------------------------|---------|-----------|--------------------------------------|-------------|
+| 1 | rows                           | VarUInt | universal | always                               | Total rows processed |
+| 2 | blocks                         | VarUInt | universal | always                               | Total blocks processed |
+| 3 | bytes                          | VarUInt | universal | always                               | Total bytes processed |
+| 4 | applied_limit                  | Bool    | universal | always                               | Whether a LIMIT clause was applied |
+| 5 | rows_before_limit              | VarUInt | universal | always                               | Row count before LIMIT was applied (useful for "Showing X of Y" displays) |
+| 6 | calculated_rows_before_limit   | Bool    | universal | always                               | Whether `rows_before_limit` is meaningful. If false, the server did not compute it. |
+| 7 | applied_aggregation            | Bool    | universal | ROWS_BEFORE_AGGREGATION (v54469)     | Whether aggregation (GROUP BY) was applied |
+| 8 | rows_before_aggregation        | VarUInt | universal | ROWS_BEFORE_AGGREGATION (v54469)     | Row count before aggregation |
+
+### 7.14 Totals
+
+**Direction:** Server → Client
+**Packet type:** `7`
+**Referenced by:** §6.4 (query phase)
+
+Carries the "totals" row produced by queries with `WITH TOTALS` (e.g., `SELECT sum(x) FROM t GROUP BY y WITH TOTALS`). The totals row aggregates over all groups.
+
+**Wire format: identical to Data (§7.11)** — a `table_name` string (always empty) followed by a Block. Only the packet type byte differs.
+
+```
+[VarUInt: 7]                     packet type (ServerPacket::Totals)
+[String: table_name]             always ""
+[Block body]                     same format as §7.11
+```
+
+Not emitted by queries that don't use `WITH TOTALS`. Clients that don't implement `WITH TOTALS` support should still decode this packet (to keep the stream aligned) but may discard the block.
+
+### 7.15 Extremes
+
+**Direction:** Server → Client
+**Packet type:** `8`
+**Referenced by:** §6.4 (query phase)
+
+Carries min/max values per column when the `extremes` setting is enabled. The block has exactly 2 rows: the first row contains the minimum of each column, the second row contains the maximum.
+
+**Wire format: identical to Data (§7.11)** — a `table_name` string (always empty) followed by a Block. Only the packet type byte differs.
+
+```
+[VarUInt: 8]                     packet type (ServerPacket::Extremes)
+[String: table_name]             always ""
+[Block body]                     same format as §7.11; num_rows = 2
+```
+
+Not emitted unless the `extremes` setting is set on the query. Clients that don't use it should still decode to keep the stream aligned.
+
+### 7.16 Log
+
+**Direction:** Server → Client
+**Packet type:** `10`
+**Referenced by:** §6.4 (query phase)
+
+Server-side log lines streamed during query execution. Useful for remote debugging and client-side progress display. Emitted only when the query has an active logs queue (controlled by the `send_logs_level` setting).
+
+**Wire format: same envelope and body format as Data (§7.11).** The packet carries a normal Block whose `num_columns` is fixed at **8** and whose column schema is predefined (see below). Each log line is **one row** in the block, spanning all 8 columns columnar-style. A single Log packet can carry many log lines — `num_rows` varies per packet depending on how many the server is flushing.
+
+```
+[VarUInt: 10]                    packet type (ServerPacket::Log)
+[String: table_name]             always ""
+[BlockInfo]                      standard (§7.11)
+[VarUInt: 8]                     num_columns — always 8 for Log
+[VarUInt: num_rows]              number of log lines in this packet
+[Column × 8]                     the 8 columns below, in this exact order
+```
+
+The 8 columns (following the standard Column wire format in §7.11 — name, type, has_custom_serialization, data):
+
+| Column # | Name              | ClickHouse Type   | Description |
+|----------|-------------------|-------------------|-------------|
+| 1        | event_time        | DateTime          | Event timestamp (seconds since epoch) |
+| 2        | event_time_microseconds | UInt32      | Microseconds component |
+| 3        | host_name         | String            | Server hostname emitting the log |
+| 4        | query_id          | String            | Query ID the log belongs to |
+| 5        | thread_id         | UInt64            | OS thread ID |
+| 6        | priority          | Int8              | Log level (Poco priority: 1=Fatal, 2=Critical, 3=Error, 4=Warning, 5=Notice, 6=Information, 7=Debug, 8=Trace) |
+| 7        | source            | String            | Logger name (e.g., `"executeQuery"`, `"TCPHandler"`) |
+| 8        | text              | String            | Log message text |
+
+To extract log line `N` from the block, read `columns[i].data[N]` for each `i` in 0..7. Clients that ignore logs must still fully decode the block (all 8 columns × `num_rows` values) to keep the stream aligned.
+
+### 7.17 ProfileEvents
+
+**Direction:** Server → Client
+**Packet type:** `14`
+**Referenced by:** §6.4 (query phase)
+
+Per-query performance counters (query execution metrics like bytes read from cache, network bytes, compression ratios, etc.).
+
+**Wire format: same envelope and body format as Data (§7.11).** The packet carries a normal Block whose `num_columns` is fixed at **6** and whose column schema is predefined (see below). Each event is **one row** in the block. A single ProfileEvents packet can carry many events — `num_rows` varies per packet.
+
+```
+[VarUInt: 14]                    packet type (ServerPacket::ProfileEvents)
+[String: table_name]             always ""
+[BlockInfo]                      standard (§7.11)
+[VarUInt: 6]                     num_columns — always 6 for ProfileEvents
+[VarUInt: num_rows]              number of events in this packet
+[Column × 6]                     the 6 columns below, in this exact order
+```
+
+The 6 columns (following the standard Column wire format in §7.11):
+
+| Column # | Name        | ClickHouse Type | Description |
+|----------|-------------|-----------------|-------------|
+| 1        | host_name   | String          | Server hostname |
+| 2        | current_time | DateTime       | Event timestamp |
+| 3        | thread_id   | UInt64          | Thread ID |
+| 4        | type        | Int8            | Event type: 1 = Increment (counter), 2 = Gauge (point-in-time value) |
+| 5        | name        | String          | Event name (e.g., `"Query"`, `"QueryMemoryUsage"`, `"NetworkReceiveBytes"`) |
+| 6        | value       | Int64 or UInt64 | Counter value or gauge reading. Type depends on event — see ClickHouse's profile events catalog. |
+
+To extract event `N` from the block, read `columns[i].data[N]` for each `i` in 0..5. Clients that ignore profile events must still decode the block (all 6 columns × `num_rows` values) to keep the stream aligned.
+
+### 7.18 TableColumns
+
+**Direction:** Server → Client
+**Packet type:** `11`
+**Referenced by:** §6.4 (query phase)
+
+Sent when the client needs column default values metadata, typically for INSERT queries that omit some columns (so the client knows the defaults). The payload is a human-readable textual description of the table schema.
+
+| # | Field              | Type   | Role      | Description |
+|---|--------------------|--------|-----------|-------------|
+| 1 | external_table     | String | universal | External table name. Empty = main table. |
+| 2 | columns_description | String | universal | Textual column definitions, e.g. `"id Int32, name String DEFAULT ''"`. Not a structured format on the wire — parse as a string. |
+
+Clients that only issue SELECT queries rarely see this packet. Ignore or skip the body to keep the stream aligned.
+
 ---
 
 ## 8. Data Types & Column Encoding
@@ -719,18 +880,18 @@ Same structure as the header but with `num_rows = 1` and 1 byte of column data.
 | 0    | Hello                             | §7.2                 | Handshake response |
 | 1    | Data                              | §7.11                | Result data block |
 | 2    | Exception                         | §7.6                 | Error |
-| 3    | Progress                          | *(not yet specified)* | Query execution progress |
+| 3    | Progress                          | §7.12                | Query execution progress |
 | 4    | Pong                              | §7.5 (no body)       | Keepalive response |
 | 5    | EndOfStream                       | (no body)            | Query complete |
-| 6    | ProfileInfo                       | *(not yet specified)* | Profiling data |
-| 7    | Totals                            | §7.11 (same as Data) | GROUP BY totals block |
-| 8    | Extremes                          | §7.11 (same as Data) | Min/max values block |
+| 6    | ProfileInfo                       | §7.13                | Post-execution profiling data |
+| 7    | Totals                            | §7.14                | GROUP BY WITH TOTALS row |
+| 8    | Extremes                          | §7.15                | Min/max values (2-row block) |
 | 9    | TablesStatusResponse              | *(not yet specified)* | Table status response |
-| 10   | Log                               | *(not yet specified)* | Query execution log line |
-| 11   | TableColumns                      | *(not yet specified)* | Column descriptions for defaults |
+| 10   | Log                               | §7.16                | Query execution log lines |
+| 11   | TableColumns                      | §7.18                | Column descriptions for defaults |
 | 12   | PartUUIDs                         | *(not yet specified)* | Unique part IDs |
 | 13   | ReadTaskRequest                   | *(not yet specified)* | Cluster read task request |
-| 14   | ProfileEvents                     | *(not yet specified)* | Performance counters |
+| 14   | ProfileEvents                     | §7.17                | Performance counters |
 | 15   | MergeTreeAllRangesAnnouncement    | *(not yet specified)* | Parallel read initialization |
 | 16   | MergeTreeReadTaskRequest          | *(not yet specified)* | Parallel read task assignment |
 | 17   | TimezoneUpdate                    | *(not yet specified)* | Server timezone update |
@@ -836,3 +997,71 @@ This pitfall is easy to miss during testing if:
 - Decode: read the byte. If `0`, continue. If `1`, either decode the kind_stack or return an `Unsupported` error — whichever matches the client's capability.
 
 Pass the negotiated protocol version through `Block::encode` / `Block::decode` so Column methods can check the feature gate.
+
+---
+
+### 11.8 `Enum8` / `Enum16` are wire-compatible with `Int8` / `Int16`
+
+**Symptom:** Decoding ProfileEvents (or other blocks with Enum columns) fails with "unsupported column type" — even though the spec describes the column as `Int8`.
+
+**Cause:** The server sends types like `Enum8('increment' = 1, 'gauge' = 2)` for columns the spec describes as `Int8` (e.g., the ProfileEvents `type` column, §7.17). The wire bytes are identical to `Int8` — one byte per row — but the type string on the wire differs.
+
+**Fix:** Treat `Enum8` as `Int8` and `Enum16` as `Int16` during column decoding. The preferred approach is to strip the `(...)` parameter suffix from the type string and dispatch on the base name (see §11.9).
+
+---
+
+### 11.9 Column type strings carry parameters — strip before matching
+
+**Symptom:** Decoding a column with type `DateTime('UTC')`, `FixedString(16)`, `Decimal(9, 2)`, `Nullable(UInt32)`, or `Array(Int32)` fails with "unsupported column type" — even when the base type is supported by the client.
+
+**Cause:** Type names on the wire include parameters in parentheses. A decoder that dispatches on the exact type string will miss parameterized variants of supported types. This is pervasive: `DateTime` always carries a timezone, `Decimal` carries precision and scale, and `Enum` / `Nullable` / `Array` / `Tuple` / `Map` all wrap a subtype.
+
+**Fix:** When dispatching on the type string, extract the base type by taking the substring before the first `(`. Example: `"DateTime('UTC')"` and `"DateTime(3)"` both reduce to the base type `"DateTime"`.
+
+The parameter content inside the parentheses may still be needed for decoding (e.g., `Decimal(P, S)` scale affects value interpretation, `FixedString(N)` determines row size, `Nullable(T)` affects wire layout). So don't discard the parameters permanently — just use only the base name for the type dispatch.
+
+---
+
+### 11.10 Unknown column types are a hard decode failure
+
+**Symptom:** Decoding a Data or Log block fails and leaves the stream in an inconsistent state; subsequent packet reads produce garbage.
+
+**Cause:** Unlike fixed-layout packets (Progress, ProfileInfo) where fields have known sizes, column data sizes depend on the type: `UInt32` = 4 bytes per row, `String` = variable (length-prefixed per value), `Array(T)` = offsets + nested element data. Without knowing the type, the decoder cannot compute the byte span of that column to skip over it.
+
+**Fix:** On encountering an unknown column type, the decoder must fail the entire query and terminate or reset the connection. There is no "skip this column" fallback — the stream is permanently misaligned. This motivates supporting at least the common types (UInt and Int variants, String, DateTime, Nullable) before targeting production workloads.
+
+Note the asymmetry with "ignored but still decoded" packets (Log, ProfileEvents): a client may choose to discard the packet's decoded *content* after the fact, but the bytes must still be consumed, and consuming those bytes requires understanding every column type in the block.
+
+---
+
+### 11.11 Log and ProfileEvents must be decoded even when ignored
+
+**Symptom:** Connection hangs or produces garbage after a query that emitted Log or ProfileEvents packets.
+
+**Cause:** The packet envelope (§5) does not include a body length. A client that reads the packet type byte and then attempts to skip to "the next packet" will consume bytes from the middle of the current packet's payload.
+
+**Fix:** Always fully decode the bodies of Log (§7.16) and ProfileEvents (§7.17) packets, even when the client intends to discard the values. The stream position must advance by exactly the body length, and the only way to compute that length is to parse the block structure.
+
+The same reasoning applies to `Totals`, `Extremes`, `TableColumns`, `Progress`, and `ProfileInfo` — a client may ignore the semantic content but must always consume the bytes.
+
+---
+
+### 11.12 Multiple Progress packets are cumulative, not deltas
+
+**Symptom:** Client-side row counts from Progress packets appear inflated (2×, 3×, ... the actual server count).
+
+**Cause:** Each Progress packet carries **cumulative** totals since the start of the query, not deltas from the previous Progress packet. Summing consecutive Progress packets double-counts.
+
+**Fix:** Treat each Progress packet as a snapshot of the query's running totals. Replace the previous value rather than add to it. The last Progress packet received before `EndOfStream` contains the final totals for the query.
+
+---
+
+### 11.13 ProfileEvents `value` column type varies between blocks
+
+**Symptom:** Decoding a ProfileEvents block fails because column 6 (`value`) is declared as `Int64` in one packet and `UInt64` in another.
+
+**Cause:** The `value` column in ProfileEvents (§7.17) is **not** a single fixed type. Each ProfileEvents packet declares its own wire type for the column based on the events it carries: always-increasing counters (e.g., `Query`, `NetworkReceiveBytes`) use `UInt64`, while gauges and delta metrics use `Int64`. The declared column type is uniform within a single packet but may differ between packets during one query's response stream.
+
+**Fix:** Decode the column according to the wire type declared in each packet, not based on an assumed fixed type. Clients that want a unified representation can widen to a signed 64-bit integer, accepting that unsigned values at or above 2^63 either need explicit handling or are treated as a decode error.
+
+A simpler alternative is to store the `value` column as raw bytes plus the type string, deferring interpretation to the caller.

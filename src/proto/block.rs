@@ -59,7 +59,6 @@ impl Block {
 
         let num_columns = r.read_varuint()? as usize;
         let num_rows = r.read_varuint()? as usize;
-        eprintln!("[dbg] num_columns: {}, num_rows: {}", num_columns, num_rows);
 
         // Empty block signals end-of-data. No column entries follow.
         if num_columns == 0 {

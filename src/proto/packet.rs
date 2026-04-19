@@ -1,6 +1,9 @@
 use std::io::{self, Error};
 
-use super::{block::Block, exception::ServerException, hello::ServerHello};
+use super::{
+    block::Block, exception::ServerException, hello::ServerHello, profile::ProfileInfo,
+    progress::Progress, table_columns::TableColumns,
+};
 
 #[derive(Debug)]
 pub enum ServerPacket {
@@ -82,6 +85,13 @@ pub enum ServerResponse {
     Pong,
     Data(Block),
     EndOfStream,
+    ProfileInfo(ProfileInfo),
+    Progress(Progress),
+    Totals(Block),
+    Extremes(Block),
+    Log(Block),
+    ProfileEvents(Block),
+    TableColumns(TableColumns),
 }
 
 pub enum ClientPacket {

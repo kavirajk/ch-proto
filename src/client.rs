@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     block::Block,
+    query_result::QueryResult,
     proto::{
         self,
         client_info::{ClientInfo, QueryKind},
@@ -13,7 +14,10 @@ use crate::{
         feature::Feature,
         hello::{ClientHello, ServerHello},
         packet::{ClientPacket, ServerPacket, ServerResponse},
+        profile::ProfileInfo,
+        progress::Progress,
         query::{Query, Stage},
+        table_columns::TableColumns,
         wire::{ProtoRead, ProtoWrite},
     },
 };
@@ -102,7 +106,7 @@ impl Connection {
         }
     }
 
-    pub fn query(&mut self, sql: &str) -> Result<Vec<Block>> {
+    pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
         let protocol = self.protocol as u32;
         let query_id = uuid::Uuid::new_v4().to_string();
 
@@ -113,8 +117,8 @@ impl Connection {
                 initial_user: self.user.clone().unwrap_or("default".to_string()),
                 initial_query_id: query_id,
                 initial_address: "127.0.0.1:0".to_string(),
-                initial_time: Some(0), // feature-gated: INITIAL_QUERY_START_TIME
-                query_interface: 1,    // TCP
+                initial_time: Some(0),
+                query_interface: 1, // TCP
                 os_user: std::env::var("USER").unwrap_or_default(),
                 client_hostname: hostname::get()
                     .unwrap_or_default()
@@ -124,10 +128,10 @@ impl Connection {
                 version_major: 1,
                 version_minor: 0,
                 protocol_version: self.protocol,
-                quota_key: Some("".to_string()), // feature-gated: QUOTA_KEY_IN_CLIENT_INFO
-                distributed_depth: Some(0),      // feature-gated: DISTRIBUTED_DEPTH
-                version_patch: Some(0),          // feature-gated: VERSION_PATCH
-                collaborate_with_initiator: Some(false), // feature-gated: PARALLEL_REPLICAS
+                quota_key: Some("".to_string()),
+                distributed_depth: Some(0),
+                version_patch: Some(0),
+                collaborate_with_initiator: Some(false),
                 obsolete_count_participating_replicas: Some(0),
                 count_current_replicas: Some(0),
             },
@@ -142,67 +146,117 @@ impl Connection {
 
         q.encode(&mut self.inner)?;
 
-        // Send empty external table (marks end of client data)
+        // Send empty Data packet (marks end of client data)
         ExternalTable::encode_empty(&mut self.inner, protocol)?;
         self.inner.flush()?;
 
-        let mut header_block: Option<Block> = None;
-        let mut results: Vec<Block> = vec![];
+        let mut result = QueryResult::new();
 
-        // Read response blocks
-        // TODO: handle streaming multiple blocks, progress, logs, etc.
+        // Read response packets until EndOfStream or Exception.
+        // See SPEC.md §6.4 for the full dispatch table.
         loop {
             match self.read_response()? {
-                ServerResponse::Data(block) => match header_block {
-                    None => {
-                        header_block = Some(block.into());
+                ServerResponse::Data(block) => {
+                    if result.header.is_none() {
+                        // First Data packet is the schema header (0 rows expected)
+                        result.header = Some(block.into());
+                    } else if block.rows > 0 || !block.columns.is_empty() {
+                        // Result blocks. Skip truly empty boundary markers (0/0).
+                        result.rows.push(block.into());
                     }
-                    Some(_) => {
-                        if block.rows != 0 {
-                            results.push(block.into());
-                        }
-                    }
-                },
+                }
+                ServerResponse::Progress(_) => {
+                    // Cumulative metrics — for now, ignore. Could aggregate.
+                }
+                ServerResponse::ProfileInfo(pi) => {
+                    result.profile = Some(pi);
+                }
+                ServerResponse::Totals(block) => {
+                    result.totals = Some(block.into());
+                }
+                ServerResponse::Extremes(block) => {
+                    result.extremes = Some(block.into());
+                }
+                ServerResponse::Log(block) => {
+                    // Multiple Log packets may arrive; last-write-wins for now.
+                    result.logs = Some(block.into());
+                }
+                ServerResponse::ProfileEvents(block) => {
+                    result.profile_events = Some(block.into());
+                }
                 ServerResponse::Exception(e) => {
                     return Err(Error::new(
                         io::ErrorKind::Other,
                         format!("query failed: {e:?}"),
-                    ))
+                    ));
                 }
-                ServerResponse::EndOfStream => {
-                    break;
+                ServerResponse::EndOfStream => break,
+                ServerResponse::TableColumns(_) => {
+                    // Column defaults metadata — ignore for SELECT queries.
                 }
                 _ => {
                     return Err(Error::new(
                         io::ErrorKind::InvalidData,
                         "unexpected response to query",
-                    ))
+                    ));
                 }
             }
         }
-        Ok(results)
+
+        Ok(result)
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
         let code_byte = self.inner.read_varuint()? as u8;
         let code = ServerPacket::try_from(code_byte)?;
-        eprintln!("[dbg] read_response code: {:?}", code);
+        let protocol = self.protocol as u32;
 
         match code {
             ServerPacket::Hello => Ok(ServerResponse::Hello(ServerHello::decode(
                 &mut self.inner,
-                self.protocol as u32,
+                protocol,
             )?)),
             ServerPacket::Exception => Ok(ServerResponse::Exception(ServerException::decode(
                 &mut self.inner,
             )?)),
             ServerPacket::Pong => Ok(ServerResponse::Pong),
             ServerPacket::Data => {
-                let _tn = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, self.protocol as u32)?;
+                let _table_name = self.inner.read_string()?;
+                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
                 Ok(ServerResponse::Data(b))
             }
             ServerPacket::EndOfStream => Ok(ServerResponse::EndOfStream),
+            ServerPacket::ProfileInfo => Ok(ServerResponse::ProfileInfo(ProfileInfo::decode(
+                &mut self.inner,
+                protocol,
+            )?)),
+            ServerPacket::Progress => Ok(ServerResponse::Progress(Progress::decode(
+                &mut self.inner,
+                protocol,
+            )?)),
+            ServerPacket::Totals => {
+                let _table_name = self.inner.read_string()?;
+                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                Ok(ServerResponse::Totals(b))
+            }
+            ServerPacket::Extremes => {
+                let _table_name = self.inner.read_string()?;
+                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                Ok(ServerResponse::Extremes(b))
+            }
+            ServerPacket::Log => {
+                let _table_name = self.inner.read_string()?;
+                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                Ok(ServerResponse::Log(b))
+            }
+            ServerPacket::ProfileEvents => {
+                let _table_name = self.inner.read_string()?;
+                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                Ok(ServerResponse::ProfileEvents(b))
+            }
+            ServerPacket::TableColumns => Ok(ServerResponse::TableColumns(TableColumns::decode(
+                &mut self.inner,
+            )?)),
             _ => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unhandled server packet type {code_byte}"),

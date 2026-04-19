@@ -33,7 +33,15 @@ pub enum Serialization {
 #[derive(Debug)]
 pub enum ColumnData {
     Uint8(Vec<u8>),
+    Uint16(Vec<u16>),
+    Uint32(Vec<u32>),
+    Uint64(Vec<u64>),
+    Int8(Vec<i8>),
+    Int32(Vec<i32>),
+    Int64(Vec<i64>),
     String(Vec<String>),
+    // DateTime is UInt32 seconds-since-epoch on the wire.
+    DateTime(Vec<u32>),
 }
 
 impl Column {
@@ -94,8 +102,38 @@ impl ColumnData {
     pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
         match self {
             ColumnData::Uint8(v) => {
-                for &b in v {
-                    w.write_u8(b)?;
+                for &x in v {
+                    w.write_u8(x)?;
+                }
+            }
+            ColumnData::Uint16(v) => {
+                for &x in v {
+                    w.write_u16(x)?;
+                }
+            }
+            ColumnData::Uint32(v) | ColumnData::DateTime(v) => {
+                for &x in v {
+                    w.write_u32(x)?;
+                }
+            }
+            ColumnData::Uint64(v) => {
+                for &x in v {
+                    w.write_u64(x)?;
+                }
+            }
+            ColumnData::Int8(v) => {
+                for &x in v {
+                    w.write_u8(x as u8)?;
+                }
+            }
+            ColumnData::Int32(v) => {
+                for &x in v {
+                    w.write_i32(x)?;
+                }
+            }
+            ColumnData::Int64(v) => {
+                for &x in v {
+                    w.write_i64(x)?;
                 }
             }
             ColumnData::String(v) => {
@@ -108,13 +146,66 @@ impl ColumnData {
     }
 
     pub fn decode(r: &mut impl ProtoRead, data_type: &str, rows: usize) -> Result<ColumnData> {
-        match data_type {
+        // Strip parameterized types like "DateTime('UTC')" → "DateTime"
+        let base_type = data_type.split('(').next().unwrap_or(data_type).trim();
+
+        match base_type {
             "UInt8" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     v.push(r.read_u8()?);
                 }
                 Ok(ColumnData::Uint8(v))
+            }
+            "UInt16" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u16()?);
+                }
+                Ok(ColumnData::Uint16(v))
+            }
+            "UInt32" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u32()?);
+                }
+                Ok(ColumnData::Uint32(v))
+            }
+            "UInt64" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u64()?);
+                }
+                Ok(ColumnData::Uint64(v))
+            }
+            // Enum8 is wire-compatible with Int8 (single byte per row).
+            "Int8" | "Enum8" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u8()? as i8);
+                }
+                Ok(ColumnData::Int8(v))
+            }
+            "Int32" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i32()?);
+                }
+                Ok(ColumnData::Int32(v))
+            }
+            "Int64" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i64()?);
+                }
+                Ok(ColumnData::Int64(v))
+            }
+            "DateTime" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u32()?);
+                }
+                Ok(ColumnData::DateTime(v))
             }
             "String" => {
                 let mut v = Vec::with_capacity(rows);
@@ -205,10 +296,10 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="DateTime", has_custom=0, no data
+        // Manually encode: name="x", type="Array(Int32)" (not yet supported), has_custom=0
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("DateTime").unwrap();
+        buf.write_string("Array(Int32)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
