@@ -102,7 +102,7 @@ impl Connection {
         }
     }
 
-    pub fn query(&mut self, sql: &str) -> Result<Block> {
+    pub fn query(&mut self, sql: &str) -> Result<Vec<Block>> {
         let protocol = self.protocol as u32;
         let query_id = uuid::Uuid::new_v4().to_string();
 
@@ -146,24 +146,47 @@ impl Connection {
         ExternalTable::encode_empty(&mut self.inner, protocol)?;
         self.inner.flush()?;
 
+        let mut header_block: Option<Block> = None;
+        let mut results: Vec<Block> = vec![];
+
         // Read response blocks
         // TODO: handle streaming multiple blocks, progress, logs, etc.
-        match self.read_response()? {
-            ServerResponse::Data(block) => Ok(block.into()),
-            ServerResponse::Exception(e) => Err(Error::new(
-                io::ErrorKind::Other,
-                format!("query failed: {e:?}"),
-            )),
-            _ => Err(Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response to query",
-            )),
+        loop {
+            match self.read_response()? {
+                ServerResponse::Data(block) => match header_block {
+                    None => {
+                        header_block = Some(block.into());
+                    }
+                    Some(_) => {
+                        if block.rows != 0 {
+                            results.push(block.into());
+                        }
+                    }
+                },
+                ServerResponse::Exception(e) => {
+                    return Err(Error::new(
+                        io::ErrorKind::Other,
+                        format!("query failed: {e:?}"),
+                    ))
+                }
+                ServerResponse::EndOfStream => {
+                    break;
+                }
+                _ => {
+                    return Err(Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected response to query",
+                    ))
+                }
+            }
         }
+        Ok(results)
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
         let code_byte = self.inner.read_varuint()? as u8;
         let code = ServerPacket::try_from(code_byte)?;
+        eprintln!("[dbg] read_response code: {:?}", code);
 
         match code {
             ServerPacket::Hello => Ok(ServerResponse::Hello(ServerHello::decode(
@@ -179,6 +202,7 @@ impl Connection {
                 let b = proto::block::Block::decode(&mut self.inner, self.protocol as u32)?;
                 Ok(ServerResponse::Data(b))
             }
+            ServerPacket::EndOfStream => Ok(ServerResponse::EndOfStream),
             _ => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unhandled server packet type {code_byte}"),

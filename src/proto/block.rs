@@ -35,7 +35,7 @@ impl Block {
         w.write_varuint(self.rows as u64)?;
 
         for col in &self.columns {
-            col.encode(w)?;
+            col.encode(w, protocol)?;
         }
         Ok(())
     }
@@ -72,7 +72,7 @@ impl Block {
 
         let mut columns = Vec::with_capacity(num_columns);
         for _ in 0..num_columns {
-            columns.push(Column::decode(r, num_rows)?);
+            columns.push(Column::decode(r, num_rows, protocol)?);
         }
 
         Ok(Block {
@@ -234,11 +234,13 @@ mod tests {
                 Column {
                     name: "id".to_string(),
                     data_type: "UInt8".to_string(),
+                    serialization: crate::proto::column::Serialization::Default,
                     data: ColumnData::Uint8(vec![1, 2, 3]),
                 },
                 Column {
                     name: "name".to_string(),
                     data_type: "String".to_string(),
+                    serialization: crate::proto::column::Serialization::Default,
                     data: ColumnData::String(vec![
                         "a".to_string(),
                         "b".to_string(),
@@ -251,18 +253,7 @@ mod tests {
         let mut buf = Vec::new();
         block.encode(&mut buf, PROTOCOL).unwrap();
 
-        // NOTE: Block::encode currently does NOT write column data —
-        // only metadata (column count + row count). Column::encode is separate.
-        // So we reconstruct the expected wire format manually for decode test.
-        let mut full_buf = Vec::new();
-        block.info.unwrap().encode(&mut full_buf).unwrap();
-        full_buf.write_varuint(2).unwrap(); // num_columns
-        full_buf.write_varuint(3).unwrap(); // num_rows
-        for col in &block.columns {
-            col.encode(&mut full_buf).unwrap();
-        }
-
-        let mut cursor = Cursor::new(full_buf.as_slice());
+        let mut cursor = Cursor::new(buf.as_slice());
         let decoded = Block::decode(&mut cursor, PROTOCOL).unwrap();
         assert_eq!(decoded.columns.len(), 2);
         assert_eq!(decoded.rows, 3);

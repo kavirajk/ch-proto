@@ -57,7 +57,8 @@ mod tests {
         let mut buf = Vec::new();
         ExternalTable::encode_empty(&mut buf, PROTOCOL).unwrap();
 
-        let mut cursor = Cursor::new(buf.as_slice());
+        // Skip the packet type byte that encode writes
+        let mut cursor = Cursor::new(&buf[1..]);
         let decoded = ExternalTable::decode(&mut cursor, PROTOCOL).unwrap();
         assert_eq!(decoded.table_name, "");
         assert!(decoded.is_end_marker());
@@ -65,10 +66,10 @@ mod tests {
 
     #[test]
     fn test_empty_external_table_wire_size() {
-        // empty table_name (1 byte varuint 0) + empty block (10 bytes) = 11 bytes total
+        // packet_type (1) + empty table_name (1) + empty block (10) = 12 bytes total
         let mut buf = Vec::new();
         ExternalTable::encode_empty(&mut buf, PROTOCOL).unwrap();
-        assert_eq!(buf.len(), 11);
+        assert_eq!(buf.len(), 12);
     }
 
     #[test]
@@ -80,7 +81,7 @@ mod tests {
         let mut buf = Vec::new();
         et.encode(&mut buf, PROTOCOL).unwrap();
 
-        let mut cursor = Cursor::new(buf.as_slice());
+        let mut cursor = Cursor::new(&buf[1..]);
         let decoded = ExternalTable::decode(&mut cursor, PROTOCOL).unwrap();
         assert_eq!(decoded.table_name, "ext_table");
         assert!(!decoded.is_end_marker()); // has a name, not an end marker

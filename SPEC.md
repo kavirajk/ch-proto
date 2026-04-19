@@ -2,10 +2,23 @@
 
 **Status:** Work in progress. Covers protocol versions up to 54459.
 
-**References:**
-- ClickHouse server: `src/Core/ProtocolDefines.h`, `src/Server/TCPHandler.cpp`, `src/Client/Connection.cpp`
-- ch-go client: `proto/` package
-- ch-proto (this project): `src/proto/`
+This document is the authoritative specification for the ClickHouse native TCP protocol at the versions indicated above. Implementations should conform to this document.
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Wire Format Primitives](#2-wire-format-primitives)
+3. [Security](#3-security)
+4. [Protocol Versioning & Feature Gates](#4-protocol-versioning--feature-gates)
+5. [Packet Envelope](#5-packet-envelope)
+6. [Connection Lifecycle](#6-connection-lifecycle) — **start here if implementing a client**
+7. [Message Reference](#7-message-reference)
+8. [Data Types & Column Encoding](#8-data-types--column-encoding) *(placeholder)*
+9. [Compression](#9-compression) *(placeholder)*
+10. [Packet Type Reference](#10-packet-type-reference)
+11. [Implementation Notes](#11-implementation-notes)
 
 ---
 
@@ -16,7 +29,7 @@ The ClickHouse native protocol is a binary, connection-oriented protocol over TC
 **Key properties:**
 - **Transport:** TCP (optionally with TLS)
 - **Byte order:** Little-endian for all fixed-width integers
-- **Encoding:** Binary, positional (no field tags except in BlockInfo)
+- **Encoding:** Binary, positional (no field tags except in BlockInfo, §7.11)
 - **Versioning:** Protocol version negotiated during handshake; features are gated by version numbers
 - **Connection model:** One query at a time per connection (no multiplexing)
 - **Data format:** Columnar — data is sent as blocks of columns, not rows
@@ -82,13 +95,13 @@ TLS is handled at the transport layer, below the protocol. When TLS is enabled, 
 
 ### 3.2 Authentication
 
-Authentication occurs during the handshake via the ClientHello message. The `user` and `password` fields are sent as plaintext strings. Transport-level encryption (TLS) is expected to protect these credentials in transit.
+Authentication occurs during the handshake via the ClientHello message (§7.1). The `user` and `password` fields are sent as plaintext strings. Transport-level encryption (TLS) is expected to protect these credentials in transit.
 
-SSH challenge-response authentication is available at protocol version 54466+ (not yet implemented in this spec).
+SSH challenge-response authentication is available at protocol version 54466+ (not yet covered by this spec).
 
 ### 3.3 Inter-Server Secret
 
-For distributed query execution, servers authenticate to each other using a shared secret string sent in the Query message (see `cluster_secret` field). This is gated by `INTERSERVER_SECRET` (v54441).
+For distributed query execution, servers authenticate to each other using a shared secret string sent in the Query message (see `cluster_secret` field in §7.7). This is gated by `INTERSERVER_SECRET` (v54441). External clients should always send an empty string.
 
 ---
 
@@ -126,136 +139,13 @@ When a feature is active, its associated fields **must** be present on the wire.
 | DISTRIBUTED_DEPTH               | 54448   | ClientInfo           | Distributed query nesting depth |
 | INITIAL_QUERY_START_TIME        | 54449   | ClientInfo           | Query start timestamp |
 | PARALLEL_REPLICAS               | 54453   | ClientInfo           | Parallel replica coordination |
+| CUSTOM_SERIALIZATION            | 54454   | Block (Column)       | Per-column serialization flag; enables sparse/dictionary/etc. on-wire formats |
 | ADDENDUM                        | 54458   | Handshake            | Post-handshake addendum (quota key) |
 | PARAMETERS                      | 54459   | Query                | Parameterized query support |
 
 ---
 
-## 5. Connection Lifecycle
-
-### 5.1 Phases
-
-```
-  [Connect]
-      |
-      v
-  HANDSHAKE --- error ---> [Disconnect]
-      |
-      ok
-      |
-      v
-  READY <-------------------------------------+
-      |                                        |
-      |--- Ping -------> Pong -------------->--|
-      |                                        |
-      |--- Query ------> Streaming ---------->--|
-      |                    |                   |
-      |                    |--- Data blocks    |
-      |                    |--- Progress       |
-      |                    |--- Exception      |
-      |                    |--- EndOfStream -->|
-      |                                        |
-      +----------------------------------------+
-```
-
-### 5.2 Handshake Phase
-
-```
-Client                              Server
-  |                                    |
-  |--- ClientHello ------------------->|
-  |                                    |
-  |<--- ServerHello -------------------|
-  |     (or Exception)                 |
-  |                                    |
-  |    [version negotiation:           |
-  |     min(client_ver, server_ver)]   |
-  |                                    |
-  |--- Addendum (if v >= 54458) ------>|
-  |    (quota_key string)              |
-  |                                    |
-  [Connection Ready]
-```
-
-The client sends ClientHello first. The server responds with either ServerHello (success) or Exception (authentication failure, etc.).
-
-After receiving ServerHello, the client computes the negotiated version. If the negotiated version supports the ADDENDUM feature (>= 54458), the client sends the addendum (currently just an empty quota_key string).
-
-**Important:** The addendum is sent based on the **negotiated** version, not the client's version. Sending it when the server doesn't expect it will corrupt the connection.
-
-### 5.3 Ping/Pong
-
-A simple keepalive mechanism. Either side can send at any time when the connection is idle.
-
-```
-Client                              Server
-  |--- Ping (packet type 4) --------->|
-  |<--- Pong (packet type 4) ---------|
-```
-
-Both Ping and Pong are single VarUInt bytes with no payload.
-
-### 5.4 Query Phase
-
-```
-Client                              Server
-  |--- Query packet ------------------>|
-  |--- ExternalTable (data block) ---->|  (optional, for temp tables)
-  |--- Empty ExternalTable ----------->|  (end-of-client-data marker)
-  |                                    |
-  |<--- Data (header) -----------------|  1st Data — schema, N cols, 0 rows
-  |<--- Progress ----------------------|  0 or more, interleaved
-  |<--- Log ---------------------------|  0 or more (if server logs enabled)
-  |<--- Data (result block) -----------|  0 or more — N cols, M rows each
-  |<--- Totals / Extremes / ProfileInfo|  0 or more (aggregation queries, profiling)
-  |<--- Data (empty block) ------------|  0 cols, 0 rows — boundary marker (NOT end)
-  |<--- Progress / ProfileEvents ------|  final updates
-  |<--- EndOfStream -------------------|  authoritative end of query
-  |                                    |
-  [Back to READY]
-```
-
-Source: see `TCPHandler::processOrdinaryQuery` in `src/Server/TCPHandler.cpp` for the server-side send sequence (around line 1608 for the header, line 1655 for result blocks, line 1685 for the empty block, line 1047 for EndOfStream).
-
-Or on error at any point during query execution:
-```
-  |<--- Exception ---------------------|
-  [Back to READY or Disconnect]
-```
-
-**After sending the Query packet**, the client must send at least one ExternalTable. An empty external table (empty table name + empty block) signals "no more client data." The server will not begin executing the query until it receives this end marker.
-
-**Reading the response**: the client must loop, reading packets until `EndOfStream` (or `Exception`). The server interleaves several packet types during query execution, and a single client `read()` is insufficient to consume a complete response. See §6.11 for the distinction between the header block and subsequent row blocks.
-
-**Packets the client must handle during this phase:**
-- `Data` — result blocks (see §6.11 for header vs. row blocks)
-- `Progress` — execution metrics (rows read, bytes read, elapsed time)
-- `Exception` — server-side error; terminates the query
-- `EndOfStream` — query complete; transition back to READY
-- `Log` — server log lines (may be ignored)
-- `ProfileInfo`, `ProfileEvents` — profiling data (may be ignored)
-- `Totals`, `Extremes` — aggregation metadata blocks (same wire format as `Data`)
-- `TableColumns` — column defaults metadata (may be ignored)
-
----
-
-## 6. Message Reference
-
-### Notation
-
-Fields are listed in wire order. The `Type` column uses:
-- `VarUInt` — variable-length unsigned integer (LEB-128)
-- `String` — VarUInt-prefixed UTF-8 bytes
-- `UInt8`, `Int32`, etc. — fixed-width little-endian integers
-- `Bool` — single byte (0x00 or 0x01)
-- `(conditional)` — field present only when the named feature is active
-
-**Role** indicates who uses this field:
-- **client** — set by external clients (clickhouse-client, JDBC, custom clients)
-- **inter-server** — only meaningful for server-to-server communication in distributed queries; external clients write a default value (empty string, 0, false)
-- **universal** — used by both external clients and inter-server communication
-
-### 6.0 Packet Envelope
+## 5. Packet Envelope
 
 Every message on the wire follows the same outer structure:
 
@@ -264,16 +154,204 @@ Every message on the wire follows the same outer structure:
 [message body]                  — format depends on packet_type_code
 ```
 
-This applies to **both directions** (client → server and server → client). Complete packet type code tables are in section 9.
+This applies to **both directions** (client → server and server → client). Complete packet type code tables are in §10.
 
-**Important:** The packet type is VarUInt, not a fixed-width byte. For values < 128 this produces the same single byte, but implementations must use VarUInt encoding to remain compatible if future packet types reach ≥128.
+**Important:** The packet type is VarUInt, not a fixed-width byte. For values < 128 this produces the same single byte, but implementations must use VarUInt encoding to remain compatible if future packet types reach ≥128. See §11.5.
 
-The following message tables document only the **body** of each packet (the bytes after the packet type code). Field numbering starts at `1` for the first body field.
+Message tables in §7 document only the **body** of each packet (the bytes after the packet type code). Field numbering starts at `1` for the first body field.
 
-### 6.1 ClientHello
+---
 
-**Direction:** Client -> Server
+## 6. Connection Lifecycle
+
+This section is the **primary reference for client implementers**. Each state machine phase describes what to send, what to expect, and how to transition — with cross-references to the message formats in §7.
+
+### 6.1 States
+
+```
+  [Connect]
+      |
+      v
+  HANDSHAKE ---- error ----> [Disconnect]
+      |
+      ok
+      |
+      v
+  READY <----------------------------------+
+      |                                     |
+      |--- Ping -------> Pong ----------->--|
+      |                                     |
+      |--- Query ------> READING_RESPONSE ->|
+      |                                     |
+      +-------------------------------------+
+```
+
+A connection is always in exactly one of: `HANDSHAKE`, `READY`, `READING_RESPONSE`, or terminated.
+
+### 6.2 Handshake Phase
+
+#### Precondition
+TCP connection just established. No messages exchanged yet.
+
+#### Flow
+```
+Client                              Server
+  |--- ClientHello ------------------>|
+  |<--- ServerHello ------------------|    or Exception
+  |                                   |
+  |    (compute negotiated_version)   |
+  |                                   |
+  |--- Addendum ---------------------->|    only if negotiated_version ≥ 54458
+```
+
+#### Step 1: Client sends ClientHello
+
+See §7.1 for the wire format.
+
+The client sends its maximum supported protocol version in `protocol_version`. The server will respond with its own version, and both sides will then use `min(client_version, server_version)` as the negotiated version for all subsequent messages.
+
+#### Step 2: Client reads response
+
+Dispatch on the packet type (§5):
+
+| Packet type (§10.2)       | Action |
+|---------------------------|--------|
+| `Hello` (0) → §7.2        | Decode ServerHello. Compute `negotiated_version = min(client_ver, server_ver)`. Proceed to Step 3. |
+| `Exception` (2) → §7.6    | Decode Exception. Return as error. Terminate connection. |
+| anything else             | Protocol violation. Terminate connection. |
+
+#### Step 3: Addendum (conditional)
+
+If `negotiated_version ≥ 54458` (feature `ADDENDUM`, §4.3), the client must send an Addendum. See §7.3.
+
+**Critical:** The decision to send the addendum is based on the **negotiated** version, not the client's declared version. Sending it when the server doesn't expect it will misalign subsequent messages and corrupt the connection.
+
+#### Postcondition
+On success, connection transitions to `READY`. On any error, terminate the connection.
+
+---
+
+### 6.3 Ping Phase
+
+#### Precondition
+Connection in `READY` state.
+
+#### Flow
+```
+Client                              Server
+  |--- Ping (0x04) ------------------->|
+  |<--- Pong (0x04) -------------------|
+```
+
+#### Step 1: Client sends Ping
+See §7.4.
+
+#### Step 2: Client reads response
+
+| Packet type (§10.2)       | Action |
+|---------------------------|--------|
+| `Pong` (4) → §7.5         | Keepalive confirmed. Transition back to `READY`. |
+| `Exception` (2) → §7.6    | Decode, return as error. |
+| anything else             | Protocol violation. |
+
+---
+
+### 6.4 Query Phase
+
+This is the most complex phase. The server emits a stream of packets in response to a single query, and the client must loop until it sees `EndOfStream`.
+
+#### Precondition
+Connection in `READY` state.
+
+#### Flow
+```
+Client                              Server
+  |--- Query packet ------------------>|     §7.7
+  |--- ExternalTable (data) ---------->|     §7.11  (optional, for temp tables)
+  |--- Empty Data marker ------------->|     §7.11  (required, end-of-client-data)
+  |                                    |
+  |<--- Data (header block) -----------|     §7.11  schema: N cols, 0 rows
+  |<--- Progress ----------------------|     0 or more, interleaved
+  |<--- Log ---------------------------|     0 or more (if server logs enabled)
+  |<--- Data (result block) -----------|     0 or more: N cols, M rows each
+  |<--- Totals / Extremes -------------|     0 or more (aggregation queries)
+  |<--- ProfileInfo / ProfileEvents ---|     0 or more (profiling)
+  |<--- Data (empty block) ------------|     boundary marker (NOT the end)
+  |<--- Progress ----------------------|     final updates
+  |<--- EndOfStream ------------------>|     authoritative end of query
+```
+
+On error at any point:
+```
+  |<--- Exception --------------------->|    terminates the query
+```
+
+#### Step 1: Client sends Query packet
+
+See §7.7. The client must choose a unique `query_id` (typically a UUID).
+
+#### Step 2: Client sends end-of-client-data marker
+
+The server will not begin executing the query until it receives at least one Data packet after the Query. For a plain `SELECT`, this is the empty Data packet (see "Empty Data packet" below).
+
+For `INSERT` queries or queries using external tables, the client first sends Data packets containing the actual data, then the empty Data packet to signal "no more data."
+
+See §7.11 for the Data packet format. The empty Data packet has:
+- `table_name = ""`
+- `num_columns = 0`
+- `num_rows = 0`
+
+#### Step 3: Client transitions to `READING_RESPONSE` and flushes
+
+The client must flush its write buffer at this point. Without a flush, the server may block waiting for input while the client blocks waiting for output.
+
+#### Step 4: Client reads response packets in a loop
+
+The server sends a stream of packets. The client loops, reading one packet envelope (§5) at a time, and dispatches by packet type:
+
+| Packet type (§10.2)          | Action |
+|------------------------------|--------|
+| `Data` (1) → §7.11           | Decode the block. First Data = schema header (§7.11). Subsequent = result blocks (accumulate). Empty block (0/0) = boundary marker. **Do not treat num_rows=0 as end-of-query.** |
+| `Progress` (3)               | Execution metrics (rows read, bytes read, elapsed time). May be aggregated or ignored. |
+| `EndOfStream` (5)            | Query complete. **Exit the loop.** Transition to `READY`. |
+| `ProfileInfo` (6)            | Profiling data. May be ignored. |
+| `Totals` (7)                 | Aggregation totals block (same wire format as Data). |
+| `Extremes` (8)               | Min/max values block (same wire format as Data). |
+| `Log` (10)                   | Server log line. May be ignored. |
+| `TableColumns` (11)          | Column defaults metadata. May be ignored. |
+| `ProfileEvents` (14)         | Performance counters. May be ignored. |
+| `Exception` (2) → §7.6       | Decode and return as error. Exit the loop. Transition to `READY`. |
+| anything else                | Unexpected during query phase. Terminate connection. |
+
+See §11.6 for the common "SELECT returns 0 rows" pitfall.
+
+#### Postcondition
+On `EndOfStream` or handled `Exception`, connection returns to `READY`. On protocol violation or I/O error, terminate the connection.
+
+---
+
+## 7. Message Reference
+
+### Notation
+
+Fields are listed in wire order. The `Type` column uses:
+- `VarUInt` — variable-length unsigned integer (LEB-128, §2.1)
+- `String` — VarUInt-prefixed UTF-8 bytes (§2.3)
+- `UInt8`, `Int32`, etc. — fixed-width little-endian integers (§2.2)
+- `Bool` — single byte, 0x00 or 0x01 (§2.4)
+
+**Role** indicates who uses this field:
+- **client** — set by external clients (clickhouse-client, JDBC, custom clients)
+- **inter-server** — only meaningful for server-to-server communication in distributed queries; external clients write a default value (empty string, 0, false)
+- **universal** — used by both external clients and inter-server communication
+
+Message tables document only the **body** of each packet (after the packet type byte of §5). Field numbering starts at `1` for the first body field.
+
+### 7.1 ClientHello
+
+**Direction:** Client → Server
 **Packet type:** `0`
+**Referenced by:** §6.2 (handshake phase)
 
 Sent as the first message after TCP connection. No feature gating — all body fields are always present.
 
@@ -287,10 +365,11 @@ Sent as the first message after TCP connection. No feature gating — all body f
 | 6 | user              | String  | universal | Username for authentication |
 | 7 | password          | String  | universal | Password (plaintext) |
 
-### 6.2 ServerHello
+### 7.2 ServerHello
 
-**Direction:** Server -> Client
+**Direction:** Server → Client
 **Packet type:** `0`
+**Referenced by:** §6.2 (handshake phase)
 
 Server's response to ClientHello on successful authentication.
 
@@ -304,35 +383,39 @@ Server's response to ClientHello on successful authentication.
 | 6 | display_name      | String  | universal | DISPLAY_NAME (v54372)   | Human-readable server name |
 | 7 | version_patch     | VarUInt | universal | VERSION_PATCH (v54401)  | Server patch version |
 
-### 6.3 Addendum
+### 7.3 Addendum
 
-**Direction:** Client -> Server
-**Condition:** Negotiated version >= 54458 (ADDENDUM)
+**Direction:** Client → Server
+**Condition:** Negotiated version ≥ 54458 (ADDENDUM)
+**Referenced by:** §6.2 (handshake phase)
 
-Not a distinct packet type. Sent as raw fields immediately after the handshake completes.
+Not a distinct packet type. Sent as raw fields immediately after the handshake completes. There is **no** packet type byte prefix.
 
 | # | Field     | Type   | Role         | Description |
 |---|-----------|--------|--------------|-------------|
-| 1 | quota_key | String | inter-server | Resource quota identifier. Client sends empty string. |
+| 1 | quota_key | String | inter-server | Resource quota identifier. External clients send empty string. |
 
-### 6.4 Ping
+### 7.4 Ping
 
-**Direction:** Client -> Server
+**Direction:** Client → Server
 **Packet type:** `4`
+**Referenced by:** §6.3 (ping phase)
 
-No body. Just the packet envelope (single byte `0x04`).
+No body. Just the packet envelope — a single byte `0x04` on the wire.
 
-### 6.5 Pong
+### 7.5 Pong
 
-**Direction:** Server -> Client
+**Direction:** Server → Client
 **Packet type:** `4`
+**Referenced by:** §6.3 (ping phase)
 
-No body. Just the packet envelope (single byte `0x04`).
+No body. Just the packet envelope — a single byte `0x04` on the wire.
 
-### 6.6 Exception
+### 7.6 Exception
 
-**Direction:** Server -> Client
+**Direction:** Server → Client
 **Packet type:** `2`
+**Referenced by:** §6.2, §6.3, §6.4
 
 Sent when the server encounters an error during any phase.
 
@@ -346,64 +429,66 @@ Sent when the server encounters an error during any phase.
 
 If `has_nested` is true, the receiver should read another Exception structure immediately after (without a packet type prefix). This forms a chain of nested exceptions.
 
-### 6.7 Query
+### 7.7 Query
 
-**Direction:** Client -> Server
+**Direction:** Client → Server
 **Packet type:** `1`
+**Referenced by:** §6.4 (query phase)
 
 | # | Field          | Type          | Role         | Condition                             | Description |
 |---|----------------|---------------|--------------|---------------------------------------|-------------|
 | 1 | query_id       | String        | universal    | always                                | Unique query identifier (UUID) |
-| 2 | client_info    | ClientInfo    | universal    | WRITE_CLIENT_INFO (v54420)            | See section 6.8 |
-| 3 | settings       | Setting[]     | universal    | SETTINGS_SERIALIZED_AS_STRINGS (v54429) | See section 6.9. Terminated by empty key. |
-| 4 | cluster_secret | String        | inter-server | INTERSERVER_SECRET (v54441)           | Cluster auth. Client sends empty string. |
+| 2 | client_info    | ClientInfo    | universal    | WRITE_CLIENT_INFO (v54420)            | See §7.8 |
+| 3 | settings       | Setting[]     | universal    | SETTINGS_SERIALIZED_AS_STRINGS (v54429) | See §7.9. Terminated by empty key. |
+| 4 | cluster_secret | String        | inter-server | INTERSERVER_SECRET (v54441)           | Cluster auth. External clients send empty string. |
 | 5 | stage          | VarUInt       | universal    | always                                | 0=FetchColumns, 1=WithMergeableState, 2=Complete |
 | 6 | compression    | VarUInt       | universal    | always                                | 0=disabled, 1=enabled |
 | 7 | query_body     | String        | universal    | always                                | SQL text |
-| 8 | parameters     | Parameter[]   | client       | PARAMETERS (v54459)                   | See section 6.10. Terminated by empty key. |
+| 8 | parameters     | Parameter[]   | client       | PARAMETERS (v54459)                   | See §7.10. Terminated by empty key. |
 
-### 6.8 ClientInfo
+### 7.8 ClientInfo
 
-**Direction:** Client -> Server (embedded in Query)
+**Direction:** Client → Server (embedded in Query)
 **Condition:** WRITE_CLIENT_INFO (v54420)
+**Referenced by:** §7.7
 
-Not a standalone packet. Encoded inline as part of the Query message.
+Not a standalone packet. Encoded inline as part of the Query message body (field 2).
 
-| # | Field                      | Type    | Role         | Condition                          | Description |
-|---|----------------------------|---------|--------------|------------------------------------|-----------------------------------------|
-| 1 | query_kind                 | UInt8   | universal    | always                             | 0=NoQuery, 1=InitialQuery, 2=SecondaryQuery. Client sends `1`. `2` is inter-server only. |
-| 2 | initial_user               | String  | universal    | always                             | User who initiated the query |
-| 3 | initial_query_id           | String  | universal    | always                             | Original query ID |
-| 4 | initial_address            | String  | universal    | always                             | Originating client socket address in `host:port` format. See §10.1. |
-| 5 | initial_time               | Int64   | client       | INITIAL_QUERY_START_TIME (v54449)  | Query start time (microseconds). Fixed-width 8 bytes, not VarUInt. See §10.2. |
-| 6 | query_interface            | UInt8   | universal    | always                             | 1=TCP, 2=HTTP |
-| 7 | os_user                    | String  | client       | if interface=TCP                   | OS username |
-| 8 | client_hostname            | String  | client       | if interface=TCP                   | Client machine hostname |
-| 9 | client_name                | String  | client       | if interface=TCP                   | Client application name |
-| 10| version_major              | VarUInt | universal    | if interface=TCP                   | Client major version |
-| 11| version_minor              | VarUInt | universal    | if interface=TCP                   | Client minor version |
-| 12| protocol_version           | VarUInt | universal    | if interface=TCP                   | Negotiated protocol version |
-| 13| quota_key                  | String  | inter-server | QUOTA_KEY_IN_CLIENT_INFO (v54060)  | Resource quota key. Client sends empty string. |
-| 14| distributed_depth          | VarUInt | inter-server | DISTRIBUTED_DEPTH (v54448)         | Distributed query nesting depth. Client sends `0`. |
-| 15| version_patch              | VarUInt | universal    | VERSION_PATCH (v54401), TCP only   | Client patch version |
-| 16| open_telemetry             | (below) | client       | OPEN_TELEMETRY (v54442)            | Trace context. Client sends `0` (no trace) if unused. |
-| 17| collaborate_with_initiator | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)         | Bool as VarUInt. Client sends `0`. |
-| 18| count_participating_replicas | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)       | Replica count. Client sends `0`. |
-| 19| number_of_current_replica  | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)         | Replica index. Client sends `0`. |
+| # | Field                        | Type    | Role         | Condition                          | Description |
+|---|------------------------------|---------|--------------|------------------------------------|-----------------------------------------|
+| 1 | query_kind                   | UInt8   | universal    | always                             | 0=NoQuery, 1=InitialQuery, 2=SecondaryQuery. External clients send `1`. `2` is inter-server only. |
+| 2 | initial_user                 | String  | universal    | always                             | User who initiated the query |
+| 3 | initial_query_id             | String  | universal    | always                             | Original query ID |
+| 4 | initial_address              | String  | universal    | always                             | Originating client socket address in `host:port` format. See §11.1. |
+| 5 | initial_time                 | Int64   | client       | INITIAL_QUERY_START_TIME (v54449)  | Query start time (microseconds). **Fixed-width 8 bytes**, not VarUInt. See §11.2. |
+| 6 | query_interface              | UInt8   | universal    | always                             | 1=TCP, 2=HTTP |
+| 7 | os_user                      | String  | client       | if interface=TCP                   | OS username |
+| 8 | client_hostname              | String  | client       | if interface=TCP                   | Client machine hostname |
+| 9 | client_name                  | String  | client       | if interface=TCP                   | Client application name |
+| 10| version_major                | VarUInt | universal    | if interface=TCP                   | Client major version |
+| 11| version_minor                | VarUInt | universal    | if interface=TCP                   | Client minor version |
+| 12| protocol_version             | VarUInt | universal    | if interface=TCP                   | Negotiated protocol version |
+| 13| quota_key                    | String  | inter-server | QUOTA_KEY_IN_CLIENT_INFO (v54060)  | Resource quota key. External clients send empty string. |
+| 14| distributed_depth            | VarUInt | inter-server | DISTRIBUTED_DEPTH (v54448)         | Distributed query nesting depth. External clients send `0`. |
+| 15| version_patch                | VarUInt | universal    | VERSION_PATCH (v54401), TCP only   | Client patch version |
+| 16| open_telemetry               | (below) | client       | OPEN_TELEMETRY (v54442)            | Trace context. Clients without tracing send `0` (no trace). |
+| 17| collaborate_with_initiator   | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)         | Bool as VarUInt. External clients send `0`. |
+| 18| count_participating_replicas | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)         | Replica count. External clients send `0`. |
+| 19| number_of_current_replica    | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)         | Replica index. External clients send `0`. |
 
 **OpenTelemetry encoding** (field 16):
 ```
-[UInt8: has_trace]       — 0 = no trace data follows, 1 = trace data follows
+[UInt8: has_trace]              0 = no trace data follows, 1 = trace data follows
 If has_trace == 1:
-  [16 bytes: trace_id]   — byte-swapped (see ClickHouse issue #34369)
-  [8 bytes: span_id]     — byte-swapped
-  [String: trace_state]  — W3C trace state
-  [UInt8: trace_flags]   — W3C trace flags
+  [16 bytes: trace_id]          byte-swapped per-8-bytes (historical quirk)
+  [8 bytes: span_id]            byte-swapped
+  [String: trace_state]         W3C trace state
+  [UInt8: trace_flags]          W3C trace flags
 ```
 
-### 6.9 Setting
+### 7.9 Setting
 
-Encoded inline as part of the Query message settings list. The list is terminated by a Setting with an empty key (just VarUInt `0`, no flags or value follow).
+Encoded inline as part of the Query message settings list (§7.7, field 3). The list is terminated by a Setting with an empty key (just VarUInt `0`, no flags or value follow).
 
 | # | Field | Type    | Role      | Description |
 |---|-------|---------|-----------|-------------|
@@ -413,7 +498,7 @@ Encoded inline as part of the Query message settings list. The list is terminate
 
 Fields 2 and 3 are **not present** when key is empty (the terminator).
 
-### 6.10 Parameter
+### 7.10 Parameter
 
 Query parameters (for parameterized queries like `SELECT {x:UInt64}`). Encoded identically to a Setting with the `Custom` flag (0x02) set. Terminated by empty key, same as settings.
 
@@ -423,9 +508,13 @@ Query parameters (for parameterized queries like `SELECT {x:UInt64}`). Encoded i
 | 2 | flags | VarUInt | client | Always `0x02` (Custom) |
 | 3 | value | String  | client | Parameter value as string |
 
-### 6.11 Block (Data Packet)
+### 7.11 Block (Data Packet)
 
 A **Block** is the fundamental unit of data processing in ClickHouse — both internally within the query engine and on the wire. Understanding the Block is essential to understanding the protocol.
+
+**Direction:** Client → Server or Server → Client
+**Packet type:** `2` (client → server) or `1` (server → client)
+**Referenced by:** §6.4 (query phase)
 
 #### What is a Block?
 
@@ -452,43 +541,30 @@ A Block contains only the **columns involved in the query**, not all columns of 
 The columnar format is what gives the ClickHouse native protocol much of its performance advantage:
 
 1. **No serialization conversion.** The server's in-memory representation is columnar. The client's consumption of analytical results is typically column-wise (aggregations, exports to Parquet/Arrow, etc.). Sending data columnar avoids any row-oriented intermediate format. No transpose step on either side.
-
-2. **Better compression.** Values within a column are the same type and often have low cardinality or repetition (e.g., timestamps, enums, boolean flags). Column-by-column compression achieves much higher ratios than row-by-row compression of mixed types.
-
+2. **Better compression.** Values within a column are the same type and often have low cardinality or repetition. Column-by-column compression achieves much higher ratios than row-by-row compression of mixed types.
 3. **Vectorized processing.** The client can process entire columns with SIMD or batched operations without splitting and regrouping by type.
-
 4. **Streaming efficiency.** Large result sets are sent as multiple Blocks. Each Block is independent — the client can start processing column 1 of Block N while Block N+1 is still arriving on the socket.
 
 Compare to row-oriented protocols (MySQL, PostgreSQL): every row must be encoded as a heterogeneous tuple, typed field-by-field. For analytical workloads returning millions of rows, this serialization cost dominates.
 
-#### Block on the wire
+#### Data packet wire format
 
-**Direction:** Client -> Server or Server -> Client
-**Packet type:** `2` (client → server, `ClientPacket::Data`) or `1` (server → client, `ServerPacket::Data`)
+The wire format is **symmetric** — both directions include a `table_name` prefix. The only difference is the packet type byte (§5): `2` for client → server, `1` for server → client.
 
-The wire format is **symmetric** — both directions include a `table_name` prefix:
-
-**Client → Server** (used for INSERT data and external tables):
 ```
-[VarUInt: 2]                     packet type (ClientPacket::Data)
-[String: table_name]             external table name ("" for INSERT data / end marker)
-[Block body]                     see below
-```
-
-**Server → Client** (used for result blocks):
-```
-[VarUInt: 1]                     packet type (ServerPacket::Data)
-[String: table_name]             almost always "" for query results
-[Block body]                     see below
+[VarUInt: packet_type]     2 (client→server) or 1 (server→client)
+[String: table_name]       External table name; "" in most cases
+[BlockInfo]                Metadata (if BLOCK_INFO feature active, §4.3)
+[VarUInt: num_columns]     Number of columns in this block
+[VarUInt: num_rows]        Number of rows in this block
+[Column × num_columns]     Column entries, omitted if num_columns = 0
 ```
 
-The `table_name` is present in **both** directions. On server → client, it is effectively always empty. See §10.4.
-
-#### table_name
+#### table_name field
 
 | Field      | Type   | Role      | Condition               | Description |
 |------------|--------|-----------|-------------------------|-------------|
-| table_name | String | universal | TEMP_TABLES (v50264)    | External table name. Client: empty = end-of-data marker. Server: always empty for query results. |
+| table_name | String | universal | TEMP_TABLES (v50264)    | External table name. Client: empty = end-of-data marker. Server: always empty for query results. See §11.4. |
 
 #### BlockInfo
 
@@ -498,8 +574,8 @@ Unlike all other protocol structures, BlockInfo uses **field-tagged encoding** f
 
 | Field ID | Field         | Type  | Role         | Description |
 |----------|---------------|-------|--------------|-------------|
-| 1        | is_overflows  | UInt8 | inter-server | Overflow block from GROUP BY. Client sends `0` (false). |
-| 2        | bucket_number | Int32 | inter-server | Aggregation bucket. Client sends `-1` (no bucket). |
+| 1        | is_overflows  | UInt8 | inter-server | Overflow block from GROUP BY. External clients send `0` (false). |
+| 2        | bucket_number | Int32 | inter-server | Aggregation bucket. External clients send `-1` (no bucket). See §11.3. |
 | 0        | (terminator)  | —     | universal    | Marks end of BlockInfo. Always required. |
 
 Wire encoding:
@@ -509,73 +585,100 @@ Wire encoding:
 [VarUInt: 0]
 ```
 
-#### Block Body
-
-| # | Field       | Type      | Role      | Description |
-|---|-------------|-----------|-----------|-------------|
-| 1 | block_info  | BlockInfo | universal | See above. Present if BLOCK_INFO (v51903) active. |
-| 2 | num_columns | VarUInt   | universal | Number of columns |
-| 3 | num_rows    | VarUInt   | universal | Number of rows |
-| 4 | columns     | Column[]  | universal | One entry per column (see below). Not present if num_columns=0. |
-
 #### Column
 
-Repeated `num_columns` times:
+Repeated `num_columns` times. Only present when `num_columns > 0`.
 
-| # | Field       | Type    | Role      | Description |
-|---|-------------|---------|-----------|-------------|
-| 1 | name        | String  | universal | Column name |
-| 2 | type        | String  | universal | ClickHouse type name (e.g., "UInt64", "String") |
-| 3 | data        | bytes   | universal | Type-specific binary encoding for all rows. See section 7. |
+| # | Field                | Type    | Role      | Condition                     | Description |
+|---|----------------------|---------|-----------|-------------------------------|-------------|
+| 1 | name                 | String  | universal | always                        | Column name |
+| 2 | type                 | String  | universal | always                        | ClickHouse type name (e.g., "UInt64", "String") |
+| 3 | has_custom_serialization | UInt8 | universal | CUSTOM_SERIALIZATION (v54454) | 0 = default serialization, 1 = custom (kind_stack follows). See §11.7. |
+| 4 | kind_stack           | bytes   | universal | if field 3 == 1               | Opaque serialization metadata describing the non-default format (sparse, low-cardinality, etc.). Not yet specified in this document. |
+| 5 | data                 | bytes   | universal | always                        | Column values for all `num_rows` rows. Layout depends on the type and (if custom) the kind_stack. See §8. |
 
-#### Header block vs. result blocks
+**Custom serialization** (field 3 = 1) enables the server to transmit columns in non-default on-wire formats:
+- **Sparse** — columns with mostly default values transmit only non-defaults + indices
+- **Low-cardinality / dictionary** — columns with few unique values transmit a dictionary + indices
+- Other variants may exist
 
-All Data packets for a query use the same wire format. They differ only in their `num_columns` / `num_rows` values and their position in the response stream:
+For most use cases, clients write `0` (default serialization) and reject non-zero values from the server if they don't implement custom decoding. Columns in INSERT data from external clients are almost always default serialization.
 
-| Variant        | `num_columns` | `num_rows` | Position           | Purpose |
-|----------------|---------------|------------|--------------------|---------|
-| **Header block**   | N > 0 | **0**     | First Data packet  | Announces the result schema: column names and types. Sent exactly once per query. |
-| **Result block**   | N > 0 | M > 0     | 0 or more after header | Actual result data, columnar. Same column order as the header. Streaming: large result sets arrive as multiple result blocks. |
-| **Empty block**    | 0     | 0         | Once near end      | Sent by server after all data — a boundary marker but **not** the query terminator. |
+**Omitting this field when the feature is active** is a common bug — see §11.7.
 
-The header block is the client's source of truth for column names and types; it is **required** to parse subsequent result blocks correctly (you cannot decode column data without knowing the types). A query that returns zero rows still sends a header block (N columns, 0 rows).
+#### Block variants and their meaning
 
-Structurally, "header" vs. "result" vs. "empty" is purely a function of the contents — there is no distinct packet type or wire marker. A client that loops on `ServerPacket::Data` naturally handles all three; the only rule is **don't treat `num_rows = 0` as end-of-query**. Only `EndOfStream` (packet type 5) signals the end. See §10.6.
+All Data packets use the same wire format above. Their **meaning** depends on their content and position in the response stream:
 
-#### Empty Block
+| Variant            | `num_columns` | `num_rows` | Position in stream      | Purpose |
+|--------------------|---------------|------------|-------------------------|---------|
+| **Header block**   | N > 0         | **0**      | 1st Data after a Query  | Announces the result schema (column names + types). Sent exactly once per query. |
+| **Result block**   | N > 0         | M > 0      | 0 or more after header  | Actual result data. Same column order as the header. Large result sets stream as multiple result blocks. |
+| **Empty block**    | 0             | 0          | Client: end-of-data marker before server responds. Server: boundary marker near end of response stream (not the query terminator). | |
 
-An empty block signals "end of data." It is used in two contexts:
+Structurally, these three are just different fillings of the same wire format. A client that loops on `ServerPacket::Data` naturally handles all three; the key rule is **never treat `num_rows = 0` as end-of-query**. Only `EndOfStream` (packet type 5, §10.2) signals the end of a query. See §11.6.
 
-1. **Client -> Server:** As the empty ExternalTable to mark end of client data after a Query packet.
-2. **Server -> Client:** Rare — some server versions may emit one, but `EndOfStream` is the authoritative end marker.
+#### Byte-level examples
 
-An empty block has `num_columns=0` and `num_rows=0` with no column entries. The full wire encoding of an empty Data packet (with BLOCK_INFO active), including the packet type and table_name, is:
+##### Example 1: Empty Data packet (12 bytes, with BLOCK_INFO active)
+
+Used as the client's end-of-client-data marker (§6.4 Step 2), and also sent by the server as a boundary marker in the response stream.
 
 ```
-[VarUInt: packet_type]              2 (client→server) or 1 (server→client)
-[VarUInt: 0]                        table_name = "" (empty)
-
-BlockInfo:
-  [VarUInt: 1] [UInt8: 0x00]       is_overflows = false
-  [VarUInt: 2] [Int32: FF FF FF FF] bucket_number = -1
-  [VarUInt: 0]                      end of BlockInfo
-
-Block body:
-  [VarUInt: 0]                      num_columns = 0
-  [VarUInt: 0]                      num_rows = 0
+02                      packet_type = 2 (client→server) or 01 for server→client
+00                      table_name = "" (varuint length 0, no bytes follow)
+01 00                   BlockInfo field_id=1, is_overflows = 0 (false)
+02 FF FF FF FF          BlockInfo field_id=2, bucket_number = -1 (Int32 LE)
+00                      BlockInfo terminator (field_id=0)
+00                      num_columns = 0
+00                      num_rows = 0
 ```
 
-Total: 12 bytes. No column data follows.
+##### Example 2: Header block for `SELECT 1`
+
+The server announces one column named `"1"` of type `UInt8`, with zero rows. At protocol ≥ 54454, the `has_custom_serialization` byte is included.
+
+```
+01                      packet_type = 1 (ServerPacket::Data)
+00                      table_name = ""
+01 00                   BlockInfo: is_overflows = 0
+02 FF FF FF FF          BlockInfo: bucket_number = -1
+00                      BlockInfo terminator
+01                      num_columns = 1
+00                      num_rows = 0
+01 "1"                  Column[0].name = "1"
+05 "UInt8"              Column[0].type = "UInt8"
+00                      Column[0].has_custom_serialization = 0 (v54454+)
+                        Column[0].data: no bytes (num_rows is 0)
+```
+
+##### Example 3: Result block for `SELECT 1` (the row)
+
+Same structure as the header but with `num_rows = 1` and 1 byte of column data.
+
+```
+01                      packet_type = 1
+00                      table_name = ""
+01 00                   BlockInfo: is_overflows = 0
+02 FF FF FF FF          BlockInfo: bucket_number = -1
+00                      BlockInfo terminator
+01                      num_columns = 1
+01                      num_rows = 1
+01 "1"                  Column[0].name = "1"
+05 "UInt8"              Column[0].type = "UInt8"
+00                      Column[0].has_custom_serialization = 0 (v54454+)
+01                      Column[0].data: one UInt8 byte = 1
+```
 
 ---
 
-## 7. Data Types & Column Encoding
+## 8. Data Types & Column Encoding
 
-> **Placeholder.** This section will document how each ClickHouse data type (UInt8, String, DateTime, Nullable, Array, etc.) is serialized within the column data portion of a Block.
+> **Placeholder.** This section will document how each ClickHouse data type (UInt8, String, DateTime, Nullable, Array, etc.) is serialized within the `data` field of a Column (§7.11).
 
 ---
 
-## 8. Compression
+## 9. Compression
 
 > **Placeholder.** This section will document block-level compression. The compression frame format is:
 > ```
@@ -588,158 +691,148 @@ Total: 12 bytes. No column data follows.
 
 ---
 
-## 9. Packet Type Reference
+## 10. Packet Type Reference
 
-### Client -> Server
+### 10.1 Client → Server
 
-| Code | Name                      | Description |
-|------|---------------------------|-------------|
-| 0    | Hello                     | Handshake initiation |
-| 1    | Query                     | Query execution request |
-| 2    | Data                      | Data block (INSERT data, external tables) |
-| 3    | Cancel                    | Cancel running query |
-| 4    | Ping                      | Keepalive check |
-| 5    | TablesStatusRequest       | Table status check |
-| 6    | KeepAlive                 | Connection keepalive |
-| 7    | Scalar                    | Scalar data block |
-| 8    | IgnoredPartUUIDs          | Parts to exclude from query |
-| 9    | ReadTaskResponse          | S3 cluster read response |
-| 10   | MergeTreeReadTaskResponse | Parallel read task response |
-| 11   | SSHChallengeRequest       | SSH auth challenge request |
-| 12   | SSHChallengeResponse      | SSH auth challenge response |
-| 13   | QueryPlan                 | Query plan |
+| Code | Name                      | Body format          | Description |
+|------|---------------------------|----------------------|-------------|
+| 0    | Hello                     | §7.1                 | Handshake initiation |
+| 1    | Query                     | §7.7                 | Query execution request |
+| 2    | Data                      | §7.11                | Data block (INSERT data, external tables, end-of-data marker) |
+| 3    | Cancel                    | (no body)            | Cancel running query |
+| 4    | Ping                      | §7.4 (no body)       | Keepalive check |
+| 5    | TablesStatusRequest       | *(not yet specified)* | Table status check |
+| 6    | KeepAlive                 | *(not yet specified)* | Connection keepalive |
+| 7    | Scalar                    | *(not yet specified)* | Scalar data block |
+| 8    | IgnoredPartUUIDs          | *(not yet specified)* | Parts to exclude from query |
+| 9    | ReadTaskResponse          | *(not yet specified)* | S3 cluster read response |
+| 10   | MergeTreeReadTaskResponse | *(not yet specified)* | Parallel read task response |
+| 11   | SSHChallengeRequest       | *(not yet specified)* | SSH auth challenge request |
+| 12   | SSHChallengeResponse      | *(not yet specified)* | SSH auth challenge response |
+| 13   | QueryPlan                 | *(not yet specified)* | Query plan |
 
-### Server -> Client
+### 10.2 Server → Client
 
-| Code | Name                              | Description |
-|------|-----------------------------------|-------------|
-| 0    | Hello                             | Handshake response |
-| 1    | Data                              | Result data block |
-| 2    | Exception                         | Error |
-| 3    | Progress                          | Query execution progress |
-| 4    | Pong                              | Keepalive response |
-| 5    | EndOfStream                       | Query complete |
-| 6    | ProfileInfo                       | Profiling data |
-| 7    | Totals                            | GROUP BY totals block |
-| 8    | Extremes                          | Min/max values block |
-| 9    | TablesStatusResponse              | Table status response |
-| 10   | Log                               | Query execution logs |
-| 11   | TableColumns                      | Column descriptions for defaults |
-| 12   | PartUUIDs                         | Unique part IDs |
-| 13   | ReadTaskRequest                   | Cluster read task request |
-| 14   | ProfileEvents                     | Performance counters |
-| 15   | MergeTreeAllRangesAnnouncement    | Parallel read initialization |
-| 16   | MergeTreeReadTaskRequest          | Parallel read task assignment |
-| 17   | TimezoneUpdate                    | Server timezone update |
-| 18   | SSHChallenge                      | SSH auth challenge |
+| Code | Name                              | Body format          | Description |
+|------|-----------------------------------|----------------------|-------------|
+| 0    | Hello                             | §7.2                 | Handshake response |
+| 1    | Data                              | §7.11                | Result data block |
+| 2    | Exception                         | §7.6                 | Error |
+| 3    | Progress                          | *(not yet specified)* | Query execution progress |
+| 4    | Pong                              | §7.5 (no body)       | Keepalive response |
+| 5    | EndOfStream                       | (no body)            | Query complete |
+| 6    | ProfileInfo                       | *(not yet specified)* | Profiling data |
+| 7    | Totals                            | §7.11 (same as Data) | GROUP BY totals block |
+| 8    | Extremes                          | §7.11 (same as Data) | Min/max values block |
+| 9    | TablesStatusResponse              | *(not yet specified)* | Table status response |
+| 10   | Log                               | *(not yet specified)* | Query execution log line |
+| 11   | TableColumns                      | *(not yet specified)* | Column descriptions for defaults |
+| 12   | PartUUIDs                         | *(not yet specified)* | Unique part IDs |
+| 13   | ReadTaskRequest                   | *(not yet specified)* | Cluster read task request |
+| 14   | ProfileEvents                     | *(not yet specified)* | Performance counters |
+| 15   | MergeTreeAllRangesAnnouncement    | *(not yet specified)* | Parallel read initialization |
+| 16   | MergeTreeReadTaskRequest          | *(not yet specified)* | Parallel read task assignment |
+| 17   | TimezoneUpdate                    | *(not yet specified)* | Server timezone update |
+| 18   | SSHChallenge                      | *(not yet specified)* | SSH auth challenge |
 
 ---
 
-## 10. Implementation Notes
+## 11. Implementation Notes
 
-Discoveries and gotchas that aren't obvious from the wire format alone. Each entry documents the symptom, cause, and fix.
+Discoveries and gotchas that aren't obvious from the wire format alone. Each entry documents the symptom, cause, and fix. These are hard-won findings from real implementations; future implementers are strongly encouraged to read through them before debugging misalignment issues.
 
-### 10.1 `ClientInfo.initial_address` must be non-empty in `host:port` format
+### 11.1 `ClientInfo.initial_address` must be non-empty in `host:port` format
 
-**Symptom:** Server rejects Query with:
-```
-DB::Exception: Assertion violation: !hostAndPort.empty()
-in file "base/poco/Net/src/SocketAddress.cpp", line 350
-```
+**Symptom:** Server rejects Query with an assertion violation in `SocketAddress::init()` complaining that `hostAndPort` is empty.
 
-**Cause:** The server parses `initial_address` via Poco's `SocketAddress::init()`, which fails an assertion if the string is empty.
+**Cause:** The server parses `initial_address` via a socket address parser that fails if the string is empty.
 
 **Fix:** Always send a valid `host:port` string, e.g., `"127.0.0.1:0"`. Port `0` is fine — the server uses this only for logging, not for actual connections.
 
 ---
 
-### 10.2 `ClientInfo.initial_time` is Int64, not VarUInt
+### 11.2 `ClientInfo.initial_time` is Int64, not VarUInt
 
-**Symptom:** Server hangs or rejects Query with:
-```
-DB::Exception: Cannot read all data. Bytes read: 54. Bytes expected: 108.
-(CANNOT_READ_ALL_DATA)
-```
+**Symptom:** Server rejects Query with `CANNOT_READ_ALL_DATA` — reporting a byte count shortfall (e.g., "Bytes read: 54. Bytes expected: 108.").
 
-**Cause:** `initial_time` is written as a **fixed-width Int64 (8 bytes, little-endian)** on the server side (`writeBinary(initial_query_start_time_microseconds, out)` in `ClientInfo.cpp`). Encoding it as VarUInt underruns the server's expected byte count by 7 bytes (VarUInt encodes `0` in 1 byte vs. 8 bytes for Int64).
+**Cause:** `initial_time` is a **fixed-width Int64 (8 bytes, little-endian)** on the wire. Encoding it as VarUInt under-runs the server's expected byte count by up to 7 bytes (VarUInt encodes `0` in 1 byte vs. 8 bytes for Int64).
 
-**Fix:** Use `write_i64` / `read_i64` for `initial_time`. Don't confuse this with other numeric fields in ClientInfo (`version_major`, `version_minor`, `protocol_version`, `distributed_depth`, etc.) which **are** VarUInt.
+**Fix:** Use a fixed-width 8-byte little-endian write for `initial_time`. Do not confuse this with other numeric fields in ClientInfo (`version_major`, `version_minor`, `protocol_version`, `distributed_depth`, etc.) which **are** VarUInt.
 
-**General rule:** Within ClientInfo specifically, timestamps are fixed-width; everything else numeric is VarUInt. Check the C++ server's `ClientInfo.cpp` for the authoritative encoding of each field.
+**General rule:** Within ClientInfo specifically, timestamps are fixed-width; everything else numeric is VarUInt. Always consult the field tables in §7.8 for the authoritative type of each field.
 
 ---
 
-### 10.3 `BlockInfo.bucket_number` default is `-1`, not `0`
+### 11.3 `BlockInfo.bucket_number` default is `-1`, not `0`
 
 **Symptom:** Server misinterprets normal result blocks as belonging to aggregation bucket `0`, leading to incorrect distributed query behavior.
 
 **Cause:** `0` is a valid bucket number (first bucket in a two-level GROUP BY aggregation). The "no bucket" sentinel is `-1`.
 
-**Fix:** Default-construct `BlockInfo` with `bucket_number = -1`. Only set it to a non-negative value when actually emitting bucketed aggregation blocks (inter-server use only; external clients should always send `-1`).
+**Fix:** Default-construct BlockInfo with `bucket_number = -1`. Only set it to a non-negative value when actually emitting bucketed aggregation blocks (inter-server use only; external clients should always send `-1`).
 
 ---
 
-### 10.4 Server → Client Data packet also carries `table_name`
+### 11.4 Data packets are symmetric — both directions carry `table_name`
 
 **Symptom:** Client hangs on read after query, or decodes garbage for column names/types.
 
-**Cause:** The Data packet wire format is **symmetric** — both directions include an empty `String` (table name) before the Block. The server's `sendData()` in `TCPHandler.cpp` writes `writeStringBinary("", *out)` after the packet type and before the Block payload. An earlier version of this spec incorrectly claimed only client→server had this prefix.
+**Cause:** The Data packet wire format is **symmetric** — both directions include an empty `String` (table name) before the Block. Failing to read the `table_name` before decoding the Block on the server → client path misaligns every subsequent field.
 
-**Fix:** When reading a `ServerPacket::Data`, read a string first (the table name, almost always empty for query results) before calling `Block::decode`. See section 6.11 for the corrected wire diagram.
-
----
-
-### 10.5 Packet type codes are VarUInt, not u8
-
-**Symptom:** Works in testing (all current packet type codes are < 128, where VarUInt and u8 produce identical bytes), but future packet types ≥ 128 would silently break compatibility.
-
-**Cause:** Every ClickHouse C++ send/receive path uses `writeVarUInt(Protocol::...)` / `readVarUInt(...)` for packet type codes, not fixed-byte writes.
-
-**Fix:** Always use VarUInt encoding for packet type codes on both client and server sides. See section 6.0.
+**Fix:** When reading a `ServerPacket::Data`, read a `String` first (the table name, almost always empty for query results) before reading the Block body. See §7.11 for the full wire format.
 
 ---
 
-### 10.6 First Data packet after a query is the header (0 rows)
+### 11.5 Packet type codes are VarUInt, not UInt8
+
+**Symptom:** Works in testing (all current packet type codes are < 128, where VarUInt and UInt8 produce identical bytes), but future packet types ≥ 128 would silently break compatibility.
+
+**Cause:** The protocol's formal encoding for packet type codes is VarUInt, not fixed-width. Current implementations happen to work with UInt8 only because all packet type codes are small (0-18).
+
+**Fix:** Always use VarUInt encoding for packet type codes on both encode and decode paths. See §5.
+
+---
+
+### 11.6 First Data packet after a query is the header block (0 rows)
 
 **Symptom:** `SELECT 1` returns 1 column and **0 rows** instead of 1 row with value `1`.
 
 **Cause:** The server's response to a query is a **stream of packets**, not a single packet:
 
 ```
-Data (header:  N cols, 0 rows)        ← schema announcement, no data
-Data (result:  N cols, M rows)        ← actual data (0 or more such blocks)
+Data (header:  N cols, 0 rows)     ← schema announcement, no data
+Data (result:  N cols, M rows)     ← actual data (0 or more such blocks)
 ...
-Data (empty:   0 cols, 0 rows)        ← boundary marker, still NOT the end
-EndOfStream                            ← authoritative end of query
+Data (empty:   0 cols, 0 rows)     ← boundary marker, still NOT the end
+EndOfStream                         ← authoritative end of query
 ```
 
 A client that reads only one Data packet gets the header block — which correctly announces the columns but has zero rows. The actual data arrives in subsequent Data packets.
 
-`num_rows = 0` does **not** mean end-of-query. Only `EndOfStream` (packet type 5) signals the end of a query response. See server source: `TCPHandler::processOrdinaryQuery` in `src/Server/TCPHandler.cpp`.
+`num_rows = 0` does **not** mean end-of-query. Only `EndOfStream` (packet type 5) signals the end of a query response.
 
-**Fix:** After sending the Query + empty ExternalTable, loop reading packets until you see `EndOfStream`:
-
-```rust
-let mut header: Option<Block> = None;
-loop {
-    match self.read_response()? {
-        ServerResponse::Data(block) => {
-            if header.is_none() {
-                header = Some(block);  // schema
-            } else {
-                // append block.rows to accumulated result
-            }
-        }
-        ServerResponse::EndOfStream => break,
-        ServerResponse::Exception(e) => return Err(...),
-        ServerResponse::Progress(_) => { /* ignore or aggregate */ }
-        ServerResponse::Log(_) => { /* ignore */ }
-        // ProfileInfo, ProfileEvents, Totals, Extremes, TableColumns: handle per need
-        _ => { /* unexpected */ }
-    }
-}
-```
-
-See §5.4 for the full list of packets the client must handle during the query phase.
+**Fix:** After sending the Query + end-of-client-data marker, loop reading packets until `EndOfStream` or `Exception`. Treat the first Data packet as the schema; accumulate rows from subsequent Data packets. See §6.4 for the full dispatch table.
 
 ---
+
+### 11.7 Column must include `has_custom_serialization` byte at v54454+
+
+**Symptom:** After decoding the first result block, the next `read_response()` call reads what looks like `ServerPacket::Hello` (packet type `0`) — but the handshake is long over. The stream is misaligned by exactly one `0x00` byte per column.
+
+A variant: INSERT data sent with columns is rejected or misparsed by the server, because every column is missing one byte.
+
+**Cause:** At negotiated protocol ≥ 54454 (feature `CUSTOM_SERIALIZATION`), every Column carries a `UInt8` byte after the type string, indicating whether the column uses a non-default serialization (sparse, low-cardinality, etc.). For standard columns, this byte is `0`. See §7.11 Column table, field 3.
+
+Clients that skip this byte read the server's next-packet-type-code out of the middle of the previous packet. Since the byte is `0x00`, it appears to be a `Hello` packet (server packet type 0), but the rest of the stream is garbage.
+
+This pitfall is easy to miss during testing if:
+- The client only sends **empty** Data packets (num_columns = 0), so the Column encode path is never exercised, and
+- The client only handles the **header** Data packet from the server (which has columns but 0 rows of data, so the misalignment doesn't surface until the next packet is read).
+
+**Fix:** In both `Column::encode` and `Column::decode`, gate reading/writing the `has_custom_serialization` byte on the `CUSTOM_SERIALIZATION` feature:
+
+- Encode: write `0` for standard columns. To represent a non-default serialization, model it explicitly (e.g., a `Serialization` enum with `Default` / `Custom { kind_stack }` variants) and write `1` followed by the kind_stack.
+- Decode: read the byte. If `0`, continue. If `1`, either decode the kind_stack or return an `Unsupported` error — whichever matches the client's capability.
+
+Pass the negotiated protocol version through `Block::encode` / `Block::decode` so Column methods can check the feature gate.

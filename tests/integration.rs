@@ -108,6 +108,8 @@ fn test_simple_query() {
     require_server();
     let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
     conn.ping().unwrap();
-    let block = conn.query("SELECT 1").unwrap();
-    println!("row_count {} {:?}", block.rows_count, block.columns);
+    let blocks = conn.query("SELECT 1").unwrap();
+    for b in &blocks {
+        println!("row_count {} {:?}", b.rows_count, b.columns);
+    }
 }

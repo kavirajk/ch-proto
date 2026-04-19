@@ -13,6 +13,7 @@ impl Feature {
     pub const DISTRIBUTED_DEPTH: Feature = Feature(54448);
     pub const INITIAL_QUERY_START_TIME: Feature = Feature(54449);
     pub const PARALLEL_REPLICAS: Feature = Feature(54453);
+    pub const CUSTOM_SERIALIZATION: Feature = Feature(54454);
     pub const ADDENDUM: Feature = Feature(54458);
     pub const PARAMETERS: Feature = Feature(54459);
 }

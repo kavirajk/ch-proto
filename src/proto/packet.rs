@@ -2,6 +2,7 @@ use std::io::{self, Error};
 
 use super::{block::Block, exception::ServerException, hello::ServerHello};
 
+#[derive(Debug)]
 pub enum ServerPacket {
     /// Name, version, revision.
     Hello = 0,
@@ -80,6 +81,7 @@ pub enum ServerResponse {
     Exception(ServerException),
     Pong,
     Data(Block),
+    EndOfStream,
 }
 
 pub enum ClientPacket {

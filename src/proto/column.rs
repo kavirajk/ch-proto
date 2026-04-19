@@ -1,13 +1,31 @@
 use std::io::{Error, ErrorKind, Result};
 
-use super::wire::{ProtoRead, ProtoWrite};
+use super::{
+    feature::Feature,
+    wire::{ProtoRead, ProtoWrite},
+};
 
 // Column represents a single column in ClickHouse term.
 #[derive(Debug)]
 pub struct Column {
     pub name: String,
     pub data_type: String,
+    pub serialization: Serialization,
     pub data: ColumnData,
+}
+
+// Serialization describes the on-wire format used for this column's data.
+// Feature-gated by CUSTOM_SERIALIZATION (v54454). External clients almost
+// always produce Default; server may send non-Default for sparse /
+// low-cardinality columns.
+#[derive(Debug, Clone)]
+pub enum Serialization {
+    /// Default per-type serialization — values encoded directly, one per row.
+    Default,
+    /// Server-emitted non-default format (sparse, low-cardinality dictionary,
+    /// etc.). The `kind_stack` is opaque metadata describing the variant.
+    /// Decoding support is not yet implemented.
+    Custom { kind_stack: Vec<u8> },
 }
 
 // ColumnData is in-memory representation of a single column data in ClickHouse terms
@@ -19,20 +37,54 @@ pub enum ColumnData {
 }
 
 impl Column {
-    pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
+    pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
         w.write_string(&self.name)?;
         w.write_string(&self.data_type)?;
+
+        if Feature::CUSTOM_SERIALIZATION.in_version(protocol) {
+            match &self.serialization {
+                Serialization::Default => w.write_u8(0)?,
+                Serialization::Custom { kind_stack } => {
+                    w.write_u8(1)?;
+                    w.write_all(kind_stack)?;
+                }
+            }
+        }
+
         self.data.encode(w)?;
         Ok(())
     }
 
-    pub fn decode(r: &mut impl ProtoRead, rows: usize) -> Result<Column> {
+    pub fn decode(r: &mut impl ProtoRead, rows: usize, protocol: u32) -> Result<Column> {
         let name = r.read_string()?;
         let data_type = r.read_string()?;
+
+        let serialization = if Feature::CUSTOM_SERIALIZATION.in_version(protocol) {
+            let has_custom = r.read_u8()?;
+            match has_custom {
+                0 => Serialization::Default,
+                1 => {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        format!("custom serialization for column '{name}' not yet supported"),
+                    ));
+                }
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid has_custom_serialization byte: {other}"),
+                    ));
+                }
+            }
+        } else {
+            Serialization::Default
+        };
+
         let data = ColumnData::decode(r, &data_type, rows)?;
         Ok(Column {
             name,
             data_type,
+            serialization,
             data,
         })
     }
@@ -84,18 +136,22 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    const PROTOCOL: u32 = 54459;
+    const PROTOCOL_PRE_CUSTOM: u32 = 54453; // before CUSTOM_SERIALIZATION (54454)
+
     #[test]
     fn test_column_uint8_roundtrip() {
         let col = Column {
             name: "id".to_string(),
             data_type: "UInt8".to_string(),
+            serialization: Serialization::Default,
             data: ColumnData::Uint8(vec![1, 2, 3, 255, 0]),
         };
         let mut buf = Vec::new();
-        col.encode(&mut buf).unwrap();
+        col.encode(&mut buf, PROTOCOL).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
-        let decoded = Column::decode(&mut cursor, 5).unwrap();
+        let decoded = Column::decode(&mut cursor, 5, PROTOCOL).unwrap();
         assert_eq!(decoded.name, "id");
         assert_eq!(decoded.data_type, "UInt8");
         match decoded.data {
@@ -109,6 +165,7 @@ mod tests {
         let col = Column {
             name: "name".to_string(),
             data_type: "String".to_string(),
+            serialization: Serialization::Default,
             data: ColumnData::String(vec![
                 "hello".to_string(),
                 "".to_string(),
@@ -116,10 +173,10 @@ mod tests {
             ]),
         };
         let mut buf = Vec::new();
-        col.encode(&mut buf).unwrap();
+        col.encode(&mut buf, PROTOCOL).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
-        let decoded = Column::decode(&mut cursor, 3).unwrap();
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
         assert_eq!(decoded.name, "name");
         match decoded.data {
             ColumnData::String(v) => assert_eq!(v, vec!["hello", "", "world"]),
@@ -132,13 +189,14 @@ mod tests {
         let col = Column {
             name: "x".to_string(),
             data_type: "UInt8".to_string(),
+            serialization: Serialization::Default,
             data: ColumnData::Uint8(vec![]),
         };
         let mut buf = Vec::new();
-        col.encode(&mut buf).unwrap();
+        col.encode(&mut buf, PROTOCOL).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
-        let decoded = Column::decode(&mut cursor, 0).unwrap();
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
         match decoded.data {
             ColumnData::Uint8(v) => assert_eq!(v.len(), 0),
             _ => panic!("expected UInt8"),
@@ -147,13 +205,14 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="DateTime", no data
+        // Manually encode: name="x", type="DateTime", has_custom=0, no data
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
         buf.write_string("DateTime").unwrap();
+        buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
-        let err = Column::decode(&mut cursor, 0).unwrap_err();
+        let err = Column::decode(&mut cursor, 0, PROTOCOL).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
@@ -162,17 +221,64 @@ mod tests {
         let col = Column {
             name: "名前".to_string(),
             data_type: "String".to_string(),
+            serialization: Serialization::Default,
             data: ColumnData::String(vec!["日本語".to_string(), "пароль".to_string()]),
         };
         let mut buf = Vec::new();
-        col.encode(&mut buf).unwrap();
+        col.encode(&mut buf, PROTOCOL).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
-        let decoded = Column::decode(&mut cursor, 2).unwrap();
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
         assert_eq!(decoded.name, "名前");
         match decoded.data {
             ColumnData::String(v) => assert_eq!(v, vec!["日本語", "пароль"]),
             _ => panic!("expected String"),
         }
+    }
+
+    #[test]
+    fn test_column_wire_includes_custom_serialization_byte() {
+        // At PROTOCOL (>= 54454), the wire must include a `has_custom_serialization`
+        // byte between the type string and the column data.
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "UInt8".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uint8(vec![]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // Expected wire: [1 "x"] [5 "UInt8"] [0 (has_custom)]
+        assert_eq!(buf, vec![0x01, b'x', 0x05, b'U', b'I', b'n', b't', b'8', 0x00]);
+    }
+
+    #[test]
+    fn test_column_wire_omits_custom_serialization_byte_pre_feature() {
+        // Before CUSTOM_SERIALIZATION (54454), the byte is NOT written.
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "UInt8".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uint8(vec![]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL_PRE_CUSTOM).unwrap();
+
+        // Expected wire: [1 "x"] [5 "UInt8"] (no has_custom byte)
+        assert_eq!(buf, vec![0x01, b'x', 0x05, b'U', b'I', b'n', b't', b'8']);
+    }
+
+    #[test]
+    fn test_column_rejects_custom_serialization_on_decode() {
+        // Server sends has_custom=1, we should reject with Unsupported.
+        let mut buf = Vec::new();
+        buf.write_string("x").unwrap();
+        buf.write_string("UInt8").unwrap();
+        buf.write_u8(1).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let err = Column::decode(&mut cursor, 0, PROTOCOL).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 }
