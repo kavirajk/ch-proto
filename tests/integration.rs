@@ -236,3 +236,21 @@ fn test_query_default_options() {
     let b = conn.query_with("SELECT 1", QueryOptions::new()).unwrap();
     assert_eq!(a.row_count(), b.row_count());
 }
+
+#[test]
+fn test_query_string_type() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let a = conn.query("select name from system.tables").unwrap();
+
+    eprintln!("databases: {:?}", a.rows)
+}
+
+#[test]
+fn test_query_date_type() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let a = conn.query("select now()::Time64").unwrap();
+
+    eprintln!("now: {:?}", a.rows)
+}

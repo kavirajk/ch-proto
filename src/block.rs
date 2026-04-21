@@ -5,6 +5,7 @@ use crate::proto::{
 
 // Block is basic data processing unit in ClickHouse
 // It represents bunch of "columns" (of fixed row size)
+#[derive(Debug)]
 pub struct Block {
     pub columns: Vec<Column>,
     pub rows_count: usize,

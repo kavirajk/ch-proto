@@ -1,8 +1,15 @@
-# ClickHouse Native Protocol Specification
+# ClickHouse Native Protocol & Native Format Specification
 
 **Status:** Work in progress. Covers protocol versions up to 54459.
 
-This document is the authoritative specification for the ClickHouse native TCP protocol at the versions indicated above. Implementations should conform to this document.
+This document is the authoritative specification for two co-dependent pieces of the ClickHouse wire contract at the versions indicated above:
+
+1. The **Native TCP protocol** — how packets are framed, how connections progress through handshake and query phases, and how non-Block message bodies are structured.
+2. The **Native data format** — how tabular data (Blocks of columns) is serialized within Data-family packets.
+
+The native TCP protocol always uses the Native data format on the wire; the two specifications are intentionally documented together.
+
+Implementations should conform to this document.
 
 ---
 
@@ -19,6 +26,7 @@ This document is the authoritative specification for the ClickHouse native TCP p
 9. [Compression](#9-compression) *(placeholder)*
 10. [Packet Type Reference](#10-packet-type-reference)
 11. [Implementation Notes](#11-implementation-notes)
+12. [Configuration](#12-configuration)
 
 ---
 
@@ -35,6 +43,26 @@ The ClickHouse native protocol is a binary, connection-oriented protocol over TC
 - **Data format:** Columnar — data is sent as blocks of columns, not rows
 
 Each message on the wire begins with a VarUInt packet type code, followed by the message body. The format of the body depends on the packet type and the negotiated protocol version.
+
+### Scope: protocol and data format together
+
+This document covers two closely-related but technically distinct specifications, bundled because they are co-dependent in the native TCP protocol:
+
+1. **The native protocol** — packet framing, state machine, handshake, message structure. Everything in §5 (Packet Envelope) and §6 (Connection Lifecycle), plus the non-Block message bodies in §7 (Hello, Query, Exception, Progress, etc.).
+2. **The Native data format** — how Blocks and their columns are serialized within Data/Totals/Extremes/Log/ProfileEvents packets. Covered by §7.11 (Block) and §8 (Data Types & Column Encoding).
+
+### Native format is the only wire format over TCP
+
+The native TCP protocol **always transmits tabular data in Native format**, regardless of any `FORMAT` clause in the SQL. This is important for implementers to understand:
+
+- A query like `SELECT 1 FORMAT RowBinary` sent over the native TCP protocol still returns **Native-format** Block packets on the wire. The server's TCP handler constructs a `NativeWriter` for output unconditionally.
+- The `FORMAT` clause is the client's responsibility to honor: `clickhouse-client` (the official CLI) receives Native blocks over TCP, then reformats them client-side into whatever the user requested (RowBinary, CSV, TabSeparated, JSON, Pretty, etc.).
+- The HTTP interface is a separate code path where the server **does** honor the `FORMAT` clause and emits the requested format on the wire. That interface is out of scope for this spec.
+- For INSERT queries, the `FORMAT` clause **is** honored by the TCP server — but only for parsing client-provided input data (`INSERT INTO t FORMAT CSV`). Client→server data on the inbound side can be in non-Native formats; server→client data on the outbound side is always Native.
+
+A correct native-TCP client therefore needs to:
+- Implement Native-format decoding (§7.11 and §8).
+- Optionally, for compatibility with the `FORMAT` clause, reformat received blocks into other output formats — but that is a client-side concern, not a protocol concern.
 
 ---
 
@@ -1102,3 +1130,138 @@ For example, declaring the client's max version as `Feature::ADDENDUM.version()`
 **Fix:** The client's declared `protocol_version` in ClientHello (§7.1) must be at least the maximum version of any feature the client wants to use. In practice, declare the highest version supported by the implementation (i.e., the "Status" line of this spec) and let version negotiation pick the actual working version.
 
 This is a **silent failure mode**: no error is emitted during encoding, and the server often accepts the malformed packet and simply executes the query without the expected feature data. Hard to debug without diffing against known-good packet captures.
+
+---
+
+## 12. Configuration
+
+This section documents the tunables that shape native protocol connections. Two categories:
+
+- **§12.1 Transport-layer settings** — TCP socket options and timeouts. Affect how the TCP connection itself behaves (latency, failure detection, connection lifetime).
+- **§12.2 Application-layer settings** — per-query tunables the client may include in the Query packet's `settings` list (§7.9). Affect what the server sends on the wire or how it's framed.
+
+All defaults below reflect the behavior of the reference server implementation at the protocol versions covered by this document. Values may differ across server versions and deployments.
+
+### 12.1 Transport-Layer Settings
+
+These settings affect the TCP socket and the connection's physical transport. They are negotiated or applied at handshake time and typically do not change mid-connection.
+
+#### 12.1.1 Socket options
+
+| Option | Default | Unit | Side | Description |
+|--------|---------|------|------|-------------|
+| `TCP_NODELAY` | on | bool | both | Nagle's algorithm disabled on both ends. Small packets (handshake, Ping, short Query packets) are sent immediately without coalescing delay. |
+| `SO_KEEPALIVE` | on (client), OS default (server) | bool | asymmetric | Kernel-level TCP keepalive probes. **Client** explicitly enables the socket option when `tcp_keep_alive_timeout > 0`. **Server** does not explicitly set this option on the native protocol socket; it inherits the OS default (typically off, or with a long idle interval like 2 hours). This asymmetry means the **client** detects silently broken connections faster than the server. |
+| `SO_RCVBUF` / `SO_SNDBUF` | not set (OS defaults) | bytes | — | Socket receive/send buffer sizes. Not tuned by the protocol; OS defaults apply. Large result streaming may benefit from increased buffer sizes at the OS level. |
+
+#### 12.1.2 Timeouts
+
+| Setting | Default | Unit | Side | Description |
+|---------|---------|------|------|-------------|
+| `connect_timeout` | 10 | seconds | client | Timeout for establishing the initial TCP connection. Exceeding this aborts the connection attempt. |
+| `handshake_timeout_ms` | 10000 | milliseconds | client | Timeout for receiving ServerHello during handshake. Applied as both send and receive timeout during the handshake phase. |
+| `send_timeout` | 300 | seconds | both | If no bytes can be written to the socket within this interval, the connection throws. Bidirectional: client's `send_timeout` becomes server's `receive_timeout` expectation and vice versa. |
+| `receive_timeout` | 300 | seconds | both | If no bytes can be read from the socket within this interval, the connection throws. Bidirectional (see above). |
+| `tcp_keep_alive_timeout` | 290 | seconds | client | Idle duration before the client's OS sends the first TCP keepalive probe. Deliberately less than `receive_timeout` so the kernel detects dead servers before the application's receive timeout fires. Applied via `TCP_KEEPIDLE` on Linux / `TCP_KEEPALIVE` on macOS. Server-side keepalive is not set by the native protocol path and falls back to OS defaults; this asymmetry is intentional — the server relies on `idle_connection_timeout` (§12.1.3) for its own dead-peer detection. |
+| `receive_data_timeout_ms` | 2000 | milliseconds | client | Timeout for receiving the first Data packet (or Progress packet indicating work) from a replica. Used in multi-replica (failover / hedged) connections. |
+| `connect_timeout_with_failover_ms` | 1000 | milliseconds | client | Per-attempt connect timeout when iterating replicas (non-TLS). Shorter than base `connect_timeout` because failing fast allows faster failover. |
+| `connect_timeout_with_failover_secure_ms` | 1000 | milliseconds | client | Per-attempt connect timeout when iterating replicas over TLS. |
+| `hedged_connection_timeout_ms` | 50 | milliseconds | client | Per-attempt connect timeout for hedged (speculative parallel) requests. Very short — hedging only makes sense when attempts are cheap. |
+| `poll_interval` | 10 | seconds | server | Granularity of the server's idle-connection and shutdown check loop. Not a user-visible latency; affects how quickly the server detects shutdown signals and idle-connection expiry. |
+
+**Timing relationship to be aware of:**
+
+```
+tcp_keep_alive_timeout (290s)
+      < receive_timeout (300s)
+      < idle_connection_timeout (3600s)
+      < tcp_close_connection_after_queries_seconds (0 = unlimited by default)
+```
+
+OS keepalive fires first and may detect dead peers silently (at the kernel level). Application receive timeout is the next line of defense. Idle timeout is the last resort that reaps long-unused connections.
+
+#### 12.1.3 Connection limits
+
+| Setting | Default | Unit | Side | Description |
+|---------|---------|------|------|-------------|
+| `max_connections` | 4096 | count | server | Maximum concurrent TCP connections the server accepts. Additional connections are refused at the TCP layer. |
+| `idle_connection_timeout` | 3600 | seconds | server | Maximum time an **idle** (no active query, no in-flight request) connection may remain open. Server closes connections exceeding this threshold during the poll loop. |
+| `tcp_close_connection_after_queries_num` | 0 (unlimited) | count | server | Maximum number of queries per connection before the server forcibly closes it. Useful for forced connection recycling during rolling deploys. |
+| `tcp_close_connection_after_queries_seconds` | 0 (unlimited) | seconds | server | Maximum **total** connection lifetime in seconds regardless of activity. Server closes any connection older than this threshold. Useful for ensuring connections eventually re-authenticate and re-balance. |
+
+**Long-lived connections by default.** A connection that issues queries regularly (even infrequently) can live indefinitely. Only idle connections are reaped after 1 hour. There is **no default maximum lifetime** — production deployments wishing to force periodic reconnects must set `tcp_close_connection_after_queries_seconds` explicitly.
+
+### 12.2 Application-Layer Settings
+
+These settings are carried per-query in the Query packet's `settings` list (§7.7, §7.9). They change **what the server sends on the wire or how it's framed**, distinct from settings that affect SQL execution semantics (`max_threads`, `max_memory_usage`, etc.), which are not protocol concerns.
+
+#### 12.2.1 Compression
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `network_compression_method` | `"LZ4"` | string | Compression codec applied to data blocks on the wire when the Query packet's `compression` flag is set. Values: `"LZ4"`, `"LZ4HC"`, `"ZSTD"`, `"NONE"`. Affects the compression method byte in the compressed frame (§9). |
+| `network_zstd_compression_level` | 1 | 1–15 | ZSTD compression level when `network_compression_method == "ZSTD"`. Higher values produce smaller compressed blocks at higher CPU cost. No effect for other codecs. |
+
+The `compression` flag in the Query packet itself (§7.7 field 6) toggles compression on/off for that query. These settings select **which** codec is used when it's on.
+
+#### 12.2.2 Log streaming
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `send_logs_level` | `"fatal"` | string | Minimum log level to include in Log packets (§7.16). Values: `"none"`, `"fatal"`, `"error"`, `"warning"`, `"information"`, `"debug"`, `"trace"`. Setting to `"none"` suppresses Log packets entirely. |
+| `send_logs_source_regexp` | `""` (all sources) | string | Regex filter on the logger name column of Log packets. Only log lines whose source matches are transmitted. Empty = all sources pass. |
+
+Setting `send_logs_level` to anything other than `"none"` causes the server to emit `Log` packets during query execution (§7.16). Clients that don't care about logs should leave the default (or set `"none"`) to reduce wire volume.
+
+#### 12.2.3 Progress reporting
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `interactive_delay` | 100000 | microseconds | Target minimum interval between consecutive Progress packets (§7.12) from server to client. Smaller values produce more Progress packets (more wire traffic, finer-grained UI updates). Also affects how often the server checks for client cancellation. |
+
+Note: `interactive_delay` is the **target minimum** between Progress packets. The server may send Progress packets less frequently if the query is not producing work fast enough to trigger them.
+
+#### 12.2.4 Result envelope
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `extremes` | false | bool | When true, the server sends an additional `Extremes` packet (§7.15) carrying min/max values per column after the result data. When false, no Extremes packet is emitted. |
+| `max_result_rows` | 0 (unlimited) | count | Cap on the number of rows the server transmits. When exceeded, behavior is controlled by `result_overflow_mode`. |
+| `max_result_bytes` | 0 (unlimited) | uncompressed bytes | Cap on the uncompressed byte volume the server transmits. Behavior on overflow follows `result_overflow_mode`. |
+| `result_overflow_mode` | `"throw"` | string | Behavior when a result cap is exceeded: `"throw"` ends the stream with an Exception packet (§7.6); `"break"` sends partial results followed by a normal `EndOfStream` (§10.2). |
+
+#### 12.2.5 Async INSERT (relevant for INSERT queries only)
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `async_insert` | true | bool | When true, INSERT data is queued server-side and batched with other inserts instead of flushing immediately. Affects the timing of the server's response (EndOfStream or Exception) but does not change the wire packet types. |
+| `wait_for_async_insert` | true | bool | When true (with `async_insert` on), the server holds the response until the queued data is flushed. When false, the server returns immediately after queuing, before the data is actually durable. |
+| `wait_for_async_insert_timeout` | 120 | seconds | Maximum time the server waits for flush before returning (when `wait_for_async_insert` is true). Past this, the server returns success even if flush hasn't completed. |
+
+#### 12.2.6 Distributed tracing
+
+| Setting | Default | Unit | Description |
+|---------|---------|------|-------------|
+| `opentelemetry_start_trace_probability` | 0.0 | 0–1 probability | Server-side probability of attaching OpenTelemetry trace context to response-side telemetry. Does not directly affect client → server wire format (which is governed by the client's own ClientInfo OpenTelemetry fields, §7.8 field 16). |
+
+---
+
+### 12.3 Settings Explicitly Out of Scope
+
+These are commonly confused with protocol-level settings but actually control SQL execution, storage, or CPU use — not wire behavior. A protocol implementation does not need to handle them specially:
+
+- `max_threads` — parallelism within query execution
+- `max_memory_usage` — per-query memory cap
+- `max_block_size`, `preferred_block_size_bytes` — internal block sizing during query processing; the blocks transmitted on the wire may be of any size independent of these
+- `compile_expressions` — JIT compilation of expressions; CPU-only
+- `async_insert_max_data_size` — server-side queue buffer; not a wire concern
+- All settings prefixed `input_format_*` and `output_format_*` — apply to non-native formats (CSV, TSV, JSONEachRow, etc.) over the HTTP interface, not the native protocol
+
+### 12.4 Settings Not Yet Covered
+
+The chunked protocol (negotiated via the addendum at v54470+) introduces additional transport tunables that are not yet documented in this spec:
+
+- `proto_send_chunked`, `proto_recv_chunked` — negotiated mode (`chunked`, `notchunked`, `chunked_optional`, `notchunked_optional`)
+- Chunk framing, length prefixes, chunk-level flow control
+
+These will be added in a future revision.
