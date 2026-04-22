@@ -198,6 +198,12 @@ Message tables in §7 document only the **body** of each packet (the bytes after
 
 This section is the **primary reference for client implementers**. Each state machine phase describes what to send, what to expect, and how to transition — with cross-references to the message formats in §7.
 
+### Why this is a state machine
+
+The native protocol is **strictly stateful**: at every point in time the connection has exactly one role — handshaking, idle (waiting for the next command), or processing a query. The protocol does not tag packets with stream IDs or request IDs, and it does not support concurrent operations on one connection. A client that sends a new request before the previous response has fully drained will interleave bytes on the wire and produce an unparseable stream on the server's side.
+
+The state machine in this section defines precisely when each type of packet may be sent or received. Clients must conform to this model; deviations that "happen to work" on one code path will break in adversarial ordering (e.g., an exception mid-query, a cancellation request, or a concurrent Ping).
+
 ### 6.1 States
 
 ```
@@ -220,7 +226,21 @@ This section is the **primary reference for client implementers**. Each state ma
 
 A connection is always in exactly one of: `HANDSHAKE`, `READY`, `READING_RESPONSE`, or terminated.
 
+**State descriptions:**
+
+- **`HANDSHAKE`** — the initial state after the TCP connection is established. Only the handshake messages (§6.2) are valid in this state. The connection transitions to `READY` on success, or terminates on failure (bad credentials, protocol mismatch, etc.).
+
+- **`READY`** — the idle state. The server is waiting for the client to initiate the next operation. The only valid actions from `READY` are: send a Ping (→ §6.3), send a Query (→ §6.4), or close the connection. Between commands the connection may remain in `READY` indefinitely (subject to the server's `idle_connection_timeout` — see §12.1.3).
+
+- **`READING_RESPONSE`** — entered when the client sends a Query. The client must fully drain the server's response stream (§6.4) before the connection returns to `READY`. While in this state, the client must not send any other request. The only client → server packet allowed is a Cancel (not yet specified in this document).
+
+- **Terminated** — the connection is no longer usable. Terminated connections cannot be re-used; the client must establish a new TCP connection and restart the handshake.
+
 ### 6.2 Handshake Phase
+
+The handshake is the **authentication and negotiation** phase. Its job is to (a) verify the client's credentials, (b) agree on a protocol version that both sides support, and (c) exchange identifying information (server version, timezone, etc.). The handshake happens exactly once per connection and is non-resumable — a connection that fails handshake cannot be reused.
+
+**Why it matters:** every subsequent message on the connection depends on the **negotiated protocol version** computed during this phase. A client that skips handshake, gets the version wrong, or sends packets in the wrong order will corrupt every subsequent packet on the connection. See §11.15 for the silent-failure mode when the client declares too low a protocol version.
 
 #### Precondition
 TCP connection just established. No messages exchanged yet.
@@ -265,6 +285,16 @@ On success, connection transitions to `READY`. On any error, terminate the conne
 
 ### 6.3 Ping Phase
 
+The Ping phase is an **application-level keepalive / liveness check**. Unlike TCP keepalive (which is a kernel-level probe, see §12.1.1), a successful Ping/Pong round-trip confirms that:
+
+1. The TCP connection is alive in both directions.
+2. The server process is responsive and scheduling work (not deadlocked).
+3. The server's native-protocol handler is correctly parsing packets.
+
+Clients typically use Ping to probe a connection's health before issuing a query, especially after an idle period — a Ping failure is much faster to act on than a failing Query. A connection that has been sitting idle for minutes may have been closed by an intermediary (NAT, firewall, LB) without either side's kernel being notified; Ping surfaces this quickly.
+
+Ping is stateless — the server does not track that a Ping was sent. The Ping/Pong pair is not correlated with any query and does not affect query state. Multiple sequential Pings on the same connection are valid and independent.
+
 #### Precondition
 Connection in `READY` state.
 
@@ -290,7 +320,27 @@ See §7.4.
 
 ### 6.4 Query Phase
 
-This is the most complex phase. The server emits a stream of packets in response to a single query, and the client must loop until it sees `EndOfStream`.
+The Query phase is where the real work happens — the client submits a SQL statement along with associated data (external tables, INSERT data), and the server streams back a sequence of result blocks and execution telemetry.
+
+This is the most complex phase for two reasons:
+
+1. **Asymmetric send/receive.** The client sends a bounded sequence of packets (Query + optional external tables + a terminating empty Data packet), then transitions to a receive-only mode. It cannot issue another command or cancel cleanly except through a specific Cancel packet.
+
+2. **Server response is a stream, not a single reply.** The response is not "one packet of results"; it is an open-ended sequence of Data, Progress, Log, ProfileEvents, and other packets, terminated by exactly one `EndOfStream` or `Exception`. The client must loop until it sees the terminator.
+
+**Key concepts for this phase:**
+
+- **Query packet:** carries the SQL text plus metadata (query_id, ClientInfo, settings, parameters, stage flag, compression flag). See §7.7.
+- **External tables:** zero or more temporary tables attached to this query, referenced from the SQL. See §6.4 Step 2 and §7.11.
+- **End-of-client-data marker:** an empty Data packet (0 columns, 0 rows). The server does **not** begin executing the query until it receives this marker — even for queries with no associated data.
+- **Response stream:** the sequence of packets the server emits during execution. See §11.6 for the critical "first Data packet is the schema header (0 rows)" behavior.
+- **Termination:** only `EndOfStream` (on success) or `Exception` (on failure) ends the response stream. `num_rows == 0` is **not** a terminator (see §11.6).
+
+**Typical error modes:**
+
+- Client forgets the end-of-client-data marker → server hangs waiting for more input; client hangs waiting for response. See §11.x-ish debugging pattern.
+- Client stops reading at the first Data packet (the header block) → sees 0 rows even for queries that return results. See §11.6.
+- Client attempts to send a new Query while still in `READING_RESPONSE` → stream corruption.
 
 #### Precondition
 Connection in `READY` state.
@@ -876,7 +926,98 @@ Types are organized into four groups:
 
 ### 8.1 Fixed-width types
 
-> Not yet documented here. These types (UInt8/16/32/64, Int8/16/32/64, Float32/64, Bool, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum8, Enum16, Decimal*) encode `N * num_rows` bytes, where `N` is the size of a single value.
+Fixed-width types encode each value as a constant number of bytes. A column of a fixed-width type with `N` bytes per value and `M` rows occupies exactly `N * M` bytes on the wire, concatenated with no separators, length prefixes, or padding.
+
+All multi-byte integer types are encoded **little-endian**. Signed integers use **two's complement**. There is no per-column header beyond the generic Column header in §7.11 (name, type string, has_custom_serialization byte).
+
+#### Byte layout summary
+
+| Type string    | Bytes per value | Logical value                              | Wire encoding |
+|----------------|-----------------|--------------------------------------------|---------------|
+| `UInt8`        | 1               | Unsigned 8-bit integer                     | Raw byte      |
+| `UInt16`       | 2               | Unsigned 16-bit integer                    | Little-endian |
+| `UInt32`       | 4               | Unsigned 32-bit integer                    | Little-endian |
+| `UInt64`       | 8               | Unsigned 64-bit integer                    | Little-endian |
+| `Int8`         | 1               | Signed 8-bit integer, two's complement     | Raw byte      |
+| `Int32`        | 4               | Signed 32-bit integer, two's complement    | Little-endian |
+| `Int64`        | 8               | Signed 64-bit integer, two's complement    | Little-endian |
+| `DateTime`     | 4               | Unix timestamp in seconds since epoch      | Little-endian UInt32 |
+| `DateTime(tz)` | 4               | Same as `DateTime`; timezone is metadata   | Little-endian UInt32 |
+| `Enum8`        | 1               | Signed 8-bit integer (variant index)       | Raw byte      |
+
+#### 8.1.1 Integer types
+
+`UInt8`, `UInt16`, `UInt32`, `UInt64`, `Int8`, `Int32`, `Int64` are direct binary encodings of integer values. Decoders read `bytes_per_value * num_rows` bytes and interpret them according to the type.
+
+**Example** — a `UInt32` column with values `[1, 256, 65536]` (3 rows = 12 bytes):
+
+```
+01 00 00 00   row 0: 1
+00 01 00 00   row 1: 256
+00 00 01 00   row 2: 65536
+```
+
+**Example** — an `Int32` column with values `[-1, 42]` (2 rows = 8 bytes):
+
+```
+FF FF FF FF   row 0: -1
+2A 00 00 00   row 1: 42
+```
+
+#### 8.1.2 DateTime
+
+`DateTime` is wire-compatible with `UInt32` — each value is a Unix timestamp in seconds since `1970-01-01 00:00:00 UTC`, encoded as a little-endian UInt32 (4 bytes).
+
+The type may appear with or without a timezone parameter:
+
+- `DateTime` — implicit server default timezone.
+- `DateTime('UTC')`, `DateTime('America/New_York')`, etc. — explicit timezone.
+
+The timezone affects how the server and client render the timestamp as text; it is **not** part of the wire value. Two `DateTime` columns with different timezone parameters have identical byte representations for the same instant in time.
+
+Decoders dispatch on the base type name `DateTime` (§11.9) and ignore the timezone parameter for byte-level decoding. The timezone may be preserved alongside the decoded values if the client wants to honor it for display or conversion.
+
+**Example** — `DateTime('UTC')` value `2024-03-15 14:30:00 UTC` (Unix timestamp `1710513000`):
+
+```
+A8 84 F4 65   Little-endian UInt32 = 0x65F484A8 = 1710513000
+```
+
+#### 8.1.3 Enum8
+
+`Enum8` is wire-compatible with `Int8` — each row is a single signed byte representing the variant's integer value (range: -128 to 127). The human-readable variant names live in the **type string**, not in the column data.
+
+The type string carries the full variant mapping, for example:
+
+```
+Enum8('active' = 1, 'inactive' = 2, 'banned' = -1)
+```
+
+Clients that care about the human-readable name must parse the type string; clients that only need the numeric value can treat the column as a plain `Int8`. The decoder's byte-level work is identical to `Int8`.
+
+**Example** — an `Enum8('active' = 1, 'inactive' = 2)` column with values `[active, inactive, active]` (3 rows = 3 bytes):
+
+```
+01 02 01
+```
+
+> **Note:** `Enum16` (a 2-byte counterpart) is also used by some ProfileEvents columns and follows the same principle — wire-compatible with `Int16`. `Enum16` is declared here for completeness but not yet implemented in the reference decoder. When implemented, it will use little-endian 2-byte signed integers.
+
+#### 8.1.4 Fixed-width types not yet implemented
+
+These types are fixed-width and will use the same "N bytes per row, concatenated" pattern, but are not yet part of the reference implementation:
+
+- `Int16` — 2 bytes, little-endian signed. Currently aliased to `Enum16` only.
+- `Float32`, `Float64` — 4 and 8 bytes, IEEE 754 binary float, little-endian.
+- `Bool` — 1 byte, `0x00` = false, `0x01` = true. Internally a domain over `UInt8`.
+- `Date` — 2 bytes, little-endian UInt16 (days since `1970-01-01`).
+- `Date32` — 4 bytes, little-endian Int32 (days since `1970-01-01`, allows pre-1970 dates).
+- `DateTime64(scale)` — 8 bytes, little-endian Int64 (ticks; scale in type string controls subsecond precision; 3 = ms, 6 = µs, 9 = ns).
+- `UUID` — 16 bytes, but with a historical quirk: transmitted as two little-endian UInt64 halves, **each byte-swapped**. See §11.x (planned) for the exact byte reordering.
+- `IPv4` — 4 bytes, raw IPv4 address (typically little-endian on the wire, but this is domain-specific).
+- `IPv6` — 16 bytes, raw IPv6 address in network byte order.
+- `Int128`, `UInt128`, `Int256`, `UInt256` — 16 / 32 bytes, little-endian.
+- `Decimal32(S)`, `Decimal64(S)`, `Decimal128(S)`, `Decimal256(S)` — 4 / 8 / 16 / 32 bytes, little-endian signed integer representing the decimal value scaled by `10^S`. The scale `S` is in the type string.
 
 ### 8.2 Variable-length types
 
