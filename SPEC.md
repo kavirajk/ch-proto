@@ -863,7 +863,108 @@ Clients that only issue SELECT queries rarely see this packet. Ignore or skip th
 
 ## 8. Data Types & Column Encoding
 
-> **Placeholder.** This section will document how each ClickHouse data type (UInt8, String, DateTime, Nullable, Array, etc.) is serialized within the `data` field of a Column (§7.11).
+This section documents how each ClickHouse data type is serialized within the `data` field of a Column (§7.11). The decoder reads the column's `type` string (also part of the Column header, §7.11), dispatches to the appropriate type decoder, and consumes exactly the bytes required by that type for `num_rows` values.
+
+Type strings may carry parameters in parentheses (see §11.9). Base-type dispatch should strip the `(...)` suffix before matching; parameters may still be needed for size/scale/element-type decisions within the matched decoder.
+
+Types are organized into four groups:
+
+- **§8.1 Fixed-width types** — each row consumes a known constant number of bytes.
+- **§8.2 Variable-length types** — each row consumes a variable number of bytes, with a per-row length prefix.
+- **§8.3 Composite types** — types built from one or more nested types, using multiple "streams" per column. *Placeholder until implemented.*
+- **§8.4 Future work** — advanced types not yet specified in this document.
+
+### 8.1 Fixed-width types
+
+> Not yet documented here. These types (UInt8/16/32/64, Int8/16/32/64, Float32/64, Bool, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum8, Enum16, Decimal*) encode `N * num_rows` bytes, where `N` is the size of a single value.
+
+### 8.2 Variable-length types
+
+#### 8.2.1 String
+
+**Type string:** `String`
+**In-memory model:** a sequence of arbitrary byte strings (not necessarily UTF-8 on the wire, though most values are).
+
+A `String` column is a sequence of `num_rows` length-prefixed byte strings, concatenated end-to-end with no padding. Each value is:
+
+```
+[VarUInt: byte_length]
+[byte_length bytes: raw value]
+```
+
+There are no separators, no row boundaries beyond the length prefixes, and no type-level state. Empty strings are a single `0x00` byte (VarUInt length 0 followed by zero bytes). Strings may contain any byte values including embedded NUL (`0x00`).
+
+Although ClickHouse's `String` type is commonly used for UTF-8 text, the wire representation is byte-oriented and does not require UTF-8 validity. Clients that decode into a UTF-8-constrained type (e.g., language-native string types) should either validate on decode or expose the raw bytes for the caller to handle.
+
+**Total bytes consumed by a String column:** sum of `(varuint_size(len_i) + len_i)` for `i` in `0..num_rows`.
+
+**Wire example** — a column of 3 strings `["ab", "", "c"]`:
+
+```
+02 61 62      row 0: length 2, "ab"
+00            row 1: length 0, empty
+01 63         row 2: length 1, "c"
+```
+
+Total: 6 bytes of column data.
+
+#### 8.2.2 FixedString(N)
+
+**Type string:** `FixedString(N)` where `N` is a positive integer (e.g., `FixedString(16)`).
+**In-memory model:** a sequence of byte strings all of exactly `N` bytes.
+
+A `FixedString(N)` column is exactly `N * num_rows` raw bytes — no length prefixes, no separators. The decoder must parse `N` from the type string and consume that many bytes per row.
+
+When a value shorter than `N` bytes is inserted by SQL (`CAST('abc' AS FixedString(5))`), the server right-pads it with NUL bytes (`0x00`) to the declared length. These padding bytes are part of the stored value and are sent on the wire. Clients receive the padded bytes as-is; trimming is a client-side concern.
+
+Unlike `String`, `FixedString(N)` values are **byte-array-like**, not text-like — they are typically used for fixed-width identifiers, IP address-style bytes, hash digests, etc. Do not assume UTF-8.
+
+**Total bytes consumed by a FixedString(N) column:** `N * num_rows`.
+
+**Wire example** — a column of 2 `FixedString(3)` values `["abc", "de\0"]`:
+
+```
+61 62 63      row 0: 3 bytes, "abc"
+64 65 00      row 1: 3 bytes, "de" followed by NUL padding
+```
+
+Total: 6 bytes of column data.
+
+**Type-string parsing:**
+
+- Strip the `(...)` suffix to get the base type (`FixedString`).
+- Parse the integer between the parentheses to get `N`.
+- Reject malformed variants (empty parentheses, non-numeric contents, missing closing paren).
+
+Comparison between String and FixedString:
+
+| Property | `String` | `FixedString(N)` |
+|----------|----------|------------------|
+| Per-row length prefix | Yes (VarUInt) | No |
+| Row size | Variable | Exactly `N` bytes |
+| Total column bytes | Variable | `N * num_rows` |
+| NUL-byte padding | Not applicable (length-prefixed) | Right-padded by server for short values |
+| UTF-8 expected | Typically yes (not enforced) | No (treat as raw bytes) |
+| Type parameter | None | Required integer `N` |
+
+### 8.3 Composite types
+
+> Not yet documented here. These types (`Nullable(T)`, `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `LowCardinality(T)`) serialize as multiple streams per column — e.g., `Nullable(T)` is a null-map stream followed by a values stream, and `Array(T)` is an offsets stream followed by a flattened values stream.
+
+### 8.4 Future work
+
+The following types are recognized by the server but not yet specified in this document:
+
+- **`Nullable(T)`**, **`Array(T)`**, **`Tuple(T1, T2, ...)`**, **`Map(K, V)`** — composite types (planned for §8.3).
+- **`LowCardinality(T)`** — dictionary-encoded column with cross-block state. Non-trivial due to the stateful dictionary.
+- **`Decimal(P, S)`**, **`Decimal32/64/128/256`** — fixed-point decimal numerics.
+- **`Dynamic`** — runtime-typed column with a discriminant per row; cross-block state for the type list.
+- **`Variant(T1, T2, ...)`** — discriminated union.
+- **`JSON`** — layered on `Object` + `Dynamic`. Most complex type in the protocol. Clients may use the `output_format_native_write_json_as_string` setting to receive JSON as a String column instead.
+- **`AggregateFunction`**, **`SimpleAggregateFunction`** — serialized aggregation state.
+- **`Nested(...)`** — syntactic sugar for `Array(Tuple(...))`.
+- **`Interval`** — calendar/time interval.
+- **Geo types** — `Point`, `Ring`, `Polygon`, `MultiPolygon`.
 
 ---
 

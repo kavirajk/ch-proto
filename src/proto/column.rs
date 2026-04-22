@@ -40,6 +40,14 @@ pub enum ColumnData {
     Int32(Vec<i32>),
     Int64(Vec<i64>),
     String(Vec<String>),
+    /// FixedString(N): each value is exactly N bytes. Values shorter than N
+    /// on INSERT are right-padded with NUL (`0x00`). We expose the raw bytes
+    /// (Vec<u8> of length n * rows) rather than attempting UTF-8 decoding,
+    /// because the bytes are not guaranteed to be valid UTF-8.
+    FixedString {
+        n: usize,
+        data: Vec<u8>, // length = n * num_rows
+    },
     // DateTime is UInt32 seconds-since-epoch on the wire.
     DateTime(Vec<u32>),
 }
@@ -141,6 +149,13 @@ impl ColumnData {
                     w.write_string(s)?;
                 }
             }
+            ColumnData::FixedString { n, data } => {
+                // Sanity: data length must be exactly n * rows, but rows isn't
+                // known here. Just write all bytes; caller is responsible for
+                // maintaining the invariant.
+                let _ = n;
+                w.write_all(data)?;
+            }
         }
         Ok(())
     }
@@ -214,12 +229,43 @@ impl ColumnData {
                 }
                 Ok(ColumnData::String(v))
             }
+            "FixedString" => {
+                let n = parse_fixed_string_n(data_type)?;
+                let total = n.checked_mul(rows).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("FixedString size overflow: n={n}, rows={rows}"),
+                    )
+                })?;
+                let mut data = vec![0u8; total];
+                r.read_exact(&mut data)?;
+                Ok(ColumnData::FixedString { n, data })
+            }
             _ => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!("column type '{data_type}' not yet supported"),
             )),
         }
     }
+}
+
+/// Parse the `N` in `FixedString(N)` from the full type string.
+fn parse_fixed_string_n(data_type: &str) -> Result<usize> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid FixedString type string: {data_type}"),
+        )
+    };
+    let open = data_type.find('(').ok_or_else(err)?;
+    let close = data_type.rfind(')').ok_or_else(err)?;
+    if close <= open + 1 {
+        return Err(err());
+    }
+    data_type[open + 1..close]
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| err())
 }
 
 #[cfg(test)]
@@ -371,5 +417,236 @@ mod tests {
         let mut cursor = Cursor::new(buf.as_slice());
         let err = Column::decode(&mut cursor, 0, PROTOCOL).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    // -- String type (varuint-length + UTF-8) --
+
+    #[test]
+    fn test_string_empty_strings() {
+        // All empty strings must still roundtrip (each is a single 0x00 byte on wire).
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "String".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::String(vec!["".to_string(), "".to_string(), "".to_string()]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::String(v) => {
+                assert_eq!(v.len(), 3);
+                for s in v {
+                    assert_eq!(s, "");
+                }
+            }
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_string_with_embedded_nulls() {
+        // Strings are byte sequences; embedded NUL is valid.
+        let s = "a\0b\0c".to_string();
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "String".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::String(vec![s.clone()]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::String(v) => assert_eq!(v[0], s),
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_string_large_values() {
+        // Values that cross the VarUInt length-byte boundary (>= 128 bytes).
+        let big = "x".repeat(500);
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "String".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::String(vec![big.clone(), "tiny".to_string(), big.clone()]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::String(v) => {
+                assert_eq!(v[0].len(), 500);
+                assert_eq!(v[1], "tiny");
+                assert_eq!(v[2].len(), 500);
+            }
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_string_wire_layout() {
+        // Verify exact byte layout: each row = [VarUInt len][bytes]
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "String".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::String(vec!["ab".to_string(), "".to_string(), "c".to_string()]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // [1 "s"] [6 "String"] [0 has_custom]
+        // then: [2 'a' 'b'] [0] [1 'c']
+        let expected = vec![
+            0x01, b's',
+            0x06, b'S', b't', b'r', b'i', b'n', b'g',
+            0x00, // has_custom_serialization
+            0x02, b'a', b'b',
+            0x00,
+            0x01, b'c',
+        ];
+        assert_eq!(buf, expected);
+    }
+
+    // -- FixedString(N) --
+
+    #[test]
+    fn test_fixed_string_roundtrip() {
+        // FixedString(4): each row is exactly 4 bytes.
+        let data = b"abcd1234wxyz".to_vec(); // 3 rows of 4 bytes
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "FixedString(4)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::FixedString { n: 4, data: data.clone() },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::FixedString { n, data: d } => {
+                assert_eq!(n, 4);
+                assert_eq!(d, data);
+            }
+            _ => panic!("expected FixedString"),
+        }
+    }
+
+    #[test]
+    fn test_fixed_string_parse_n() {
+        assert_eq!(parse_fixed_string_n("FixedString(16)").unwrap(), 16);
+        assert_eq!(parse_fixed_string_n("FixedString(1)").unwrap(), 1);
+        assert_eq!(parse_fixed_string_n("FixedString( 42 )").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_fixed_string_parse_n_invalid() {
+        assert!(parse_fixed_string_n("FixedString").is_err());
+        assert!(parse_fixed_string_n("FixedString()").is_err());
+        assert!(parse_fixed_string_n("FixedString(abc)").is_err());
+        assert!(parse_fixed_string_n("FixedString(16").is_err());
+    }
+
+    #[test]
+    fn test_fixed_string_with_null_padding() {
+        // Server right-pads short values with NUL. Roundtrip preserves those bytes.
+        let data = vec![b'h', b'i', 0, 0, 0, b'x', 0, 0, 0, 0]; // 2 rows of 5 bytes
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "FixedString(5)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::FixedString { n: 5, data: data.clone() },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::FixedString { n, data: d } => {
+                assert_eq!(n, 5);
+                assert_eq!(d, data);
+            }
+            _ => panic!("expected FixedString"),
+        }
+    }
+
+    #[test]
+    fn test_fixed_string_zero_rows() {
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "FixedString(8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::FixedString { n: 8, data: vec![] },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::FixedString { n, data: d } => {
+                assert_eq!(n, 8);
+                assert!(d.is_empty());
+            }
+            _ => panic!("expected FixedString"),
+        }
+    }
+
+    #[test]
+    fn test_fixed_string_wire_layout() {
+        // No length prefix per value — just concatenated bytes.
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "FixedString(3)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::FixedString {
+                n: 3,
+                data: vec![b'a', b'b', b'c', b'd', b'e', b'f'],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // [1 "s"] [14 "FixedString(3)"] [0 has_custom] [6 bytes of data]
+        let expected = vec![
+            0x01, b's',
+            0x0E, b'F', b'i', b'x', b'e', b'd', b'S', b't', b'r', b'i', b'n', b'g', b'(', b'3', b')',
+            0x00,
+            b'a', b'b', b'c', b'd', b'e', b'f',
+        ];
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_fixed_string_non_utf8_bytes() {
+        // FixedString holds raw bytes; arbitrary non-UTF-8 must roundtrip.
+        let data = vec![0xFF, 0xFE, 0x00, 0x80, 0xC0, 0xC1]; // 2 rows of 3 bytes, invalid UTF-8
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "FixedString(3)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::FixedString { n: 3, data: data.clone() },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::FixedString { data: d, .. } => assert_eq!(d, data),
+            _ => panic!("expected FixedString"),
+        }
     }
 }

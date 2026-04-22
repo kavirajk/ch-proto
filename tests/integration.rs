@@ -227,6 +227,145 @@ fn test_query_with_missing_param() {
     assert!(result.is_err());
 }
 
+// -- String type --
+
+#[test]
+fn test_string_basic() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT 'hello'").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::String(v) => assert_eq!(v[0], "hello"),
+        other => panic!("expected String, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_empty() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT ''").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::String(v) => assert_eq!(v[0], ""),
+        other => panic!("expected String, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_unicode() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT '日本語テスト'").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::String(v) => assert_eq!(v[0], "日本語テスト"),
+        other => panic!("expected String, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_large() {
+    // 10000 chars — well past any VarUInt length-prefix boundary.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT repeat('x', 10000)").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::String(v) => {
+            assert_eq!(v[0].len(), 10000);
+            assert!(v[0].chars().all(|c| c == 'x'));
+        }
+        other => panic!("expected String, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_embedded_nul() {
+    // ClickHouse Strings are byte sequences; NUL (0x00) is a valid byte.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT 'ab\\0cd'").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::String(v) => {
+            assert_eq!(v[0].as_bytes(), b"ab\x00cd");
+        }
+        other => panic!("expected String, got {other:?}"),
+    }
+}
+
+// -- FixedString(N) type --
+
+#[test]
+fn test_fixed_string_basic() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 'abc' cast to FixedString(5) — server right-pads with NUL to 5 bytes.
+    let result = conn.query("SELECT CAST('abc' AS FixedString(5))").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::FixedString { n, data } => {
+            assert_eq!(*n, 5);
+            assert_eq!(data, &vec![b'a', b'b', b'c', 0x00, 0x00]);
+        }
+        other => panic!("expected FixedString, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_fixed_string_exact_length() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT CAST('hello' AS FixedString(5))").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::FixedString { n, data } => {
+            assert_eq!(*n, 5);
+            assert_eq!(data, b"hello");
+        }
+        other => panic!("expected FixedString, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_fixed_string_various_sizes() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    for size in [1, 2, 16, 32, 100] {
+        let sql = format!("SELECT CAST('x' AS FixedString({size}))");
+        let result = conn.query(&sql).unwrap();
+        match &result.rows[0].columns[0].data {
+            ch_proto::proto::column::ColumnData::FixedString { n, data } => {
+                assert_eq!(*n, size, "size mismatch for FixedString({size})");
+                assert_eq!(data.len(), size, "data length mismatch for FixedString({size})");
+                assert_eq!(data[0], b'x');
+                // rest is NUL padding
+                assert!(data[1..].iter().all(|&b| b == 0));
+            }
+            other => panic!("expected FixedString({size}), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_fixed_string_multiple_rows() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST(x AS FixedString(4)) FROM (SELECT arrayJoin(['a', 'bb', 'ccc', 'dddd']) AS x)")
+        .unwrap();
+    assert_eq!(result.row_count(), 4);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::FixedString { n, data } => {
+            assert_eq!(*n, 4);
+            assert_eq!(data.len(), 16); // 4 rows × 4 bytes
+            assert_eq!(&data[0..4], &[b'a', 0, 0, 0]);
+            assert_eq!(&data[4..8], &[b'b', b'b', 0, 0]);
+            assert_eq!(&data[8..12], &[b'c', b'c', b'c', 0]);
+            assert_eq!(&data[12..16], b"dddd");
+        }
+        other => panic!("expected FixedString, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_query_default_options() {
     // query() delegates to query_with(QueryOptions::new()); should be identical behavior.
