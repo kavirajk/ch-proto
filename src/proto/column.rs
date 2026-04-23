@@ -54,6 +54,13 @@ pub enum ColumnData {
         inner: Box<ColumnData>,
         nulls: Vec<u8>,
     },
+    Array {
+        inner: Box<ColumnData>,
+        // NOTE(kavi): do we need u64 for offsets? come back later
+        // probably because it's cumulative and sum can get wide range.
+        // but still.
+        offsets: Vec<u64>,
+    },
 }
 
 impl Column {
@@ -165,6 +172,12 @@ impl ColumnData {
                 w.write_all(nulls)?;
                 inner.encode(w)?;
             }
+            ColumnData::Array { inner, offsets } => {
+                for &off in offsets {
+                    w.write_u64(off)?;
+                }
+                inner.encode(w)?;
+            }
         }
         Ok(())
     }
@@ -251,12 +264,24 @@ impl ColumnData {
                 Ok(ColumnData::FixedString { n, data })
             }
             "Nullable" => {
-                let inner_data_type = parse_nullable_inner_type(data_type)?;
+                let inner_data_type = parse_composite_inner_type(data_type)?;
                 let mut nulls = vec![0u8; rows];
                 r.read_exact(&mut nulls)?;
                 let inner = Box::new(ColumnData::decode(r, &inner_data_type, rows)?);
 
                 Ok(ColumnData::Nullable { inner, nulls })
+            }
+
+            "Array" => {
+                let inner_dt = parse_composite_inner_type(data_type)?;
+                let mut offsets: Vec<u64> = Vec::new();
+                for _ in 0..rows {
+                    let off = r.read_u64()?;
+                    offsets.push(off);
+                }
+                let inner = Box::new(ColumnData::decode(r, &inner_dt, rows)?);
+
+                Ok(ColumnData::Array { inner, offsets })
             }
             _ => Err(Error::new(
                 ErrorKind::Unsupported,
@@ -265,13 +290,14 @@ impl ColumnData {
         }
     }
 }
-// Parse the `T` in `Nullable(T)` from full type string.
-// NOTE: T can be another ColumnData type. Hence the string.
-fn parse_nullable_inner_type(data_type: &str) -> Result<String> {
+// Parse the `T` in composite types like `Nullable(T)`, `Array(T)`
+// from full type string.
+// NOTE: T can be another ColumnData type. Hence the String return type.
+fn parse_composite_inner_type(data_type: &str) -> Result<String> {
     let err = || {
         Error::new(
             ErrorKind::InvalidData,
-            format!("invalid Nullable type string: {data_type}"),
+            format!("invalid composite type string: {data_type}"),
         )
     };
 
@@ -853,9 +879,9 @@ mod tests {
 
         // [1 "x"] [15 "Nullable(UInt8)"] [0 has_custom] [0 1 0 null-map] [5 0 9 inner]
         let expected = vec![
-            0x01, b'x',                                                       // name
+            0x01, b'x', // name
             0x0F, b'N', b'u', b'l', b'l', b'a', b'b', b'l', b'e', b'(', b'U', // type
-            b'I', b'n', b't', b'8', b')',                                     //
+            b'I', b'n', b't', b'8', b')', //
             0x00, // has_custom_serialization
             0x00, 0x01, 0x00, // null map (present, null, present)
             0x05, 0x00, 0x09, // inner UInt8 values
@@ -886,7 +912,10 @@ mod tests {
 
     #[test]
     fn test_parse_nullable_inner_type() {
-        assert_eq!(parse_nullable_inner_type("Nullable(UInt32)").unwrap(), "UInt32");
+        assert_eq!(
+            parse_nullable_inner_type("Nullable(UInt32)").unwrap(),
+            "UInt32"
+        );
         assert_eq!(
             parse_nullable_inner_type("Nullable(DateTime('UTC'))").unwrap(),
             "DateTime('UTC')"
@@ -915,7 +944,10 @@ mod tests {
             data_type: "Nullable(FixedString(3))".to_string(),
             serialization: Serialization::Default,
             data: ColumnData::Nullable {
-                inner: Box::new(ColumnData::FixedString { n: 3, data: data.clone() }),
+                inner: Box::new(ColumnData::FixedString {
+                    n: 3,
+                    data: data.clone(),
+                }),
                 nulls: vec![0, 1, 0],
             },
         };
