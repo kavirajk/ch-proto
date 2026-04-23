@@ -197,21 +197,27 @@ These are fixed-width but with parameter parsing or special encoding.
 
 ---
 
-#### Problem 31: `Date`, `Date32`, `DateTime64`
+#### Problem 31: `Date`, `Date32`, `DateTime64`, `Time`, `Time64`
+
+Date/time family. All fixed-width; scale/timezone parameters live in the type string and affect interpretation, not bytes.
 
 - `Date` — 2 bytes, UInt16 days since `1970-01-01`.
 - `Date32` — 4 bytes, Int32 days since `1970-01-01` (allows pre-1970).
-- `DateTime64(scale)` or `DateTime64(scale, 'UTC')` — 8 bytes, Int64 ticks at the given scale.
+- `DateTime64(scale)` or `DateTime64(scale, 'UTC')` — 8 bytes, Int64 ticks at the given scale (0..9). Scale 3 = ms, 6 = µs, 9 = ns.
+- `Time` — 4 bytes, Int32 representing an hours/minutes/seconds duration (range spans centuries). Unlike `Date` it is a **duration**, not a calendar date. Added in a recent server version; encountered during integration tests against recent ClickHouse.
+- `Time64(scale)` — 8 bytes, Int64 ticks at the given scale. Same scale semantics as `DateTime64`. Added alongside `Time`.
 
 **Implementation:**
-- Parse scale from type string for `DateTime64`.
-- Return decoded date/time as a structured value if a library is available; otherwise raw.
+- Parse scale from the type string for `DateTime64` and `Time64`.
+- Strip timezone parameter if present (same base-type stripping rule as §11.9 in the spec).
+- Return decoded values as structured types if a library is available; otherwise raw integers + scale metadata.
 
-**Spec work:** subsections in §8.1 with byte-level examples.
+**Spec work:** subsections in §8.1 with byte-level examples. Note in §11 the distinction between `DateTime*` (absolute instant in time) and `Time*` (duration / time-of-day-like value).
 
 **References:**
-- ch-go: `proto/col_date_gen.go`, `proto/col_date32_gen.go`, `proto/col_datetime64.go`
-- ClickHouse: `src/DataTypes/DataTypeDate.cpp`, `src/DataTypes/DataTypeDate32.cpp`, `src/DataTypes/DataTypeDateTime64.cpp`, `src/DataTypes/Serializations/SerializationDate.cpp`, `SerializationDate32.cpp`, `SerializationDateTime64.cpp`
+- ch-go: `proto/col_date_gen.go`, `proto/col_date32_gen.go`, `proto/col_datetime64.go` (no ch-go Time/Time64 — added after ch-go's coverage cap)
+- ClickHouse: `src/DataTypes/DataTypeDate.cpp`, `DataTypeDate32.cpp`, `DataTypeDateTime64.cpp`, `DataTypeTime.cpp`, `DataTypeTime64.cpp`, `src/DataTypes/Serializations/SerializationDate.cpp`, `SerializationDate32.cpp`, `SerializationDateTime64.cpp`, `SerializationTime.cpp`, `SerializationTime64.cpp`
+- Registered in `DataTypeFactory.cpp:344` (`registerDataTypeTime(*this)`)
 
 ---
 

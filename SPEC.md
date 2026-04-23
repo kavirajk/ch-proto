@@ -1103,10 +1103,103 @@ The structural properties shared by all types in this group:
 - **No cross-block state.** Each block is fully self-describing; a decoder never needs information from a previous block to decode the current one.
 - **Recursive.** Inner types of a composite may themselves be any type, including other composites. `Array(Nullable(String))` is composed of `Array(...)` with a `Nullable(String)` value stream.
 
-> **Not yet specified in this document:** `Nullable(T)`, `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
+#### 8.3.1 Nullable(T)
+
+**Type string:** `Nullable(InnerType)` where `InnerType` is any ClickHouse type. Examples: `Nullable(UInt32)`, `Nullable(String)`, `Nullable(FixedString(16))`, `Nullable(DateTime('UTC'))`.
+
+**Semantic model:** each row holds either a value of the inner type or a SQL NULL. Nullability is orthogonal to the element type — any row may independently be null or present.
+
+**Wire layout:** two concatenated streams, null-map first:
+
+```
+[null-map stream]   num_rows × UInt8
+[values stream]     inner type's encoding for num_rows values
+```
+
+**Stream 1 — null-map:** exactly `num_rows` bytes, one per row. Each byte indicates whether the corresponding row is null.
+
+| Byte value | Meaning |
+|------------|---------|
+| `0x00`     | Value is present at this row. Read the value from the values stream at the corresponding position. |
+| non-zero (`0x01` canonical) | Value at this row is NULL. The bytes at the corresponding position in the values stream are a placeholder and should be ignored. |
+
+**Stream 2 — values:** the inner type's standard encoding for **all** `num_rows` rows, including the null positions. The values at null positions are placeholder bytes and may be anything the server chose to emit (typically zero-initialized or empty). The decoder must still read and consume them to advance the stream position correctly; callers must consult the null-map before interpreting any individual value.
+
+This "always emit `num_rows` values" invariant is what allows positional indexing into the values stream without computing a per-row offset. It is a deliberate space-for-simplicity tradeoff — a null-heavy column wastes some bytes in the values stream, but decoders can seek to row `N` by simple arithmetic.
+
+**Placeholder values by inner type:**
+
+| Inner type family | Placeholder at null position |
+|-------------------|-----------------------------|
+| Fixed-width (UInt/Int/Float/DateTime/UUID/etc.) | Zero-initialized bytes of the appropriate width. |
+| `String` | Empty string — a single `0x00` byte (VarUInt length 0, zero bytes of data). |
+| `FixedString(N)` | N zero bytes. |
+| `Array(T)` | Empty array — offsets stream advances by zero at the null row. |
+| `Tuple(T1, T2, ...)` | Each element uses its own default placeholder. |
+
+Senders (clients on INSERT) may write any bytes at null positions; servers are expected to write deterministic defaults. Decoders must not rely on any specific placeholder value.
+
+**Nesting:** `Nullable(T)` may be used inside other composites. For example:
+
+- `Array(Nullable(UInt32))` — an array column where individual elements may be null.
+- `Tuple(Nullable(String), UInt8)` — a tuple where the first element is nullable.
+
+`Nullable(Nullable(T))` is not allowed — the server rejects this type. Nullability is not composable with itself.
+
+**Byte-level example:** a `Nullable(UInt8)` column with three rows `[5, NULL, 9]`:
+
+```
+00 01 00                         null-map: present, null, present
+05 00 09                         values:   5, placeholder (0), 9
+```
+
+Total: 6 bytes of column data. Framed as part of the Column wire layout (§7.11):
+
+```
+01 'x'                           Column.name = "x"
+0F 'N' 'u' 'l' 'l' 'a' 'b' 'l'   Column.type = "Nullable(UInt8)" (15 chars)
+   'e' '(' 'U' 'I' 'n' 't' '8'
+   ')'
+00                               has_custom_serialization = 0
+00 01 00                         null-map
+05 00 09                         values
+```
+
+Total column bytes on the wire: 26.
+
+**Byte-level example — `Nullable(String)` with three rows `["hello", NULL, "world"]`:**
+
+```
+00 01 00                         null-map
+05 'h' 'e' 'l' 'l' 'o'           row 0: "hello"
+00                               row 1: placeholder (empty string)
+05 'w' 'o' 'r' 'l' 'd'           row 2: "world"
+```
+
+Total: 15 bytes of column data.
+
+**Decoder algorithm:**
+
+1. Read `num_rows` bytes into the null-map buffer.
+2. Recursively decode the inner type's column data for `num_rows` values.
+3. Expose an accessor that, given a row index `N`, returns either the decoded value at position `N` or a null marker, determined by the null-map byte at position `N`.
+
+**Encoder algorithm:**
+
+1. Write the `num_rows` null-map bytes.
+2. Write the inner type's encoding for all `num_rows` values, filling null positions with the default placeholder for the inner type.
+
+**Common mistakes:**
+
+- **Writing values first, then the null-map.** The spec order is null-map first. Swapping produces a stream that decodes to garbage.
+- **Writing fewer values than `num_rows`** (e.g., skipping null positions in the values stream). The values stream must have exactly `num_rows` values.
+- **Relying on the placeholder bytes as real data.** Servers may emit any bytes at null positions; decoders must treat them as unspecified.
+
+#### 8.3.2 Other composite types (not yet specified)
+
+> **Not yet specified in this document:** `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
 >
 > Planned wire format sketches (to be fleshed out):
-> - **`Nullable(T)`** — null-map stream: `num_rows` × `UInt8` (0 = present, 1 = null); then values stream: the inner type's encoding for all `num_rows` rows (values at null positions are unused).
 > - **`Array(T)`** — offsets stream: `num_rows` × `UInt64` (cumulative end-offsets into the values stream); then values stream: `offsets[num_rows - 1]` elements of the inner type.
 > - **`Tuple(T1, T2, ...)`** — one stream per element type, each encoding `num_rows` values of its type.
 > - **`Map(K, V)`** — equivalent to `Array(Tuple(K, V))`; shares `Array`'s offsets stream + a paired `Tuple(K, V)` values stream.
