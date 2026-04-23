@@ -917,12 +917,14 @@ This section documents how each ClickHouse data type is serialized within the `d
 
 Type strings may carry parameters in parentheses (see §11.9). Base-type dispatch should strip the `(...)` suffix before matching; parameters may still be needed for size/scale/element-type decisions within the matched decoder.
 
-Types are organized into four groups:
+Types are organized into four groups in order of increasing decoder complexity:
 
-- **§8.1 Fixed-width types** — each row consumes a known constant number of bytes.
-- **§8.2 Variable-length types** — each row consumes a variable number of bytes, with a per-row length prefix.
-- **§8.3 Composite types** — types built from one or more nested types, using multiple "streams" per column. *Placeholder until implemented.*
-- **§8.4 Future work** — advanced types not yet specified in this document.
+- **§8.1 Fixed-width types** — each row consumes a constant number of bytes. Single stream. No state, no version. Simplest category.
+- **§8.2 Variable-length types** — each row consumes a variable number of bytes with a per-row length prefix. Single stream. No state, no version.
+- **§8.3 Composite types (fixed shape)** — types built from one or more inner types, encoded as multiple streams per column (e.g., null-map + values, offsets + values). Wire format is stable and unversioned; shape is fully determined by the type string at decode time.
+- **§8.4 Versioned / stateful types** — types whose wire format has evolved over time, carry a serialization-version prefix, and may maintain cross-block state. Typically also feature runtime-varying per-row sub-types.
+
+A client that supports §8.1 and §8.2 can handle most simple queries. §8.3 adds support for nulls, arrays, and structured data. §8.4 is needed only for advanced analytics types; implementation complexity jumps significantly at this boundary.
 
 ### 8.1 Fixed-width types
 
@@ -1088,24 +1090,131 @@ Comparison between String and FixedString:
 | UTF-8 expected | Typically yes (not enforced) | No (treat as raw bytes) |
 | Type parameter | None | Required integer `N` |
 
-### 8.3 Composite types
+### 8.3 Composite types (fixed shape)
 
-> Not yet documented here. These types (`Nullable(T)`, `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `LowCardinality(T)`) serialize as multiple streams per column — e.g., `Nullable(T)` is a null-map stream followed by a values stream, and `Array(T)` is an offsets stream followed by a flattened values stream.
+Composite types are built by wrapping one or more inner types. They share a common wire model: **multiple streams per column**. A single logical column on the wire is encoded as two or more independently-read sequences of bytes, concatenated: for example, `Nullable(UInt32)` is a null-map stream followed by a values stream.
 
-### 8.4 Future work
+Unlike §8.4, types in this group have a **stable, unversioned wire format** and no cross-block state. The full shape of the column is known from the type string (e.g., `Array(String)`, `Nullable(UInt32)`, `Tuple(UInt8, String)`) — the decoder statically derives the streams it must read.
 
-The following types are recognized by the server but not yet specified in this document:
+The structural properties shared by all types in this group:
 
-- **`Nullable(T)`**, **`Array(T)`**, **`Tuple(T1, T2, ...)`**, **`Map(K, V)`** — composite types (planned for §8.3).
-- **`LowCardinality(T)`** — dictionary-encoded column with cross-block state. Non-trivial due to the stateful dictionary.
-- **`Decimal(P, S)`**, **`Decimal32/64/128/256`** — fixed-point decimal numerics.
-- **`Dynamic`** — runtime-typed column with a discriminant per row; cross-block state for the type list.
-- **`Variant(T1, T2, ...)`** — discriminated union.
-- **`JSON`** — layered on `Object` + `Dynamic`. Most complex type in the protocol. Clients may use the `output_format_native_write_json_as_string` setting to receive JSON as a String column instead.
-- **`AggregateFunction`**, **`SimpleAggregateFunction`** — serialized aggregation state.
-- **`Nested(...)`** — syntactic sugar for `Array(Tuple(...))`.
-- **`Interval`** — calendar/time interval.
-- **Geo types** — `Point`, `Ring`, `Polygon`, `MultiPolygon`.
+- **Fixed shape per schema.** The structure is determined entirely by the type string at decode time. `Array(UInt32)` always has the same stream layout regardless of block.
+- **No version prefix.** The stream layout is stable across ClickHouse releases.
+- **No cross-block state.** Each block is fully self-describing; a decoder never needs information from a previous block to decode the current one.
+- **Recursive.** Inner types of a composite may themselves be any type, including other composites. `Array(Nullable(String))` is composed of `Array(...)` with a `Nullable(String)` value stream.
+
+> **Not yet specified in this document:** `Nullable(T)`, `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
+>
+> Planned wire format sketches (to be fleshed out):
+> - **`Nullable(T)`** — null-map stream: `num_rows` × `UInt8` (0 = present, 1 = null); then values stream: the inner type's encoding for all `num_rows` rows (values at null positions are unused).
+> - **`Array(T)`** — offsets stream: `num_rows` × `UInt64` (cumulative end-offsets into the values stream); then values stream: `offsets[num_rows - 1]` elements of the inner type.
+> - **`Tuple(T1, T2, ...)`** — one stream per element type, each encoding `num_rows` values of its type.
+> - **`Map(K, V)`** — equivalent to `Array(Tuple(K, V))`; shares `Array`'s offsets stream + a paired `Tuple(K, V)` values stream.
+> - **`Nested(name1 T1, ...)`** — syntactic sugar that expands to several parallel `Array(T_i)` columns in the block's column list.
+
+### 8.4 Versioned / stateful types
+
+This group covers the most complex types in the protocol. Each of these types:
+
+- Begins its column data with a **serialization-version prefix** that declares which variant of the wire encoding follows.
+- May use **multiple streams** (like §8.3) but with a state prefix preceding them.
+- May maintain **cross-block state** — e.g., a dictionary that accumulates values across blocks, or a path set that grows as new paths appear in later blocks.
+- Typically supports **runtime-varying sub-types** — different rows may hold values of different concrete types (the sub-type is chosen per row at query time, not fixed by the schema).
+
+Implementing support for these types is an order of magnitude more work than §8.3. A client targeting simple analytical queries can defer this section.
+
+#### 8.4.1 Serialization version: concept and purpose
+
+A **serialization version** is a per-type, on-wire version number that declares which variant of that type's encoding the sender is using.
+
+**Where it sits on the wire.** Types in this group have a *state prefix* that precedes the row values. The serialization version is the first thing in that prefix, so the decoder reads it and dispatches to the right parser for the rest of the column.
+
+**Why it exists.** These types' wire formats have evolved over time — fields added, redundant parameters removed, optimizations introduced. The version prefix lets senders and receivers agree on which variant is in use, independent of the connection-level protocol version (§4).
+
+**Relationship to the protocol version.** The serialization version is **distinct** from the protocol version:
+
+| Dimension                     | Protocol version (§4)            | Serialization version (this section) |
+|-------------------------------|----------------------------------|--------------------------------------|
+| Scope                         | Connection-wide                  | Per-type, per-column                 |
+| Negotiated                    | Yes, at handshake                | No — sender writes, receiver reads   |
+| Controls                      | Which packet-level features are active | Which wire variant of one type    |
+| Tied to ClickHouse release?   | No (evolves independently)       | No (evolves independently)           |
+| Mandatory to read?            | Yes                              | Yes, for each versioned column       |
+
+**Common encoding.** Most versioned types write the version as a **little-endian UInt64** immediately before any other state-prefix data. A few use VarUInt or UInt8 — the exact width is per-type.
+
+**What versions are not.** They are not ClickHouse release numbers, not protocol version numbers, and not necessarily contiguous (e.g., `Dynamic` skips value `0` and uses values `1`, `2`, `3`, `4` non-monotonically in semantic order).
+
+**Decoder obligations.**
+- Read the version first.
+- Reject unknown values — they indicate a newer sender format the current decoder does not understand. Failing loudly is safer than guessing, because mis-parsing corrupts every subsequent byte.
+- Dispatch to the correct sub-format parser for the rest of the column.
+
+#### 8.4.2 Serialization version value reference
+
+| Type | Field width | Value | Name | Meaning |
+|---|---|---|---|---|
+| **Object** (base for JSON) | UInt64 LE | `0` | `V1` | Original encoding. Includes `max_dynamic_paths` parameter and a list of dynamic paths. |
+| | | `1` | `STRING` | Native-format compatibility mode — Object transmitted as a single `String` column containing JSON text. |
+| | | `2` | `V2` | V1 layout minus the `max_dynamic_paths` parameter (server found it unnecessary on read). |
+| | | `3` | `FLATTENED` | Native-format compatibility mode — flattened path representation for clients that cannot handle the nested Object structure. |
+| | | `4` | `V3` | V2 layout plus a shared-data serialization version sub-field and a statistics flag. |
+| **Object shared data** (sub-stream used in Object `V3`) | VarUInt | `0` | `MAP` | Shared data encoded as `Map(String, String)`. |
+| | | `1` | `MAP_WITH_BUCKETS` | Same as `MAP` but split into N buckets for scan efficiency. |
+| | | `2` | `ADVANCED` | Compact granule format with separate streams for paths / marks / metadata. |
+| **Dynamic** | UInt64 LE | `1` | `V1` | Original encoding. Includes `max_dynamic_types` parameter and a list of runtime variant types. |
+| | | `2` | `V2` | V1 minus the `max_dynamic_types` parameter. |
+| | | `3` | `FLATTENED` | Native-format compatibility mode for clients that cannot decode the full Dynamic structure. |
+| | | `4` | `V3` | V2 plus binary-encoded variant type names and empty-statistics support. |
+| **Variant** discriminators mode | UInt64 LE | `0` | `BASIC` | Every row's discriminator is written literally. |
+| | | `1` | `COMPACT` | If all rows in a granule share one discriminator, only a single value + granule marker is written. |
+| **Variant** granule format (when mode is `COMPACT`) | UInt8 | `0` | `PLAIN` | This granule has heterogeneous discriminators — write them all. |
+| | | `1` | `COMPACT` | This granule has one discriminator for all its rows. |
+| **LowCardinality** key serialization | Int64 | `1` | `sharedDictionariesWithAdditionalKeys` | Only version currently defined — shared dictionary with per-block additional keys (dictionary deltas). |
+| **JSON-as-String** fallback (when `output_format_native_write_json_as_string` is enabled) | UInt64 LE | `1` | `JSONStringSerializationVersion` | JSON column arrives as a `String` column preceded by this version prefix. Any other value means the server is sending the real binary JSON format, which requires the full Object/Dynamic implementation. |
+
+Notes on the table:
+
+- **Values aren't always contiguous.** `Dynamic` has values `1`, `2`, `3`, `4` with `V3` at `4` and `FLATTENED` at `3`. Don't assume `0..N` is defined or that higher numbers are newer.
+- **Native-format-only values.** `Object::STRING`, `Object::FLATTENED`, `Dynamic::FLATTENED` exist for Native protocol wire use (compatibility with clients that don't implement full Object/Dynamic); they do not appear in MergeTree on-disk storage.
+- **LowCardinality is barely versioned.** The only defined value is `1`. The versioning scaffolding is in place should the encoding ever change.
+- **`V3` is primarily on-disk.** `Object::V3` (value `4`) and `Dynamic::V3` (value `4`) are the storage-internal formats with richer metadata (shared-data sub-version, statistics, binary-encoded variant names). Clients consuming the native TCP protocol typically see `FLATTENED` (value `3`) instead, which carries equivalent column data without the storage-specific metadata. An implementation targeting only native-protocol traffic can reasonably skip the `V3` branch.
+
+#### 8.4.2.1 Client implementation tiers for JSON
+
+Three progressively-harder strategies for supporting JSON in a client, corresponding to the subset of Object versions the client decodes:
+
+**Tier 1 — String-only (simplest).** Force the server to downgrade JSON to text by setting `output_format_native_write_json_as_string = 1` in every query. Decode only version `1` (`STRING`). Reject any other value with a clear error. JSON arrives as a single UTF-8 text payload per row; users parse it themselves (or the client wraps it in a convenience type). Implementation effort: a few hours on top of existing `String` support.
+
+**Tier 2 — String + FLATTENED (matches clickhouse-go v2).** Decode versions `0` (legacy `V1`; auto-upgrade to FLATTENED on read), `1` (`STRING`), and `3` (`FLATTENED`). FLATTENED requires supporting the full `Dynamic` type underneath, which in turn requires `Variant`. A client at this tier delivers structured JSON — typed paths exposed as individual column-like access. Implementation effort: significant (thousands of lines of code to implement FLATTENED + Dynamic + Variant correctly).
+
+**Tier 3 — Full (`V3` support).** Also decodes versions `2` (`V2`) and `4` (`V3`). `V3` adds the `shared_data` sub-stream with its own version enum (§8.4.2), plus statistics and extended metadata. In practice this tier is only useful for clients that read raw on-disk MergeTree parts; the native TCP server does not emit `V3` to remote clients in typical operation.
+
+Most production Go/Rust/Python clients sit at Tier 2. The Tier 1 fallback remains useful as a simpler path when full JSON support is not required.
+
+#### 8.4.3 Types in this group
+
+> **Not yet specified in this document.** The following types belong to this group but their full wire format is not yet documented:
+>
+> - **`LowCardinality(T)`** — dictionary-encoded column with cross-block state (accumulating additional keys per block). Simplest of the versioned types; only one version defined.
+> - **`Variant(T1, T2, ...)`** — discriminated union. Each row has a discriminator byte/short indicating which alternative holds the value; then per-alternative streams carry the actual values.
+> - **`Dynamic`** — runtime-typed column. Each row's type is chosen from a set of variants that can grow across blocks. Built from `Variant` plus a structure prefix.
+> - **`Object`** (underlying `JSON`) — tree of dynamically-discovered paths, each path a `Dynamic` column. Complex due to the multi-layer composition (`Object` over `Dynamic` over `Variant`).
+> - **`JSON`** — thin wrapper over `Object`. Clients may bypass the full implementation by setting `output_format_native_write_json_as_string = 1`, in which case JSON arrives as a `String` column with the `JSONStringSerializationVersion` prefix — see §8.4.2.
+>
+> Recommended implementation order for clients: `LowCardinality` → `Variant` → `Dynamic` → `Object` / `JSON`.
+
+### 8.5 Types not yet categorized
+
+A catch-all for types recognized by the server that aren't documented above:
+
+- **`Decimal(P, S)`**, **`Decimal32/64/128/256`** — fixed-point decimal numerics. Will fall under §8.1 (fixed-width).
+- **`AggregateFunction`**, **`SimpleAggregateFunction`** — serialized aggregation state. Structurally similar to §8.3 composites.
+- **`Interval`** — calendar/time interval. Fixed-width.
+- **Geo types** — `Point`, `Ring`, `Polygon`, `MultiPolygon`. Composites built on `Tuple` and `Array`.
+- **`Int16`, `UInt16`**, **`Int128`, `UInt128`**, **`Int256`, `UInt256`**, **`Float32`, `Float64`**, **`Date`**, **`Date32`**, **`DateTime64`**, **`UUID`**, **`IPv4`**, **`IPv6`**, **`Enum16`**, **`Bool`** — fixed-width, to be specified in §8.1.
+
+These will be moved into their respective groups (§8.1–8.4) as specifications are filled in.
 
 ---
 
