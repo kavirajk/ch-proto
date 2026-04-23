@@ -315,7 +315,9 @@ fn test_fixed_string_basic() {
 fn test_fixed_string_exact_length() {
     require_server();
     let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
-    let result = conn.query("SELECT CAST('hello' AS FixedString(5))").unwrap();
+    let result = conn
+        .query("SELECT CAST('hello' AS FixedString(5))")
+        .unwrap();
     match &result.rows[0].columns[0].data {
         ch_proto::proto::column::ColumnData::FixedString { n, data } => {
             assert_eq!(*n, 5);
@@ -335,7 +337,11 @@ fn test_fixed_string_various_sizes() {
         match &result.rows[0].columns[0].data {
             ch_proto::proto::column::ColumnData::FixedString { n, data } => {
                 assert_eq!(*n, size, "size mismatch for FixedString({size})");
-                assert_eq!(data.len(), size, "data length mismatch for FixedString({size})");
+                assert_eq!(
+                    data.len(),
+                    size,
+                    "data length mismatch for FixedString({size})"
+                );
                 assert_eq!(data[0], b'x');
                 // rest is NUL padding
                 assert!(data[1..].iter().all(|&b| b == 0));
@@ -374,22 +380,4 @@ fn test_query_default_options() {
     let a = conn.query("SELECT 1").unwrap();
     let b = conn.query_with("SELECT 1", QueryOptions::new()).unwrap();
     assert_eq!(a.row_count(), b.row_count());
-}
-
-#[test]
-fn test_query_string_type() {
-    require_server();
-    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
-    let a = conn.query("select name from system.tables").unwrap();
-
-    eprintln!("databases: {:?}", a.rows)
-}
-
-#[test]
-fn test_query_date_type() {
-    require_server();
-    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
-    let a = conn.query("select now()::Time64").unwrap();
-
-    eprintln!("now: {:?}", a.rows)
 }

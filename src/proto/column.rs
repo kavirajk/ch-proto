@@ -50,6 +50,10 @@ pub enum ColumnData {
     },
     // DateTime is UInt32 seconds-since-epoch on the wire.
     DateTime(Vec<u32>),
+    Nullable {
+        inner: Box<ColumnData>,
+        nulls: Vec<u8>,
+    },
 }
 
 impl Column {
@@ -156,6 +160,11 @@ impl ColumnData {
                 let _ = n;
                 w.write_all(data)?;
             }
+            ColumnData::Nullable { inner, nulls } => {
+                // Wire format:
+                w.write_all(nulls)?;
+                inner.encode(w)?;
+            }
         }
         Ok(())
     }
@@ -241,12 +250,39 @@ impl ColumnData {
                 r.read_exact(&mut data)?;
                 Ok(ColumnData::FixedString { n, data })
             }
+            "Nullable" => {
+                let inner_data_type = parse_nullable_inner_type(data_type)?;
+                let mut nulls = vec![0u8; rows];
+                r.read_exact(&mut nulls)?;
+                let inner = Box::new(ColumnData::decode(r, &inner_data_type, rows)?);
+
+                Ok(ColumnData::Nullable { inner, nulls })
+            }
             _ => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!("column type '{data_type}' not yet supported"),
             )),
         }
     }
+}
+// Parse the `T` in `Nullable(T)` from full type string.
+// NOTE: T can be another ColumnData type. Hence the string.
+fn parse_nullable_inner_type(data_type: &str) -> Result<String> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Nullable type string: {data_type}"),
+        )
+    };
+
+    let open = data_type.find('(').ok_or_else(err)?;
+    let close = data_type.rfind(')').ok_or_else(err)?;
+
+    if open + 1 >= close {
+        return Err(err());
+    }
+
+    Ok(data_type[open + 1..close].trim().to_string())
 }
 
 /// Parse the `N` in `FixedString(N)` from the full type string.
@@ -387,7 +423,10 @@ mod tests {
         col.encode(&mut buf, PROTOCOL).unwrap();
 
         // Expected wire: [1 "x"] [5 "UInt8"] [0 (has_custom)]
-        assert_eq!(buf, vec![0x01, b'x', 0x05, b'U', b'I', b'n', b't', b'8', 0x00]);
+        assert_eq!(
+            buf,
+            vec![0x01, b'x', 0x05, b'U', b'I', b'n', b't', b'8', 0x00]
+        );
     }
 
     #[test]
@@ -507,12 +546,9 @@ mod tests {
         // [1 "s"] [6 "String"] [0 has_custom]
         // then: [2 'a' 'b'] [0] [1 'c']
         let expected = vec![
-            0x01, b's',
-            0x06, b'S', b't', b'r', b'i', b'n', b'g',
+            0x01, b's', 0x06, b'S', b't', b'r', b'i', b'n', b'g',
             0x00, // has_custom_serialization
-            0x02, b'a', b'b',
-            0x00,
-            0x01, b'c',
+            0x02, b'a', b'b', 0x00, 0x01, b'c',
         ];
         assert_eq!(buf, expected);
     }
@@ -527,7 +563,10 @@ mod tests {
             name: "s".to_string(),
             data_type: "FixedString(4)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::FixedString { n: 4, data: data.clone() },
+            data: ColumnData::FixedString {
+                n: 4,
+                data: data.clone(),
+            },
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
@@ -566,7 +605,10 @@ mod tests {
             name: "s".to_string(),
             data_type: "FixedString(5)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::FixedString { n: 5, data: data.clone() },
+            data: ColumnData::FixedString {
+                n: 5,
+                data: data.clone(),
+            },
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
@@ -621,10 +663,8 @@ mod tests {
 
         // [1 "s"] [14 "FixedString(3)"] [0 has_custom] [6 bytes of data]
         let expected = vec![
-            0x01, b's',
-            0x0E, b'F', b'i', b'x', b'e', b'd', b'S', b't', b'r', b'i', b'n', b'g', b'(', b'3', b')',
-            0x00,
-            b'a', b'b', b'c', b'd', b'e', b'f',
+            0x01, b's', 0x0E, b'F', b'i', b'x', b'e', b'd', b'S', b't', b'r', b'i', b'n', b'g',
+            b'(', b'3', b')', 0x00, b'a', b'b', b'c', b'd', b'e', b'f',
         ];
         assert_eq!(buf, expected);
     }
@@ -637,7 +677,10 @@ mod tests {
             name: "s".to_string(),
             data_type: "FixedString(3)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::FixedString { n: 3, data: data.clone() },
+            data: ColumnData::FixedString {
+                n: 3,
+                data: data.clone(),
+            },
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
@@ -647,6 +690,252 @@ mod tests {
         match decoded.data {
             ColumnData::FixedString { data: d, .. } => assert_eq!(d, data),
             _ => panic!("expected FixedString"),
+        }
+    }
+
+    // -- Nullable(T) --
+
+    #[test]
+    fn test_nullable_uint32_roundtrip() {
+        // Nullable(UInt32) with [10, null, 20] — placeholder byte for null row is 0.
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint32(vec![10, 0, 20])),
+                nulls: vec![0, 1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![0, 1, 0]);
+                match *inner {
+                    ColumnData::Uint32(v) => assert_eq!(v, vec![10, 0, 20]),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_all_nulls() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint32(vec![0, 0, 0])),
+                nulls: vec![1, 1, 1],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { nulls, .. } => assert_eq!(nulls, vec![1, 1, 1]),
+            _ => panic!("expected Nullable"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_no_nulls() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+                nulls: vec![0, 0, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![0, 0, 0]);
+                match *inner {
+                    ColumnData::Uint32(v) => assert_eq!(v, vec![1, 2, 3]),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_zero_rows() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint32(vec![])),
+                nulls: vec![],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert!(nulls.is_empty());
+                match *inner {
+                    ColumnData::Uint32(v) => assert!(v.is_empty()),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_string_roundtrip() {
+        // Placeholder for null row is an empty string (wire: single 0x00 byte).
+        let col = Column {
+            name: "s".to_string(),
+            data_type: "Nullable(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::String(vec![
+                    "hello".to_string(),
+                    "".to_string(),
+                    "world".to_string(),
+                ])),
+                nulls: vec![0, 1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![0, 1, 0]);
+                match *inner {
+                    ColumnData::String(v) => assert_eq!(v, vec!["hello", "", "world"]),
+                    _ => panic!("expected String inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_wire_layout() {
+        // Verify exact wire bytes: null-map first, then inner.
+        // Nullable(UInt8) with [5, null, 9]
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint8(vec![5, 0, 9])),
+                nulls: vec![0, 1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // [1 "x"] [15 "Nullable(UInt8)"] [0 has_custom] [0 1 0 null-map] [5 0 9 inner]
+        let expected = vec![
+            0x01, b'x',                                                       // name
+            0x0F, b'N', b'u', b'l', b'l', b'a', b'b', b'l', b'e', b'(', b'U', // type
+            b'I', b'n', b't', b'8', b')',                                     //
+            0x00, // has_custom_serialization
+            0x00, 0x01, 0x00, // null map (present, null, present)
+            0x05, 0x00, 0x09, // inner UInt8 values
+        ];
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_nullable_wire_order_is_null_map_first() {
+        // Regression guard: encode must put null-map BEFORE inner values.
+        // A swapped encoder would produce [0x05, 0x09 ...] before [0x00, 0x01, ...].
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uint8(vec![0xAA, 0xBB])),
+                nulls: vec![0xFF, 0x00],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // The last 4 bytes of buf should be: null-map (0xFF, 0x00), then inner (0xAA, 0xBB).
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(tail, &[0xFF, 0x00, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_parse_nullable_inner_type() {
+        assert_eq!(parse_nullable_inner_type("Nullable(UInt32)").unwrap(), "UInt32");
+        assert_eq!(
+            parse_nullable_inner_type("Nullable(DateTime('UTC'))").unwrap(),
+            "DateTime('UTC')"
+        );
+        // Nested — rfind(')') correctly takes the outermost.
+        assert_eq!(
+            parse_nullable_inner_type("Nullable(FixedString(16))").unwrap(),
+            "FixedString(16)"
+        );
+    }
+
+    #[test]
+    fn test_parse_nullable_inner_type_invalid() {
+        assert!(parse_nullable_inner_type("Nullable").is_err());
+        assert!(parse_nullable_inner_type("Nullable()").is_err());
+        assert!(parse_nullable_inner_type("Nullable(UInt32").is_err());
+    }
+
+    #[test]
+    fn test_nullable_fixed_string_roundtrip() {
+        // Compose Nullable with a parameterized inner type.
+        // FixedString(3) with 3 rows: "abc", <null placeholder>, "xyz"
+        let data = vec![b'a', b'b', b'c', 0, 0, 0, b'x', b'y', b'z'];
+        let col = Column {
+            name: "f".to_string(),
+            data_type: "Nullable(FixedString(3))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::FixedString { n: 3, data: data.clone() }),
+                nulls: vec![0, 1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![0, 1, 0]);
+                match *inner {
+                    ColumnData::FixedString { n, data: d } => {
+                        assert_eq!(n, 3);
+                        assert_eq!(d, data);
+                    }
+                    _ => panic!("expected FixedString inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
         }
     }
 }
