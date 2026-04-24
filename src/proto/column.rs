@@ -118,7 +118,111 @@ impl Column {
 }
 
 impl ColumnData {
+    /// The number of logical rows this column holds.
+    ///
+    /// For flat types, this is the length of the underlying `Vec`.
+    /// For composites it is the **outer** row count: `Nullable` returns
+    /// `nulls.len()`, `Array` returns `offsets.len()`. Inner ColumnData of a
+    /// composite typically has a different row count (see §8.3 of the spec).
+    pub fn row_count(&self) -> usize {
+        match self {
+            ColumnData::Uint8(v) => v.len(),
+            ColumnData::Uint16(v) => v.len(),
+            ColumnData::Uint32(v) => v.len(),
+            ColumnData::Uint64(v) => v.len(),
+            ColumnData::Int8(v) => v.len(),
+            ColumnData::Int32(v) => v.len(),
+            ColumnData::Int64(v) => v.len(),
+            ColumnData::DateTime(v) => v.len(),
+            ColumnData::String(v) => v.len(),
+            ColumnData::FixedString { n, data } => {
+                if *n == 0 {
+                    0
+                } else {
+                    data.len() / n
+                }
+            }
+            ColumnData::Nullable { nulls, .. } => nulls.len(),
+            ColumnData::Array { offsets, .. } => offsets.len(),
+        }
+    }
+
+    /// Validate internal consistency of a composite column before encoding.
+    ///
+    /// Flat types are always self-consistent by construction (their data is a
+    /// single `Vec` whose length *is* the row count). Composites carry two
+    /// pieces of length information that must match — this is where most
+    /// programmer errors surface.
+    ///
+    /// Called at the top of `encode()` so that an inconsistent column is
+    /// rejected before any bytes hit the wire.
+    fn validate(&self) -> Result<()> {
+        match self {
+            ColumnData::Nullable { inner, nulls } => {
+                if inner.row_count() != nulls.len() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Nullable invariant broken: inner.row_count()={} != nulls.len()={}",
+                            inner.row_count(),
+                            nulls.len()
+                        ),
+                    ));
+                }
+                inner.validate()
+            }
+            ColumnData::Array { inner, offsets } => {
+                // Offsets must be monotonic non-decreasing.
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Array offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i, offsets[i], i - 1, offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+                if inner.row_count() != total_elements {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Array invariant broken: inner.row_count()={} != offsets.last()={}",
+                            inner.row_count(),
+                            total_elements
+                        ),
+                    ));
+                }
+                inner.validate()
+            }
+            ColumnData::FixedString { n, data } => {
+                if *n == 0 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "FixedString with n=0 is not allowed",
+                    ));
+                }
+                if data.len() % n != 0 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "FixedString invariant broken: data.len()={} is not a multiple of n={}",
+                            data.len(),
+                            n
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            // Flat types: self-consistent by construction.
+            _ => Ok(()),
+        }
+    }
+
     pub fn encode(&self, w: &mut impl ProtoWrite) -> Result<()> {
+        self.validate()?;
         match self {
             ColumnData::Uint8(v) => {
                 for &x in v {
@@ -161,14 +265,10 @@ impl ColumnData {
                 }
             }
             ColumnData::FixedString { n, data } => {
-                // Sanity: data length must be exactly n * rows, but rows isn't
-                // known here. Just write all bytes; caller is responsible for
-                // maintaining the invariant.
                 let _ = n;
                 w.write_all(data)?;
             }
             ColumnData::Nullable { inner, nulls } => {
-                // Wire format:
                 w.write_all(nulls)?;
                 inner.encode(w)?;
             }
@@ -274,12 +374,35 @@ impl ColumnData {
 
             "Array" => {
                 let inner_dt = parse_composite_inner_type(data_type)?;
-                let mut offsets: Vec<u64> = Vec::new();
+                let mut offsets: Vec<u64> = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     let off = r.read_u64()?;
                     offsets.push(off);
                 }
-                let inner = Box::new(ColumnData::decode(r, &inner_dt, rows)?);
+
+                // Validate offsets are monotonic non-decreasing (SPEC §11.x,
+                // see the offset semantics in §8.3.2). A corrupted or malicious
+                // server that emits out-of-order offsets would cause downstream
+                // garbage; fail loudly here.
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "Array offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+
+                // Total element count = last cumulative offset (or 0 for empty column).
+                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+
+                let inner = Box::new(ColumnData::decode(r, &inner_dt, total_elements)?);
 
                 Ok(ColumnData::Array { inner, offsets })
             }
@@ -404,10 +527,10 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="Array(Int32)" (not yet supported), has_custom=0
+        // Manually encode: name="x", type="Tuple(UInt32)" (not yet supported), has_custom=0
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("Array(Int32)").unwrap();
+        buf.write_string("Tuple(UInt32)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
@@ -911,27 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nullable_inner_type() {
+    fn test_parse_composite_inner_type() {
         assert_eq!(
-            parse_nullable_inner_type("Nullable(UInt32)").unwrap(),
+            parse_composite_inner_type("Nullable(UInt32)").unwrap(),
             "UInt32"
         );
         assert_eq!(
-            parse_nullable_inner_type("Nullable(DateTime('UTC'))").unwrap(),
+            parse_composite_inner_type("Nullable(DateTime('UTC'))").unwrap(),
             "DateTime('UTC')"
         );
         // Nested — rfind(')') correctly takes the outermost.
         assert_eq!(
-            parse_nullable_inner_type("Nullable(FixedString(16))").unwrap(),
+            parse_composite_inner_type("Nullable(FixedString(16))").unwrap(),
             "FixedString(16)"
         );
     }
 
     #[test]
-    fn test_parse_nullable_inner_type_invalid() {
-        assert!(parse_nullable_inner_type("Nullable").is_err());
-        assert!(parse_nullable_inner_type("Nullable()").is_err());
-        assert!(parse_nullable_inner_type("Nullable(UInt32").is_err());
+    fn test_parse_composite_inner_type_invalid() {
+        assert!(parse_composite_inner_type("Nullable").is_err());
+        assert!(parse_composite_inner_type("Nullable()").is_err());
+        assert!(parse_composite_inner_type("Nullable(UInt32").is_err());
     }
 
     #[test]
@@ -969,5 +1092,339 @@ mod tests {
             }
             _ => panic!("expected Nullable"),
         }
+    }
+
+    // -- Array(T) --
+
+    #[test]
+    fn test_array_uint32_roundtrip() {
+        // Array(UInt32) with 3 rows: [[10, 20, 30], [], [40, 50]]
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![10, 20, 30, 40, 50])),
+                offsets: vec![3, 3, 5],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert_eq!(offsets, vec![3, 3, 5]);
+                match *inner {
+                    ColumnData::Uint32(v) => assert_eq!(v, vec![10, 20, 30, 40, 50]),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_all_empty() {
+        // 3 rows, each an empty array.
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![])),
+                offsets: vec![0, 0, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert_eq!(offsets, vec![0, 0, 0]);
+                match *inner {
+                    ColumnData::Uint32(v) => assert!(v.is_empty()),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_zero_rows() {
+        // 0 rows: no offsets, no inner values.
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![])),
+                offsets: vec![],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert!(offsets.is_empty());
+                match *inner {
+                    ColumnData::Uint32(v) => assert!(v.is_empty()),
+                    _ => panic!("expected Uint32 inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_string_roundtrip() {
+        // Array(String) with [["a", "bb"], [], ["c"]]
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::String(vec![
+                    "a".to_string(),
+                    "bb".to_string(),
+                    "c".to_string(),
+                ])),
+                offsets: vec![2, 2, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert_eq!(offsets, vec![2, 2, 3]);
+                match *inner {
+                    ColumnData::String(v) => assert_eq!(v, vec!["a", "bb", "c"]),
+                    _ => panic!("expected String inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_nested_array_array_uint32() {
+        // Array(Array(UInt32)) with 3 rows: [[[1,2]], [], [[3], [4,5]]]
+        // Outer offsets = [1, 1, 3]           (inner count per outer row: 1, 0, 2)
+        // Middle Array(UInt32) row count = 3 (one per inner-array)
+        // Middle offsets = [2, 3, 5]
+        // Innermost values = [1, 2, 3, 4, 5]
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(Array(UInt32))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Array {
+                    inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4, 5])),
+                    offsets: vec![2, 3, 5],
+                }),
+                offsets: vec![1, 1, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets: outer_offsets } => {
+                assert_eq!(outer_offsets, vec![1, 1, 3]);
+                match *inner {
+                    ColumnData::Array { inner: inner2, offsets: mid_offsets } => {
+                        assert_eq!(mid_offsets, vec![2, 3, 5]);
+                        match *inner2 {
+                            ColumnData::Uint32(v) => assert_eq!(v, vec![1, 2, 3, 4, 5]),
+                            _ => panic!("expected Uint32 innermost"),
+                        }
+                    }
+                    _ => panic!("expected Array middle layer"),
+                }
+            }
+            _ => panic!("expected outer Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_nullable_inner() {
+        // Array(Nullable(UInt32)) with [[1, null, 3], [null]]
+        // Outer offsets = [3, 4]
+        // Inner Nullable(UInt32) row count = 4
+        let col = Column {
+            name: "arr".to_string(),
+            data_type: "Array(Nullable(UInt32))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Nullable {
+                    inner: Box::new(ColumnData::Uint32(vec![1, 0, 3, 0])),
+                    nulls: vec![0, 1, 0, 1],
+                }),
+                offsets: vec![3, 4],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert_eq!(offsets, vec![3, 4]);
+                match *inner {
+                    ColumnData::Nullable { nulls, .. } => {
+                        assert_eq!(nulls, vec![0, 1, 0, 1]);
+                    }
+                    _ => panic!("expected Nullable inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_array_wire_layout() {
+        // Verify byte layout: offsets (UInt64 LE) first, then inner values.
+        // Array(UInt8) with [[5, 10], [20]]: offsets=[2,3], values=[5,10,20]
+        let col = Column {
+            name: "a".to_string(),
+            data_type: "Array(UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Uint8(vec![5, 10, 20])),
+                offsets: vec![2, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // Expected tail (after header): 2 offsets × 8 bytes, then 3 UInt8 values.
+        let expected_tail = vec![
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[0] = 2
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[1] = 3
+            0x05, 0x0A, 0x14,                                // UInt8 values: 5, 10, 20
+        ];
+        let tail = &buf[buf.len() - expected_tail.len()..];
+        assert_eq!(tail, expected_tail.as_slice());
+    }
+
+    // -- row_count() helper --
+
+    #[test]
+    fn test_row_count_flat_types() {
+        assert_eq!(ColumnData::Uint8(vec![1, 2, 3]).row_count(), 3);
+        assert_eq!(ColumnData::String(vec!["a".to_string()]).row_count(), 1);
+        assert_eq!(ColumnData::Uint64(vec![]).row_count(), 0);
+    }
+
+    #[test]
+    fn test_row_count_fixed_string() {
+        let c = ColumnData::FixedString { n: 4, data: vec![0; 12] };
+        assert_eq!(c.row_count(), 3);
+    }
+
+    #[test]
+    fn test_row_count_nullable() {
+        // Nullable row count is nulls.len(), regardless of inner.
+        let c = ColumnData::Nullable {
+            inner: Box::new(ColumnData::Uint8(vec![1, 2, 3])),
+            nulls: vec![0, 1, 0],
+        };
+        assert_eq!(c.row_count(), 3);
+    }
+
+    #[test]
+    fn test_row_count_array() {
+        // Array row count is offsets.len(), NOT inner.row_count().
+        let c = ColumnData::Array {
+            inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4, 5])), // 5 inner values
+            offsets: vec![2, 3, 5],                                    // 3 outer rows
+        };
+        assert_eq!(c.row_count(), 3);
+    }
+
+    // -- validate() — catches encode-time invariant violations --
+
+    #[test]
+    fn test_validate_rejects_mismatched_nullable() {
+        // 3 nulls but 2 inner values — invalid.
+        let c = ColumnData::Nullable {
+            inner: Box::new(ColumnData::Uint32(vec![1, 2])),
+            nulls: vec![0, 1, 0],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_mismatched_array() {
+        // offsets.last() = 5 but inner has only 3 values — invalid.
+        let c = ColumnData::Array {
+            inner: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+            offsets: vec![2, 3, 5],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_non_monotonic_offsets() {
+        // offsets[2]=1 < offsets[1]=3 — invalid.
+        let c = ColumnData::Array {
+            inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4])),
+            offsets: vec![2, 3, 1],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_fixed_string_with_bad_length() {
+        // n=4, but data has 7 bytes (not a multiple of 4).
+        let c = ColumnData::FixedString { n: 4, data: vec![0; 7] };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_decode_with_non_monotonic_offsets() {
+        // Hand-craft a wire stream with a bad Array and verify decode catches it.
+        let mut buf = Vec::new();
+        buf.write_string("a").unwrap();
+        buf.write_string("Array(UInt8)").unwrap();
+        buf.write_u8(0).unwrap(); // has_custom_serialization
+        buf.write_u64(3).unwrap();
+        buf.write_u64(1).unwrap(); // <- decreases from 3 to 1 (invalid)
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let err = Column::decode(&mut cursor, 2, PROTOCOL).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_composite() {
+        let c = ColumnData::Array {
+            inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4, 5])),
+            offsets: vec![3, 3, 5],
+        };
+        let mut buf = Vec::new();
+        c.encode(&mut buf).unwrap();
+        // No panic, no error.
     }
 }

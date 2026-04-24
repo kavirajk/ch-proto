@@ -1195,12 +1195,133 @@ Total: 15 bytes of column data.
 - **Writing fewer values than `num_rows`** (e.g., skipping null positions in the values stream). The values stream must have exactly `num_rows` values.
 - **Relying on the placeholder bytes as real data.** Servers may emit any bytes at null positions; decoders must treat them as unspecified.
 
-#### 8.3.2 Other composite types (not yet specified)
+#### 8.3.2 Array(T)
 
-> **Not yet specified in this document:** `Array(T)`, `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
+**Type string:** `Array(InnerType)` where `InnerType` is any ClickHouse type. Examples: `Array(UInt32)`, `Array(String)`, `Array(Nullable(UInt32))`, `Array(Array(UInt8))`.
+
+**Semantic model:** each row holds a variable-length sequence of values of the inner type. Rows can have any number of elements (including zero); different rows in the same column may have different lengths.
+
+**Wire layout:** two concatenated streams, offsets first:
+
+```
+[offsets stream]    num_rows × UInt64 LE
+[values stream]     inner type's encoding for (offsets[num_rows - 1]) values
+```
+
+**Stream 1 — offsets:** exactly `num_rows` values, each a little-endian `UInt64` (8 bytes). Each offset is the **cumulative end position** in the values stream after that row's elements.
+
+For row `N` (zero-indexed):
+- Element **start** index (in the values stream) = `offsets[N - 1]` (or `0` when `N == 0`).
+- Element **end** index (exclusive) = `offsets[N]`.
+- Row `N`'s element count = `offsets[N] - offsets[N - 1]` (or `offsets[0]` when `N == 0`).
+
+The last offset `offsets[num_rows - 1]` equals the **total number of elements** across all rows — this is what the decoder uses to know how many values to read from the values stream.
+
+**Stream 2 — values:** the inner type's standard encoding for all `offsets[num_rows - 1]` values, concatenated end-to-end. No separators or row boundaries; the offsets stream is the only source of row-boundary information.
+
+**Key invariants:**
+
+1. Offsets are **monotonic non-decreasing**: `offsets[i] >= offsets[i - 1]` for all `i > 0`. Equal consecutive offsets mean an empty row (e.g., `[3, 3, 5]` — row 1 is empty).
+2. The values stream contains **exactly `offsets[num_rows - 1]` values** — no more, no fewer.
+3. An empty column (`num_rows == 0`) has no offsets stream and no values stream — zero bytes.
+
+Decoders must validate invariant 1 (monotonicity) and fail loudly on violations; a non-monotonic offsets stream indicates corruption or a server bug and the subsequent decode would produce garbage.
+
+**Why cumulative offsets (not per-row lengths)?**
+
+- **O(1) random access.** Row `N`'s elements are at `values[offsets[N-1]..offsets[N]]` — two reads, no scan required. Per-row lengths would require summing from row 0.
+- **Total element count is free.** `offsets[num_rows - 1]` is immediately the total, which the decoder needs up-front to size the inner stream's read.
+- **Matches in-memory layout.** ClickHouse stores arrays internally as (cumulative offsets, flat values) — the wire format is a direct serialization with no transformation.
+
+**Nesting: `Array(Array(T))`.** Each layer has its own offsets stream over the flat element count of the layer beneath it. Concretely, for rows `[[[1,2]], [], [[3], [4,5]]]`:
+
+- **Outer** `Array(Array(UInt32))`:
+  - `num_rows = 3` (three logical rows).
+  - `offsets = [1, 1, 3]` — row 0 has 1 inner-array, row 1 has 0, row 2 has 2. Total inner-arrays: 3.
+- **Middle** `Array(UInt32)` (decodes `3` rows because the outer's last offset is `3`):
+  - `offsets = [2, 3, 5]` — first inner-array has 2 elements, second has 1, third has 2. Total elements: 5.
+- **Innermost** `UInt32` (decodes `5` values because the middle's last offset is `5`):
+  - `values = [1, 2, 3, 4, 5]`.
+
+Total bytes: 24 (outer offsets) + 24 (middle offsets) + 20 (values) = 68 bytes.
+
+**Composition with Nullable.** `Array(Nullable(T))` is legal and common. The outer Array encodes as usual; the inner becomes a `Nullable(T)` column whose `num_rows` equals the outer's total element count. Each individual element of an array may independently be null.
+
+`Nullable(Array(T))` is also legal — the outer row may be entirely null (distinct from an empty array). The inner values stream at a null outer row typically encodes as an empty array (same cumulative offset as the previous row).
+
+**Byte-level example — `Array(UInt32)` with `[[10, 20, 30], [], [40, 50]]`:**
+
+```
+Offsets (3 × UInt64 LE = 24 bytes):
+03 00 00 00 00 00 00 00      offsets[0] = 3
+03 00 00 00 00 00 00 00      offsets[1] = 3
+05 00 00 00 00 00 00 00      offsets[2] = 5
+
+Values (5 × UInt32 LE = 20 bytes):
+0A 00 00 00                  10
+14 00 00 00                  20
+1E 00 00 00                  30
+28 00 00 00                  40
+32 00 00 00                  50
+```
+
+Total: 44 bytes of column data.
+
+Framed as part of the Column wire layout (§7.11):
+
+```
+03 'a' 'r' 'r'                          Column.name = "arr"
+0D 'A' 'r' 'r' 'a' 'y'                  Column.type = "Array(UInt32)" (13 chars)
+   '(' 'U' 'I' 'n' 't' '3' '2' ')'
+00                                       has_custom_serialization = 0
+[24 bytes of offsets as above]
+[20 bytes of values as above]
+```
+
+Total column bytes on the wire: 62.
+
+**Byte-level example — `Array(String)` with `[["a", "bb"], []]`:**
+
+```
+Offsets (2 × UInt64 LE = 16 bytes):
+02 00 00 00 00 00 00 00      offsets[0] = 2
+02 00 00 00 00 00 00 00      offsets[1] = 2 (empty row)
+
+Values (2 strings, 4 bytes total):
+01 'a'                        row's first string: "a"
+02 'b' 'b'                    row's second string: "bb"
+```
+
+Total: 20 bytes.
+
+**Decoder algorithm:**
+
+1. Read `num_rows × 8` bytes as `num_rows` `UInt64` values → offsets vector.
+2. Validate offsets are monotonic non-decreasing; fail on violation.
+3. Compute `total_elements = offsets.last().unwrap_or(&0)` (or `0` if `num_rows == 0`).
+4. Recursively decode the inner type with `total_elements` as the row count.
+5. Expose accessors that, given a row index `N`, return the slice of values at `offsets[N-1]..offsets[N]` (with `offsets[-1] = 0`).
+
+**Encoder algorithm:**
+
+1. Build cumulative offsets while iterating logical rows: `offsets.push(total_so_far)` after each row.
+2. Write the `num_rows × 8` bytes of offsets.
+3. Write the inner type's encoding for all accumulated values.
+
+**Invariant when constructing in memory:** `inner.row_count() == offsets.last().unwrap_or(&0) as usize`. Implementations validate this at encode time (see §12 implementation notes).
+
+**Common mistakes:**
+
+- **Passing `num_rows` instead of `total_elements` to the inner decoder.** The outer Array has `num_rows` rows, but the inner values stream has `total_elements` values. The inner decode must be told the latter.
+- **Writing per-row lengths instead of cumulative end-offsets.** Lengths would be `[3, 0, 2]`; offsets are `[3, 3, 5]`. These look similar for the first row but diverge quickly.
+- **Forgetting that empty rows produce duplicate offsets.** A row with zero elements does not advance the offset; an offsets stream like `[5, 5, 5]` means three empty rows.
+- **Computing total from `num_rows × avg_len`.** The total element count is `offsets.last()`, not derivable from `num_rows` alone.
+
+#### 8.3.3 Other composite types (not yet specified)
+
+> **Not yet specified in this document:** `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
 >
 > Planned wire format sketches (to be fleshed out):
-> - **`Array(T)`** — offsets stream: `num_rows` × `UInt64` (cumulative end-offsets into the values stream); then values stream: `offsets[num_rows - 1]` elements of the inner type.
 > - **`Tuple(T1, T2, ...)`** — one stream per element type, each encoding `num_rows` values of its type.
 > - **`Map(K, V)`** — equivalent to `Array(Tuple(K, V))`; shares `Array`'s offsets stream + a paired `Tuple(K, V)` values stream.
 > - **`Nested(name1 T1, ...)`** — syntactic sugar that expands to several parallel `Array(T_i)` columns in the block's column list.

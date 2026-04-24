@@ -21,6 +21,10 @@ harness = false
 name = "query"
 harness = false
 
+[[bench]]
+name = "column"
+harness = false
+
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4"] }
 hostname = "0.4"

@@ -381,3 +381,233 @@ fn test_query_default_options() {
     let b = conn.query_with("SELECT 1", QueryOptions::new()).unwrap();
     assert_eq!(a.row_count(), b.row_count());
 }
+
+// -- Nullable(T) --
+
+#[test]
+fn test_nullable_uint32_all_nulls() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST(NULL AS Nullable(UInt32))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nullable { nulls, .. } => {
+            assert_eq!(nulls, &vec![1u8]);
+        }
+        other => panic!("expected Nullable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullable_uint32_no_nulls() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST(42 AS Nullable(UInt32))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nullable { inner, nulls } => {
+            assert_eq!(nulls, &vec![0u8]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => assert_eq!(v[0], 42),
+                other => panic!("expected Uint32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nullable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullable_uint32_mixed() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 3 rows: [42, null, 100]
+    let result = conn
+        .query(
+            "SELECT arrayJoin([CAST(42 AS Nullable(UInt32)), CAST(NULL AS Nullable(UInt32)), CAST(100 AS Nullable(UInt32))])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nullable { inner, nulls } => {
+            assert_eq!(nulls, &vec![0u8, 1u8, 0u8]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v.len(), 3);
+                    assert_eq!(v[0], 42);
+                    // v[1] is a placeholder — server may emit any bytes
+                    assert_eq!(v[2], 100);
+                }
+                other => panic!("expected Uint32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nullable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullable_string() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([CAST('hi' AS Nullable(String)), CAST(NULL AS Nullable(String)), CAST('yo' AS Nullable(String))])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nullable { inner, nulls } => {
+            assert_eq!(nulls, &vec![0u8, 1u8, 0u8]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v.len(), 3);
+                    assert_eq!(v[0], "hi");
+                    // v[1] is a placeholder (empty string) for the null row
+                    assert_eq!(v[2], "yo");
+                }
+                other => panic!("expected String inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nullable, got {other:?}"),
+    }
+}
+
+// -- Array(T) --
+
+#[test]
+fn test_array_uint32_single_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT [10, 20, 30]::Array(UInt32)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![3u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => assert_eq!(v, &vec![10u32, 20, 30]),
+                other => panic!("expected Uint32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_array_empty() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT []::Array(UInt32)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![0u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => assert!(v.is_empty()),
+                other => panic!("expected Uint32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_array_multiple_rows() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Three rows: [[10,20,30], [], [40,50]]
+    let result = conn
+        .query("SELECT arrayJoin([[10, 20, 30]::Array(UInt32), []::Array(UInt32), [40, 50]::Array(UInt32)])")
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![3u64, 3, 5]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![10u32, 20, 30, 40, 50]);
+                }
+                other => panic!("expected Uint32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_array_string() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT ['a', 'bb', 'ccc']::Array(String)").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![3u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["a".to_string(), "bb".to_string(), "ccc".to_string()]);
+                }
+                other => panic!("expected String inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_array_nested() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Array(Array(UInt32)) with a single row containing [[1,2], [], [3]]
+    let result = conn
+        .query("SELECT [[1, 2], []::Array(UInt32), [3]]::Array(Array(UInt32))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            // Outer row count = 1, last offset = 3 (3 inner arrays in this single row).
+            assert_eq!(offsets, &vec![3u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Array {
+                    inner: inner2,
+                    offsets: mid_offsets,
+                } => {
+                    // Three inner arrays with element counts [2, 0, 1] → cumulative [2, 2, 3]
+                    assert_eq!(mid_offsets, &vec![2u64, 2, 3]);
+                    match inner2.as_ref() {
+                        ch_proto::proto::column::ColumnData::Uint32(v) => {
+                            assert_eq!(v, &vec![1u32, 2, 3]);
+                        }
+                        other => panic!("expected Uint32 innermost, got {other:?}"),
+                    }
+                }
+                other => panic!("expected middle Array, got {other:?}"),
+            }
+        }
+        other => panic!("expected outer Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_array_of_nullable() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Array(Nullable(UInt32)) with [1, null, 3]
+    let result = conn
+        .query("SELECT [1, NULL, 3]::Array(Nullable(UInt32))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![3u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Nullable { nulls, .. } => {
+                    assert_eq!(nulls, &vec![0u8, 1, 0]);
+                }
+                other => panic!("expected Nullable inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
