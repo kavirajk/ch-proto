@@ -921,6 +921,157 @@ fn test_map_array_key() {
     }
 }
 
+// -- Nested(...) --
+//
+// Note: with default `flatten_nested = 1` (which is the server default),
+// `Nested(...)` columns are physically stored and sent to the client as N
+// flat `Array(T_i)` columns with dotted names — no `Nested` wire type is
+// involved, and our existing `Array(T)` decoder already covers that path.
+//
+// These tests exercise the `flatten_nested = 0` shape, where the server
+// genuinely emits a column with type string `Nested(name1 T1, ...)`. We
+// reach that shape via `::Nested(...)` cast on a literal so the test is
+// self-contained (no DDL required).
+
+#[test]
+fn test_nested_single_row_cast() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Single-row Nested(a UInt8, b String): row has 2 elements (10,'x'),(20,'y')
+    let result = conn
+        .query("SELECT [(10, 'x'), (20, 'y')]::Nested(a UInt8, b String) AS n")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nested { fields, offsets } => {
+            assert_eq!(offsets, &vec![2u64]);
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "a");
+            match &fields[0].1 {
+                ch_proto::proto::column::ColumnData::Uint8(v) => {
+                    assert_eq!(v, &vec![10u8, 20]);
+                }
+                other => panic!("expected Uint8 field a, got {other:?}"),
+            }
+            assert_eq!(fields[1].0, "b");
+            match &fields[1].1 {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["x".to_string(), "y".to_string()]);
+                }
+                other => panic!("expected String field b, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nested, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nested_multi_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 3 rows: row 0 has 2 elements, row 1 has 0, row 2 has 1.
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                [(10, 'x'), (20, 'y')]::Nested(a UInt8, b String), \
+                []::Nested(a UInt8, b String), \
+                [(30, 'z')]::Nested(a UInt8, b String)\
+             ])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nested { fields, offsets } => {
+            assert_eq!(offsets, &vec![2u64, 2, 3]);
+            assert_eq!(fields.len(), 2);
+            match &fields[0].1 {
+                ch_proto::proto::column::ColumnData::Uint8(v) => {
+                    assert_eq!(v, &vec![10u8, 20, 30]);
+                }
+                other => panic!("expected Uint8 field a, got {other:?}"),
+            }
+            match &fields[1].1 {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["x".to_string(), "y".to_string(), "z".to_string()]);
+                }
+                other => panic!("expected String field b, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nested, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nested_three_fields() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT [(1, 100, 'one'), (2, 200, 'two')]::Nested(x UInt8, y Int32, z String) AS n",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nested { fields, offsets } => {
+            assert_eq!(offsets, &vec![2u64]);
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["x", "y", "z"]);
+            match &fields[0].1 {
+                ch_proto::proto::column::ColumnData::Uint8(v) => assert_eq!(v, &vec![1u8, 2]),
+                other => panic!("expected Uint8 field x, got {other:?}"),
+            }
+            match &fields[1].1 {
+                ch_proto::proto::column::ColumnData::Int32(v) => assert_eq!(v, &vec![100i32, 200]),
+                other => panic!("expected Int32 field y, got {other:?}"),
+            }
+            match &fields[2].1 {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["one".to_string(), "two".to_string()]);
+                }
+                other => panic!("expected String field z, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nested, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nested_with_array_field() {
+    // Field type is itself a composite (Array). Verifies recursion through
+    // the parser and decoder for Nested fields.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT [(1, [10, 20]), (2, [30])]::Nested(a UInt8, b Array(UInt32)) AS n",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nested { fields, offsets } => {
+            assert_eq!(offsets, &vec![2u64]);
+            assert_eq!(fields.len(), 2);
+            match &fields[0].1 {
+                ch_proto::proto::column::ColumnData::Uint8(v) => assert_eq!(v, &vec![1u8, 2]),
+                other => panic!("expected Uint8 field a, got {other:?}"),
+            }
+            match &fields[1].1 {
+                ch_proto::proto::column::ColumnData::Array { inner, offsets: bo } => {
+                    assert_eq!(bo, &vec![2u64, 3]);
+                    match inner.as_ref() {
+                        ch_proto::proto::column::ColumnData::Uint32(v) => {
+                            assert_eq!(v, &vec![10u32, 20, 30]);
+                        }
+                        other => panic!("expected Uint32 innermost, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Array field b, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nested, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_map_complex_value_array() {
     require_server();

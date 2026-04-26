@@ -73,6 +73,22 @@ pub enum ColumnData {
         values: Box<ColumnData>,
         offsets: Vec<u64>,
     },
+    /// `Nested(name1 T1, name2 T2, ...)` with `flatten_nested = 0` on the
+    /// server. Wire format is byte-identical to `Array(Tuple(T1, T2, ...))`:
+    ///   - `offsets` × num_rows UInt64 LE
+    ///   - per-field stream of `total_elements` T_i values, in declaration order
+    /// where `total_elements = offsets.last().unwrap_or(0)`.
+    ///
+    /// `fields` preserves the declared `(name, column)` pairs — the only
+    /// metadata that distinguishes Nested from `Array(Tuple(...))` on the wire.
+    ///
+    /// Note: with default `flatten_nested = 1`, the server emits Nested as N
+    /// separate `Array(T_i)` columns with dotted names (`n.a`, `n.b`) and this
+    /// variant is never produced.
+    Nested {
+        fields: Vec<(String, ColumnData)>,
+        offsets: Vec<u64>,
+    },
 }
 
 impl Column {
@@ -163,6 +179,7 @@ impl ColumnData {
                 v.first().map_or(0, |d| d.row_count())
             }
             ColumnData::Map { offsets, .. } => offsets.len(),
+            ColumnData::Nested { offsets, .. } => offsets.len(),
         }
     }
 
@@ -286,6 +303,39 @@ impl ColumnData {
                 values.validate()?;
                 Ok(())
             }
+            ColumnData::Nested { fields, offsets } => {
+                // Same offset rules as Array/Map: monotonic, last offset = total
+                // elements that every per-field column must match.
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Nested offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+                for (i, (name, col)) in fields.iter().enumerate() {
+                    if col.row_count() != total_elements {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Nested invariant broken: field {i} '{name}' row_count={} != offsets.last()={}",
+                                col.row_count(),
+                                total_elements
+                            ),
+                        ));
+                    }
+                    col.validate()?;
+                }
+                Ok(())
+            }
             ColumnData::FixedString { n, data } => {
                 if *n == 0 {
                     return Err(Error::new(
@@ -382,6 +432,14 @@ impl ColumnData {
                 }
                 keys.encode(w)?;
                 values.encode(w)?;
+            }
+            ColumnData::Nested { fields, offsets } => {
+                for &off in offsets {
+                    w.write_u64(off)?;
+                }
+                for (_name, col) in fields {
+                    col.encode(w)?;
+                }
             }
         }
         Ok(())
@@ -525,6 +583,38 @@ impl ColumnData {
 
                 Ok(ColumnData::Array { inner, offsets })
             }
+            "Nested" => {
+                // Wire format = Array(Tuple(T1, ..., Tn)). Parse field names
+                // and types from the type string, read offsets, then decode
+                // each field's stream sized to total_elements.
+                let field_specs = parse_nested_inner_types(data_type)?;
+                let mut offsets: Vec<u64> = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    offsets.push(r.read_u64()?);
+                }
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "Nested offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+                let mut fields: Vec<(String, ColumnData)> =
+                    Vec::with_capacity(field_specs.len());
+                for (name, dt) in field_specs {
+                    let col = ColumnData::decode(r, &dt, total_elements)?;
+                    fields.push((name, col));
+                }
+                Ok(ColumnData::Nested { fields, offsets })
+            }
             "Map" => {
                 // Wire format = Array(Tuple(K, V)). Parse out K, V from the
                 // type string, read the offsets stream, then decode the keys
@@ -563,6 +653,56 @@ impl ColumnData {
             )),
         }
     }
+}
+
+/// Parse the field list of a `Nested(name1 T1, name2 T2, ...)` type string
+/// into pairs of `(field_name, field_type)`. Each piece coming out of the
+/// depth-aware splitter is `"name TYPE"` — split on the first ASCII
+/// whitespace character. The type itself may contain spaces (e.g. inside
+/// a nested `Tuple(a UInt8, b String)`), so we explicitly take only the
+/// first whitespace as the separator.
+///
+/// Backtick-quoted identifiers (`` `field name` UInt8 ``) are not yet
+/// supported; rare in practice for client-side INSERT/SELECT.
+fn parse_nested_inner_types(data_type: &str) -> Result<Vec<(String, String)>> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Nested type string: {data_type}"),
+        )
+    };
+    let begin = data_type.find('(').ok_or_else(err)?;
+    let end = data_type.rfind(')').ok_or_else(err)?;
+    if begin + 1 >= end {
+        return Err(err());
+    }
+    let inner = data_type[begin + 1..end].trim();
+    let parts = split_with_composite(inner)?;
+
+    let mut fields: Vec<(String, String)> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let part = part.trim();
+        let split = part
+            .char_indices()
+            .find(|(_, c)| c.is_ascii_whitespace())
+            .map(|(i, _)| i);
+        let Some(i) = split else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Nested field missing type: '{part}' in {data_type}"),
+            ));
+        };
+        let name = part[..i].trim().to_string();
+        let ty = part[i + 1..].trim().to_string();
+        if name.is_empty() || ty.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Nested field has empty name or type: '{part}' in {data_type}"),
+            ));
+        }
+        fields.push((name, ty));
+    }
+    Ok(fields)
 }
 
 /// Parse the `K` and `V` from a `Map(K, V)` type string. Reuses the same
@@ -2272,5 +2412,343 @@ mod tests {
         assert!(parse_map_inner_types("Map(String)").is_err());
         // Wrong arity — three types.
         assert!(parse_map_inner_types("Map(String, Int32, UInt32)").is_err());
+    }
+
+    // -- Nested(...) --
+
+    #[test]
+    fn test_nested_uint8_string_roundtrip() {
+        // Nested(a UInt8, b String) with 2 rows:
+        //   row 0: a=[10,20], b=['x','y']
+        //   row 1: a=[30],    b=['z']
+        let col = Column {
+            name: "n".to_string(),
+            data_type: "Nested(a UInt8, b String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nested {
+                fields: vec![
+                    ("a".to_string(), ColumnData::Uint8(vec![10, 20, 30])),
+                    (
+                        "b".to_string(),
+                        ColumnData::String(vec![
+                            "x".to_string(),
+                            "y".to_string(),
+                            "z".to_string(),
+                        ]),
+                    ),
+                ],
+                offsets: vec![2, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nested { fields, offsets } => {
+                assert_eq!(offsets, vec![2, 3]);
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "a");
+                match &fields[0].1 {
+                    ColumnData::Uint8(v) => assert_eq!(v, &vec![10, 20, 30]),
+                    _ => panic!("expected Uint8 field a"),
+                }
+                assert_eq!(fields[1].0, "b");
+                match &fields[1].1 {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["x", "y", "z"]),
+                    _ => panic!("expected String field b"),
+                }
+            }
+            _ => panic!("expected Nested"),
+        }
+    }
+
+    #[test]
+    fn test_nested_zero_rows() {
+        let col = Column {
+            name: "n".to_string(),
+            data_type: "Nested(a UInt8, b String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nested {
+                fields: vec![
+                    ("a".to_string(), ColumnData::Uint8(vec![])),
+                    ("b".to_string(), ColumnData::String(vec![])),
+                ],
+                offsets: vec![],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nested { fields, offsets } => {
+                assert!(offsets.is_empty());
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].1.row_count(), 0);
+                assert_eq!(fields[1].1.row_count(), 0);
+            }
+            _ => panic!("expected Nested"),
+        }
+    }
+
+    #[test]
+    fn test_nested_three_fields() {
+        // Nested(x Int32, y UInt8, z String), 1 row, 2 elements per row.
+        let col = Column {
+            name: "n".to_string(),
+            data_type: "Nested(x Int32, y UInt8, z String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nested {
+                fields: vec![
+                    ("x".to_string(), ColumnData::Int32(vec![-1, -2])),
+                    ("y".to_string(), ColumnData::Uint8(vec![1, 2])),
+                    (
+                        "z".to_string(),
+                        ColumnData::String(vec!["one".to_string(), "two".to_string()]),
+                    ),
+                ],
+                offsets: vec![2],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nested { fields, offsets } => {
+                assert_eq!(offsets, vec![2]);
+                assert_eq!(fields.len(), 3);
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["x", "y", "z"]);
+            }
+            _ => panic!("expected Nested"),
+        }
+    }
+
+    #[test]
+    fn test_nested_with_array_field() {
+        // Nested(a UInt8, b Array(UInt32)) — field type itself is composite.
+        // 1 row with 2 elements: a=[1, 2], b=[[10, 20], [30]]
+        let col = Column {
+            name: "n".to_string(),
+            data_type: "Nested(a UInt8, b Array(UInt32))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nested {
+                fields: vec![
+                    ("a".to_string(), ColumnData::Uint8(vec![1, 2])),
+                    (
+                        "b".to_string(),
+                        ColumnData::Array {
+                            inner: Box::new(ColumnData::Uint32(vec![10, 20, 30])),
+                            offsets: vec![2, 3],
+                        },
+                    ),
+                ],
+                offsets: vec![2],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nested { fields, offsets } => {
+                assert_eq!(offsets, vec![2]);
+                assert_eq!(fields.len(), 2);
+                match &fields[1].1 {
+                    ColumnData::Array {
+                        inner,
+                        offsets: bo,
+                    } => {
+                        assert_eq!(bo, &vec![2u64, 3]);
+                        match inner.as_ref() {
+                            ColumnData::Uint32(v) => assert_eq!(v, &vec![10u32, 20, 30]),
+                            _ => panic!("expected Uint32 innermost"),
+                        }
+                    }
+                    _ => panic!("expected Array field b"),
+                }
+            }
+            _ => panic!("expected Nested"),
+        }
+    }
+
+    #[test]
+    fn test_nested_wire_layout_matches_array_tuple() {
+        // Regression / documentation: encoded Nested(...) bytes after the type
+        // string must match what Array(Tuple(...)) would emit for the same data.
+        let nested = Column {
+            name: "n".to_string(),
+            data_type: "Nested(a UInt8, b UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nested {
+                fields: vec![
+                    ("a".to_string(), ColumnData::Uint8(vec![10, 20, 30])),
+                    ("b".to_string(), ColumnData::Uint8(vec![40, 50, 60])),
+                ],
+                offsets: vec![2, 3],
+            },
+        };
+        let array_tuple = Column {
+            name: "n".to_string(),
+            // Same bytes regardless of which type string is written, after the
+            // type string ends. We don't compare the type-string bytes.
+            data_type: "Array(Tuple(UInt8, UInt8))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Tuple(vec![
+                    ColumnData::Uint8(vec![10, 20, 30]),
+                    ColumnData::Uint8(vec![40, 50, 60]),
+                ])),
+                offsets: vec![2, 3],
+            },
+        };
+
+        let mut buf_nested = Vec::new();
+        nested.encode(&mut buf_nested, PROTOCOL).unwrap();
+        let mut buf_at = Vec::new();
+        array_tuple.encode(&mut buf_at, PROTOCOL).unwrap();
+
+        // The trailing 22 bytes (offsets × 16, per-element streams × 6) must be
+        // identical:
+        let tail_len = 22;
+        assert_eq!(
+            &buf_nested[buf_nested.len() - tail_len..],
+            &buf_at[buf_at.len() - tail_len..],
+        );
+    }
+
+    #[test]
+    fn test_nested_row_count_is_offsets_len() {
+        let c = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![1, 2, 3])),
+                ("b".to_string(), ColumnData::Uint8(vec![4, 5, 6])),
+            ],
+            offsets: vec![1, 2, 3],
+        };
+        assert_eq!(c.row_count(), 3);
+    }
+
+    #[test]
+    fn test_validate_rejects_nested_field_row_count_mismatch() {
+        // Field 'a' has 3 values, field 'b' has 2 — invariant broken.
+        let c = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![1, 2, 3])),
+                ("b".to_string(), ColumnData::Uint8(vec![4, 5])),
+            ],
+            offsets: vec![3],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_nested_offset_field_mismatch() {
+        // offsets.last() = 3 but each field has only 2 values.
+        let c = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![1, 2])),
+                ("b".to_string(), ColumnData::Uint8(vec![3, 4])),
+            ],
+            offsets: vec![3],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_nested_non_monotonic_offsets() {
+        let c = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![1, 2, 3])),
+                ("b".to_string(), ColumnData::Uint8(vec![4, 5, 6])),
+            ],
+            offsets: vec![2, 1, 3], // 1 < 2 — invalid
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_recurses_into_nested_field() {
+        // Nested invariants pass at the outer level (1 row, offsets=[2], each
+        // field row_count=2), but the Array field has non-monotonic offsets.
+        let c = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![1, 2])),
+                (
+                    "b".to_string(),
+                    ColumnData::Array {
+                        inner: Box::new(ColumnData::Uint32(vec![10, 20])),
+                        offsets: vec![2, 1], // non-monotonic
+                    },
+                ),
+            ],
+            offsets: vec![2],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_parse_nested_inner_types_basic() {
+        let got = parse_nested_inner_types("Nested(a UInt8, b String)").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "UInt8".to_string()),
+                ("b".to_string(), "String".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_inner_types_complex_field() {
+        // Field type contains internal commas — depth-aware splitter handles it.
+        let got = parse_nested_inner_types(
+            "Nested(a Tuple(x UInt8, y String), b Array(UInt32))",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "Tuple(x UInt8, y String)".to_string()),
+                ("b".to_string(), "Array(UInt32)".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_inner_types_extra_whitespace() {
+        // Multiple spaces between name and type, leading/trailing whitespace.
+        let got = parse_nested_inner_types("Nested(  a   UInt8 ,  b   String  )").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), "UInt8".to_string()),
+                ("b".to_string(), "String".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_inner_types_invalid() {
+        // Missing type for a field.
+        assert!(parse_nested_inner_types("Nested(a)").is_err());
+        // Empty inner.
+        assert!(parse_nested_inner_types("Nested()").is_err());
+        // No parens at all.
+        assert!(parse_nested_inner_types("Nested").is_err());
     }
 }

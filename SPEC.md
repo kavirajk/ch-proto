@@ -1554,12 +1554,133 @@ Encode validates all three before any bytes are written.
 - **Validating only `keys.row_count() == values.row_count()` and skipping the offset check.** Both inner streams must equal `offsets.last()`, not just each other. A consistent-but-detached pair count (e.g., 5 keys, 5 values, but offsets imply 3 pairs total) would silently emit a misaligned stream.
 - **Assuming key uniqueness.** ClickHouse permits duplicate keys to round-trip; the server resolves duplicates only when the row is consumed by a Map-aware function. Don't deduplicate keys at decode time.
 
-#### 8.3.5 Other composite types (not yet specified)
+#### 8.3.5 Nested(name1 T1, name2 T2, ...)
 
-> **Not yet specified in this document:** `Nested(...)`.
->
-> Planned wire format sketch (to be fleshed out):
-> - **`Nested(name1 T1, ...)`** — syntactic sugar that expands to several parallel `Array(T_i)` columns in the block's column list.
+`Nested` is the most situational type in the protocol because its on-wire representation depends on a server setting, not on the type itself. Two distinct cases — a client must handle both:
+
+**Case A: `flatten_nested = 1` (server default)**
+
+When the table was created under default settings, `Nested` is **not a wire type**. The server stores and presents the column as N parallel `Array(T_i)` columns with **dotted names** (`outer.field1`, `outer.field2`, …). For the protocol layer there is nothing new to handle — every dotted column is a regular `Array(T)` (§8.3.2).
+
+Empirical confirmation:
+```
+DESCRIBE TABLE t   -- t has column n Nested(a UInt8, b String)
+id     UInt8
+n.a    Array(UInt8)
+n.b    Array(String)
+```
+
+A client that supports `Array(T)` already supports this case.
+
+**Case B: `flatten_nested = 0`**
+
+When the table was created with `flatten_nested = 0`, the column genuinely appears on the wire as a single column with type string `Nested(name1 T1, name2 T2, ...)`. The wire format is **byte-identical to `Array(Tuple(T1, T2, ..., Tn))` after the type string**. Empirically verified by hex-comparing two SELECTs against the same data:
+
+```
+Nested(a UInt8, b String) bytes (after type string):
+  02 00 00 00 00 00 00 00       offsets[0] = 2
+  03 00 00 00 00 00 00 00       offsets[1] = 3
+  0A 14 1E                       UInt8 stream
+  01 'x' 01 'y' 01 'z'           String stream
+
+Array(Tuple(a UInt8, b String)) bytes (after type string):
+  02 00 00 00 00 00 00 00       offsets[0] = 2
+  03 00 00 00 00 00 00 00       offsets[1] = 3
+  0A 14 1E                       UInt8 stream
+  01 'x' 01 'y' 01 'z'           String stream
+```
+
+The only difference is the type string itself — Nested preserves the field names (`a`, `b`) which `Array(Tuple)` does not carry as named slots.
+
+**Type string syntax:** `Nested(name1 TYPE1, name2 TYPE2, ...)` — a comma-separated list of (name, type) pairs separated by whitespace. Field types may themselves contain spaces and commas (`Tuple(a UInt8, b String)` as a field type). Field names are typically simple identifiers; backtick-quoted names with embedded whitespace are syntactically legal in SQL but rarely seen on the protocol wire and are not handled by this client's parser.
+
+**Wire layout (Case B):**
+
+```
+[offsets stream]    num_rows × UInt64 LE                  ← from Array
+[field1 stream]     T1's encoding for total_elements vals ┐ from Tuple's
+[field2 stream]     T2's encoding for total_elements vals │ per-element
+ ...                                                       │ streams
+[fieldn stream]     Tn's encoding for total_elements vals ┘
+```
+
+where `total_elements = offsets.last().unwrap_or(0)`.
+
+**Stream 1 — offsets:** identical to Array (§8.3.2). Each offset is the cumulative end position of its row in the field streams. Row `N`'s element count is `offsets[N] - offsets[N - 1]`.
+
+**Streams 2..n — fields:** the *i*-th field type's standard encoding for all `total_elements` values, concatenated end-to-end. Pair `i` of row `r` is reconstructed by reading position `i + (start of row r)` in every field stream.
+
+**Key invariants:**
+
+1. Offsets are monotonic non-decreasing.
+2. Every field stream contains exactly `total_elements` values.
+3. *(Server-enforced)* All fields of a single row carry the same number of elements. The wire format makes this automatic — there's only one offsets stream — but server-side INSERT validates that the literal arrays at the SQL level have matching lengths per row.
+4. An empty column writes zero bytes.
+
+Decoders must validate invariant 1 and fail loudly on non-monotonic offsets.
+
+**Why is Nested = Array(Tuple) on the wire?** ClickHouse's columnar storage stores a `Nested` column as one offsets array plus N flat element columns — exactly the same shape as `Array(Tuple(T1, ..., Tn))`. The wire format is a direct serialization of that storage. The "Nested" type exists purely to preserve field names (the dotted-name DDL convenience) and to enforce the per-row length invariant at INSERT time. No bytes are spent encoding the names beyond the type string at the head of the column.
+
+**Composition.** Field types may be any composite; `Nested(a UInt8, b Array(UInt32))` and `Nested(x Tuple(p UInt8, q String), y UInt32)` are legal. The depth-aware parser (§11.16) handles them.
+
+**Byte-level example — `Nested(a UInt8, b String)` with 2 rows, `[(10,'x'),(20,'y')]` and `[(30,'z')]`:**
+
+```
+Offsets (2 × UInt64 LE = 16 bytes):
+02 00 00 00 00 00 00 00      offsets[0] = 2
+03 00 00 00 00 00 00 00      offsets[1] = 3 (cumulative)
+
+Field 'a' stream (3 × UInt8 = 3 bytes):
+0A 14 1E                     10, 20, 30
+
+Field 'b' stream (3 strings, 6 bytes):
+01 'x' 01 'y' 01 'z'         "x", "y", "z"
+```
+
+Total: 25 bytes after the type string.
+
+Framed as part of the Column wire layout (§7.11):
+
+```
+01 'n'                                  Column.name = "n"
+19 'N' 'e' 's' 't' 'e' 'd' '('          Column.type = "Nested(a UInt8, b String)" (25 chars)
+   'a' ' ' 'U' 'I' 'n' 't' '8' ','
+   ' ' 'b' ' ' 'S' 't' 'r' 'i' 'n' 'g' ')'
+00                                       has_custom_serialization = 0
+[16 bytes of offsets]
+[3 bytes of field 'a' stream]
+[6 bytes of field 'b' stream]
+```
+
+**Decoder algorithm (Case B):**
+
+1. Recognise `Nested` as the base type.
+2. Parse the type string into `[(field_name, field_type), ...]`. Use the depth-aware splitter (§11.16) to split on top-level commas, then split each piece on the first whitespace into `(name, type)`. The type half can contain further whitespace and parens; only the first whitespace separates name from type.
+3. Read `num_rows × 8` bytes as `num_rows` `UInt64` offsets.
+4. Validate offsets are monotonic; fail on violation.
+5. Compute `total_elements = offsets.last().unwrap_or(&0)`.
+6. For each `(name, type)` in declaration order, recursively decode `total_elements` values of that field type.
+7. Return `Nested { fields: Vec<(String, ColumnData)>, offsets }`.
+
+**Encoder algorithm (Case B):**
+
+1. Verify offsets are monotonic and every field column's `row_count() == offsets.last()`.
+2. Write `num_rows × 8` bytes of offsets.
+3. For each field column in declaration order, write its standard encoding.
+
+**When to emit Case B vs rely on Case A.** A client doing pure SELECTs against an ordinary table only ever sees Case A — so the literal `Nested` decoder is exercised when:
+- The query casts an array of tuples to `Nested(...)` (`SELECT [...]::Nested(...)`).
+- The connection or table was configured with `flatten_nested = 0`.
+
+For INSERTs, the picture is symmetric: against a flatten-nested table the client INSERTs into `outer.field1`, `outer.field2`, …; against a non-flattened table it INSERTs into a single `Nested` column.
+
+**Common mistakes:**
+
+- **Believing every server emits `Nested(...)` on the wire.** Most don't. Default `flatten_nested = 1` means the dotted-name flat Array path is the common path; treat the literal Nested type as a less-common variant.
+- **Assuming the type string differs from `Array(Tuple(...))` in bytes.** The wire bytes after the type string are identical. Only the type string text and (in our model) the field name vector preserve the difference.
+- **Splitting a field's `name TYPE` on every whitespace.** Types may contain spaces (`Tuple(a UInt8, b String)`); only the *first* whitespace separates name from type.
+- **Splitting the inner field list naively on commas.** A field type like `Tuple(a UInt8, b String)` has internal commas. Use the depth-aware splitter — same one that handles Tuple and Map.
+- **Not checking the server setting at INSERT time.** A client constructing a `ColumnData::Nested` to INSERT will fail or be silently flattened if the target table was created under `flatten_nested = 1` — those tables have flat `Array(T)` storage, not a Nested column. Symmetric care is required: discover the column shape via DESCRIBE before constructing the in-memory representation.
 
 ### 8.4 Versioned / stateful types
 
