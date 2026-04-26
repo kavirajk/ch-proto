@@ -1430,12 +1430,135 @@ No length prefix, no element separator — bytes are written end-to-end and the 
 - **Skipping recursion in `validate()`.** Checking that all element row counts agree is necessary but not sufficient — a `Tuple(Array(...), ...)` whose Array has non-monotonic offsets must also be rejected before encode. Recurse into each element.
 - **Using `decode(r, dt, 1)` for inner elements.** Each element's stream contains `num_rows` values, not 1 — pass the outer `num_rows` down unchanged.
 
-#### 8.3.4 Other composite types (not yet specified)
+#### 8.3.4 Map(K, V)
 
-> **Not yet specified in this document:** `Map(K, V)`, `Nested(...)`.
+**Type string:** `Map(KeyType, ValueType)`. Examples: `Map(String, UInt32)`, `Map(String, Array(UInt32))`, `Map(UInt8, Tuple(Int32, String))`, `Map(Array(String), Int8)`.
+
+The wire format imposes no restriction on either type — both K and V can be any type the encoder/decoder supports, including composites. ClickHouse's SQL-level rules around which key types are accepted by `CREATE TABLE` have varied across releases (historically restricted to scalars; later relaxed); a wire-format implementation should not assume any specific restriction. Consult ClickHouse documentation for the SQL-level rules of the version you target.
+
+**Semantic model:** each row holds a variable-length sequence of key-value pairs — semantically a small dictionary. Different rows may have different numbers of pairs (including zero); within a single row, the key-value pairs are positionally aligned.
+
+**Wire layout = Array(Tuple(K, V)).** Map is not a new wire concept; its bytes are the exact same bytes ClickHouse would emit for `Array(Tuple(K, V))` over the same logical data:
+
+```
+[offsets stream]    num_rows × UInt64 LE                      ← from Array
+[keys stream]       K's encoding for total_pairs values       ┐ from Tuple's
+[values stream]     V's encoding for total_pairs values       ┘ per-element streams
+```
+
+where `total_pairs = offsets[num_rows - 1]` (or `0` when `num_rows == 0`).
+
+**Stream 1 — offsets:** identical semantics to Array (§8.3.2). `offsets[N]` is the cumulative end position of row `N`'s pairs in the keys/values streams. Row `N`'s pair count is `offsets[N] - offsets[N - 1]` (or `offsets[0]` for `N == 0`).
+
+**Stream 2 — keys:** the key type's standard encoding for all `total_pairs` keys, concatenated. Keys are stored *positionally aligned* with values: pair `i` is `(keys[i], values[i])`.
+
+**Stream 3 — values:** the value type's standard encoding for all `total_pairs` values. Same total count as keys.
+
+**Key invariants:**
+
+1. Offsets are **monotonic non-decreasing** (same as Array).
+2. The keys stream contains exactly `total_pairs` values; the values stream contains exactly `total_pairs` values. Both must match `offsets.last()`.
+3. An empty column (`num_rows == 0`) writes zero bytes.
+4. *(Semantic, not wire-enforced)* Within a single row, keys are typically unique. The wire format does not enforce this — duplicate keys round-trip — but server-side semantics (lookup, aggregation) treat the row as a dictionary. Decoders should not rely on uniqueness.
+
+Decoders must validate invariant 1 and fail loudly on non-monotonic offsets.
+
+**Why is Map identical to Array(Tuple(K, V))?** ClickHouse's in-memory representation of a Map column *is* an Array of Tuples — the type system surfaces it as a distinct type for ergonomics (server-side `m['key']` lookup, `mapKeys`, `mapValues`, etc.) but the columnar storage layout has no Map-specific structures. The wire format is a direct serialization of that storage, so Map and `Array(Tuple(K, V))` are byte-for-byte interchangeable.
+
+A decoder is free to internally model Map as either:
+- A dedicated `Map { keys, values, offsets }` shape — clean ergonomics, ~15 lines of encode/decode that mirror Array+Tuple.
+- A type alias for `Array(Tuple(K, V))` — zero new code, but the in-memory shape (`Array { inner: Tuple { ... }, offsets }`) doesn't match the user's mental model.
+
+Most clients pick the first.
+
+**Composition.** Both K and V can be any composite. `Map(String, Array(UInt32))` and `Map(Array(String), Int8)` are both legal. `Map(String, Tuple(Int32, String))` is the same as `Array(Tuple(String, Tuple(Int32, String)))` on the wire.
+
+**Byte-level example — `Map(UInt8, UInt8)` with 2 rows `{1:10, 2:20}`, `{3:30}`:**
+
+```
+Offsets (2 × UInt64 LE = 16 bytes):
+02 00 00 00 00 00 00 00      offsets[0] = 2 (row 0 has 2 pairs)
+03 00 00 00 00 00 00 00      offsets[1] = 3 (row 1 has 1 pair, cumulative 3)
+
+Keys (3 × UInt8 = 3 bytes):
+01 02 03                     keys: 1, 2, 3
+
+Values (3 × UInt8 = 3 bytes):
+0A 14 1E                     values: 10, 20, 30
+```
+
+Total: 22 bytes. Note that keys and values are stored as *separate streams*, not interleaved — pair `i` is reconstructed by reading `keys[i]` and `values[i]` and pairing them.
+
+Framed as part of the Column wire layout (§7.11):
+
+```
+01 'm'                                  Column.name = "m"
+11 'M' 'a' 'p' '('                      Column.type = "Map(UInt8, UInt8)" (17 chars)
+   'U' 'I' 'n' 't' '8' ',' ' '
+   'U' 'I' 'n' 't' '8' ')'
+00                                       has_custom_serialization = 0
+[16 bytes of offsets as above]
+[3 bytes of keys as above]
+[3 bytes of values as above]
+```
+
+Total column bytes on the wire: 42.
+
+**Byte-level example — `Map(String, UInt32)` with 1 row `{'a':1, 'b':2}`:**
+
+```
+Offsets (1 × UInt64 LE = 8 bytes):
+02 00 00 00 00 00 00 00      offsets[0] = 2
+
+Keys (2 strings, 4 bytes total):
+01 'a'                       "a"
+01 'b'                       "b"
+
+Values (2 × UInt32 LE = 8 bytes):
+01 00 00 00                  1
+02 00 00 00                  2
+```
+
+Total: 20 bytes.
+
+**Decoder algorithm:**
+
+1. Parse the type string to extract K and V. Use the depth-aware splitter (§8.3.3, §11.16) — `Map(String, Array(UInt32))`'s value type contains parens. Reject if there aren't exactly 2 parts.
+2. Read `num_rows × 8` bytes as `num_rows` `UInt64` offsets.
+3. Validate offsets are monotonic; fail on violation.
+4. Compute `total_pairs = offsets.last().unwrap_or(&0)`.
+5. Recursively decode K with `total_pairs` row count → keys column.
+6. Recursively decode V with `total_pairs` row count → values column.
+7. Return `Map { keys, values, offsets }`.
+
+**Encoder algorithm:**
+
+1. Verify keys, values both have row count equal to `offsets.last()` (or 0 for empty).
+2. Verify offsets are monotonic.
+3. Write `num_rows × 8` bytes of offsets.
+4. Write keys' encoding.
+5. Write values' encoding.
+
+**Invariants when constructing in memory:**
+- `keys.row_count() == offsets.last().unwrap_or(&0) as usize`
+- `values.row_count() == offsets.last().unwrap_or(&0) as usize`
+- offsets are monotonic non-decreasing
+
+Encode validates all three before any bytes are written.
+
+**Common mistakes:**
+
+- **Splitting `Map(...)` like `Nullable(...)` or `Array(...)`.** Map has two type parameters separated by a comma; the depth-aware splitter is mandatory (just like Tuple). Composite key or value types contain their own commas at deeper paren levels — `Map(Array(String), Int8)`, `Map(String, Tuple(Int32, String))`, `Map(Tuple(String, Int8), UInt32)` all need depth-aware splitting to avoid landing in the wrong place.
+- **Interleaving keys and values on the wire.** The wire format stores them as two separate streams (`KKK...VVV`), not pair-by-pair (`KVKVKV`). Pair reconstruction is positional.
+- **Forgetting the offsets stream.** Map looks like a flat dictionary type but is variable-length per row. The offsets stream is the only source of row boundaries — same as Array.
+- **Validating only `keys.row_count() == values.row_count()` and skipping the offset check.** Both inner streams must equal `offsets.last()`, not just each other. A consistent-but-detached pair count (e.g., 5 keys, 5 values, but offsets imply 3 pairs total) would silently emit a misaligned stream.
+- **Assuming key uniqueness.** ClickHouse permits duplicate keys to round-trip; the server resolves duplicates only when the row is consumed by a Map-aware function. Don't deduplicate keys at decode time.
+
+#### 8.3.5 Other composite types (not yet specified)
+
+> **Not yet specified in this document:** `Nested(...)`.
 >
-> Planned wire format sketches (to be fleshed out):
-> - **`Map(K, V)`** — equivalent to `Array(Tuple(K, V))`; shares `Array`'s offsets stream + a paired `Tuple(K, V)` values stream.
+> Planned wire format sketch (to be fleshed out):
 > - **`Nested(name1 T1, ...)`** — syntactic sugar that expands to several parallel `Array(T_i)` columns in the block's column list.
 
 ### 8.4 Versioned / stateful types

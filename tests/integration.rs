@@ -780,3 +780,182 @@ fn test_tuple_with_nullable_inner() {
         other => panic!("expected Tuple, got {other:?}"),
     }
 }
+
+// -- Map(K, V) --
+
+#[test]
+fn test_map_string_uint32_single_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Map(String, UInt32) single row: {'a':1, 'b':2}
+    let result = conn
+        .query("SELECT map('a', 1, 'b', 2)::Map(String, UInt32)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Map {
+            keys,
+            values,
+            offsets,
+        } => {
+            assert_eq!(offsets, &vec![2u64]);
+            match keys.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["a".to_string(), "b".to_string()]);
+                }
+                other => panic!("expected String keys, got {other:?}"),
+            }
+            match values.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![1u32, 2]);
+                }
+                other => panic!("expected Uint32 values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_map_empty() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT map()::Map(String, UInt32)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Map {
+            keys,
+            values,
+            offsets,
+        } => {
+            assert_eq!(offsets, &vec![0u64]);
+            assert_eq!(keys.row_count(), 0);
+            assert_eq!(values.row_count(), 0);
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_map_multi_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Three rows: {'a':1,'b':2}, {}, {'c':3}
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                map('a', 1, 'b', 2)::Map(String, UInt32), \
+                map()::Map(String, UInt32), \
+                map('c', 3)::Map(String, UInt32)\
+             ])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Map {
+            keys,
+            values,
+            offsets,
+        } => {
+            assert_eq!(offsets, &vec![2u64, 2, 3]);
+            match keys.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+                }
+                other => panic!("expected String keys, got {other:?}"),
+            }
+            match values.as_ref() {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![1u32, 2, 3]);
+                }
+                other => panic!("expected Uint32 values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_map_array_key() {
+    // Regression: confirms KeyType can be a composite (Array). Previously
+    // the SPEC incorrectly claimed scalar-only key types.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Map(Array(String), Int8) single row: {['Kavi']: 9}
+    let result = conn
+        .query("SELECT map(['Kavi'], 9)::Map(Array(String), Int8)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Map {
+            keys,
+            values,
+            offsets,
+        } => {
+            assert_eq!(offsets, &vec![1u64]);
+            match keys.as_ref() {
+                ch_proto::proto::column::ColumnData::Array {
+                    inner,
+                    offsets: ko,
+                } => {
+                    assert_eq!(ko, &vec![1u64]);
+                    match inner.as_ref() {
+                        ch_proto::proto::column::ColumnData::String(v) => {
+                            assert_eq!(v, &vec!["Kavi".to_string()]);
+                        }
+                        other => panic!("expected String innermost, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Array keys, got {other:?}"),
+            }
+            match values.as_ref() {
+                ch_proto::proto::column::ColumnData::Int8(v) => {
+                    assert_eq!(v, &vec![9i8]);
+                }
+                other => panic!("expected Int8 values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_map_complex_value_array() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Map(String, Array(UInt32)) single row: {'a':[1,2], 'b':[]}
+    let result = conn
+        .query("SELECT map('a', [1, 2], 'b', []::Array(UInt32))::Map(String, Array(UInt32))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Map {
+            keys,
+            values,
+            offsets,
+        } => {
+            assert_eq!(offsets, &vec![2u64]);
+            match keys.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["a".to_string(), "b".to_string()]);
+                }
+                other => panic!("expected String keys, got {other:?}"),
+            }
+            match values.as_ref() {
+                ch_proto::proto::column::ColumnData::Array { inner, offsets: vo } => {
+                    assert_eq!(vo, &vec![2u64, 2]);
+                    match inner.as_ref() {
+                        ch_proto::proto::column::ColumnData::Uint32(v) => {
+                            assert_eq!(v, &vec![1u32, 2]);
+                        }
+                        other => panic!("expected Uint32 innermost, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Array values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}

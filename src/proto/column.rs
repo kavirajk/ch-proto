@@ -62,6 +62,17 @@ pub enum ColumnData {
         offsets: Vec<u64>,
     },
     Tuple(Vec<ColumnData>),
+    /// `Map(K, V)`: each row holds a variable-length sequence of key-value
+    /// pairs. Wire format is identical to `Array(Tuple(K, V))`:
+    ///   - `offsets` × num_rows UInt64 LE
+    ///   - keys stream of `total_pairs` K values
+    ///   - values stream of `total_pairs` V values
+    /// where `total_pairs = offsets.last().unwrap_or(0)`.
+    Map {
+        keys: Box<ColumnData>,
+        values: Box<ColumnData>,
+        offsets: Vec<u64>,
+    },
 }
 
 impl Column {
@@ -151,6 +162,7 @@ impl ColumnData {
                 // during apppend
                 v.first().map_or(0, |d| d.row_count())
             }
+            ColumnData::Map { offsets, .. } => offsets.len(),
         }
     }
 
@@ -225,6 +237,53 @@ impl ColumnData {
                         inner.validate()?;
                     }
                 }
+                Ok(())
+            }
+            ColumnData::Map {
+                keys,
+                values,
+                offsets,
+            } => {
+                // Same offset rules as Array: monotonic non-decreasing, and the
+                // last offset is the total pair count that both inner streams
+                // must match.
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Map offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+                let total_pairs = offsets.last().copied().unwrap_or(0) as usize;
+                if keys.row_count() != total_pairs {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Map invariant broken: keys.row_count()={} != offsets.last()={}",
+                            keys.row_count(),
+                            total_pairs
+                        ),
+                    ));
+                }
+                if values.row_count() != total_pairs {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Map invariant broken: values.row_count()={} != offsets.last()={}",
+                            values.row_count(),
+                            total_pairs
+                        ),
+                    ));
+                }
+                keys.validate()?;
+                values.validate()?;
                 Ok(())
             }
             ColumnData::FixedString { n, data } => {
@@ -312,6 +371,17 @@ impl ColumnData {
                 for v in values {
                     v.encode(w)?;
                 }
+            }
+            ColumnData::Map {
+                keys,
+                values,
+                offsets,
+            } => {
+                for &off in offsets {
+                    w.write_u64(off)?;
+                }
+                keys.encode(w)?;
+                values.encode(w)?;
             }
         }
         Ok(())
@@ -455,12 +525,74 @@ impl ColumnData {
 
                 Ok(ColumnData::Array { inner, offsets })
             }
+            "Map" => {
+                // Wire format = Array(Tuple(K, V)). Parse out K, V from the
+                // type string, read the offsets stream, then decode the keys
+                // and values streams each sized to total_pairs.
+                let (k_dt, v_dt) = parse_map_inner_types(data_type)?;
+                let mut offsets: Vec<u64> = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    offsets.push(r.read_u64()?);
+                }
+                for i in 1..offsets.len() {
+                    if offsets[i] < offsets[i - 1] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "Map offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
+                            ),
+                        ));
+                    }
+                }
+                let total_pairs = offsets.last().copied().unwrap_or(0) as usize;
+                let keys = Box::new(ColumnData::decode(r, &k_dt, total_pairs)?);
+                let values = Box::new(ColumnData::decode(r, &v_dt, total_pairs)?);
+                Ok(ColumnData::Map {
+                    keys,
+                    values,
+                    offsets,
+                })
+            }
             _ => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!("column type '{data_type}' not yet supported"),
             )),
         }
     }
+}
+
+/// Parse the `K` and `V` from a `Map(K, V)` type string. Reuses the same
+/// depth-aware splitter as Tuple — a Map is just a 2-tuple in its inner
+/// shape.
+fn parse_map_inner_types(data_type: &str) -> Result<(String, String)> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Map type string: {data_type}"),
+        )
+    };
+    let begin = data_type.find('(').ok_or_else(err)?;
+    let end = data_type.rfind(')').ok_or_else(err)?;
+    if begin + 1 >= end {
+        return Err(err());
+    }
+    let inner = data_type[begin + 1..end].trim();
+    let parts = split_with_composite(inner)?;
+    if parts.len() != 2 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "Map requires exactly 2 type parameters, got {}: {data_type}",
+                parts.len()
+            ),
+        ));
+    }
+    let mut iter = parts.into_iter();
+    Ok((iter.next().unwrap(), iter.next().unwrap()))
 }
 
 // Pase the list of different types in Tuple(T1, T2,..). It's different than
@@ -631,10 +763,11 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="Map(String, UInt32)" (not yet supported), has_custom=0
+        // Manually encode: name="x", type="LowCardinality(String)" (not yet
+        // supported — versioned type, see SPEC §8.4), has_custom=0
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("Map(String, UInt32)").unwrap();
+        buf.write_string("LowCardinality(String)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
@@ -1585,10 +1718,7 @@ mod tests {
             name: "t".to_string(),
             data_type: "Tuple(UInt32, String)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::Tuple(vec![
-                ColumnData::Uint32(vec![]),
-                ColumnData::String(vec![]),
-            ]),
+            data: ColumnData::Tuple(vec![ColumnData::Uint32(vec![]), ColumnData::String(vec![])]),
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
@@ -1852,5 +1982,295 @@ mod tests {
     fn test_parse_tuple_inner_types_invalid() {
         assert!(parse_tuple_inner_types("Tuple").is_err());
         assert!(parse_tuple_inner_types("Tuple()").is_err());
+    }
+
+    // -- Map(K, V) --
+
+    #[test]
+    fn test_map_string_uint32_roundtrip() {
+        // Map(String, UInt32) with 2 rows: {'a':1, 'b':2}, {'c':3}
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(String, UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::String(vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                ])),
+                values: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+                offsets: vec![2, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Map {
+                keys,
+                values,
+                offsets,
+            } => {
+                assert_eq!(offsets, vec![2, 3]);
+                match *keys {
+                    ColumnData::String(v) => assert_eq!(v, vec!["a", "b", "c"]),
+                    _ => panic!("expected String keys"),
+                }
+                match *values {
+                    ColumnData::Uint32(v) => assert_eq!(v, vec![1u32, 2, 3]),
+                    _ => panic!("expected Uint32 values"),
+                }
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_map_zero_rows() {
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(String, UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::String(vec![])),
+                values: Box::new(ColumnData::Uint32(vec![])),
+                offsets: vec![],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Map {
+                keys,
+                values,
+                offsets,
+            } => {
+                assert!(offsets.is_empty());
+                assert_eq!(keys.row_count(), 0);
+                assert_eq!(values.row_count(), 0);
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_map_empty_row() {
+        // Single row with an empty map.
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(String, UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::String(vec![])),
+                values: Box::new(ColumnData::Uint32(vec![])),
+                offsets: vec![0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Map { offsets, .. } => assert_eq!(offsets, vec![0]),
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_map_complex_value_array() {
+        // Map(String, Array(UInt32)) with 1 row: {'a':[1,2], 'b':[]}
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(String, Array(UInt32))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string()])),
+                values: Box::new(ColumnData::Array {
+                    inner: Box::new(ColumnData::Uint32(vec![1, 2])),
+                    offsets: vec![2, 2],
+                }),
+                offsets: vec![2],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Map {
+                keys,
+                values,
+                offsets,
+            } => {
+                assert_eq!(offsets, vec![2]);
+                match *keys {
+                    ColumnData::String(v) => assert_eq!(v, vec!["a", "b"]),
+                    _ => panic!("expected String keys"),
+                }
+                match *values {
+                    ColumnData::Array {
+                        inner,
+                        offsets: vo,
+                    } => {
+                        assert_eq!(vo, vec![2, 2]);
+                        match *inner {
+                            ColumnData::Uint32(v) => assert_eq!(v, vec![1u32, 2]),
+                            _ => panic!("expected Uint32 innermost"),
+                        }
+                    }
+                    _ => panic!("expected Array values"),
+                }
+            }
+            _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_map_wire_layout() {
+        // Map(UInt8, UInt8) with 2 rows: {1:10, 2:20}, {3:30}.
+        // Wire: 2 × UInt64 LE offsets, then 3 keys, then 3 values.
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(UInt8, UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::Uint8(vec![1, 2, 3])),
+                values: Box::new(ColumnData::Uint8(vec![10, 20, 30])),
+                offsets: vec![2, 3],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // Tail: [2,0,0,0,0,0,0,0] [3,0,0,0,0,0,0,0] [1,2,3] [10,20,30]
+        let expected_tail = vec![
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[0] = 2
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[1] = 3
+            0x01, 0x02, 0x03, // keys
+            0x0A, 0x14, 0x1E, // values: 10, 20, 30
+        ];
+        let tail = &buf[buf.len() - expected_tail.len()..];
+        assert_eq!(tail, expected_tail.as_slice());
+    }
+
+    #[test]
+    fn test_map_row_count_is_offsets_len() {
+        let c = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string()])),
+            values: Box::new(ColumnData::Uint32(vec![1, 2])),
+            offsets: vec![1, 2],
+        };
+        assert_eq!(c.row_count(), 2);
+    }
+
+    #[test]
+    fn test_validate_rejects_map_keys_values_mismatch() {
+        // 2 keys but 3 values — invariant broken.
+        let c = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string()])),
+            values: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+            offsets: vec![2],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_map_offset_keys_mismatch() {
+        // offsets.last() = 3 but only 2 keys.
+        let c = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string()])),
+            values: Box::new(ColumnData::Uint32(vec![1, 2])),
+            offsets: vec![3],
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_rejects_map_non_monotonic_offsets() {
+        let c = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string(), "c".to_string()])),
+            values: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+            offsets: vec![2, 1, 3], // 1 < 2 — invalid
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_recurses_into_map_inner() {
+        // Outer Map invariants pass (3 keys, 3 values, monotonic offsets), but
+        // the inner Array used as the values column has bad offsets.
+        let c = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string()])),
+            values: Box::new(ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+                offsets: vec![3, 1], // non-monotonic
+            }),
+            offsets: vec![1],
+        };
+        // Top-level Map invariant: keys.row_count()=1, values.row_count()=2 (Array
+        // row count = offsets.len() = 2). That mismatch is caught first; force
+        // the outer invariant to pass by aligning row counts.
+        // We need a setup where outer is valid but inner is not.
+        let _ = c;
+
+        // Construct: 1 row of map, with values column = Array{ offsets=[3,1] }.
+        // For the Map invariant to pass, values.row_count() must equal
+        // offsets.last()=1. Array row count is offsets.len(); we need a single
+        // outer row, so values.offsets must have len=1. But a single offset
+        // can't be non-monotonic. So instead: 2 rows of map, map.offsets=[1,2],
+        // values.offsets=[2,1] (len=2 ✓, but 1<2 invalid).
+        let c2 = ColumnData::Map {
+            keys: Box::new(ColumnData::String(vec!["a".to_string(), "b".to_string()])),
+            values: Box::new(ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![1, 2])),
+                offsets: vec![2, 1], // non-monotonic
+            }),
+            offsets: vec![1, 2],
+        };
+        let mut buf = Vec::new();
+        let err = c2.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_parse_map_inner_types_basic() {
+        let (k, v) = parse_map_inner_types("Map(String, UInt32)").unwrap();
+        assert_eq!(k, "String");
+        assert_eq!(v, "UInt32");
+    }
+
+    #[test]
+    fn test_parse_map_inner_types_nested() {
+        let (k, v) = parse_map_inner_types("Map(String, Array(UInt32))").unwrap();
+        assert_eq!(k, "String");
+        assert_eq!(v, "Array(UInt32)");
+
+        let (k2, v2) = parse_map_inner_types("Map(String, Tuple(Int32, String))").unwrap();
+        assert_eq!(k2, "String");
+        assert_eq!(v2, "Tuple(Int32, String)");
+    }
+
+    #[test]
+    fn test_parse_map_inner_types_invalid() {
+        assert!(parse_map_inner_types("Map").is_err());
+        assert!(parse_map_inner_types("Map()").is_err());
+        // Wrong arity — only one type.
+        assert!(parse_map_inner_types("Map(String)").is_err());
+        // Wrong arity — three types.
+        assert!(parse_map_inner_types("Map(String, Int32, UInt32)").is_err());
     }
 }

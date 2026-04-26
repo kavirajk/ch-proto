@@ -227,6 +227,48 @@ fn bench_tuple_array(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------- Map ----------
+
+fn bench_map(c: &mut Criterion) {
+    let mut group = c.benchmark_group("map_string_uint32");
+
+    // Each row holds avg_len key-value pairs.
+    for rows in [10usize, 1_000, 10_000].iter() {
+        let avg_len = 10u64;
+        let total_pairs = *rows as u64 * avg_len;
+
+        let keys: Vec<String> = (0..total_pairs).map(|i| format!("k{i}")).collect();
+        let values: Vec<u32> = (0..total_pairs as u32).collect();
+        let offsets: Vec<u64> = (1..=*rows as u64).map(|i| i * avg_len).collect();
+
+        let col = Column {
+            name: "m".to_string(),
+            data_type: "Map(String, UInt32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Map {
+                keys: Box::new(ColumnData::String(keys)),
+                values: Box::new(ColumnData::Uint32(values)),
+                offsets,
+            },
+        };
+
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let encoded = buf.clone();
+
+        // One throughput element per K-V pair.
+        group.throughput(Throughput::Elements(total_pairs));
+        group.bench_with_input(BenchmarkId::new("encode", rows), rows, |b, _| {
+            b.iter(|| encode_col(&col, &mut buf))
+        });
+        group.bench_with_input(BenchmarkId::new("decode", rows), rows, |b, n| {
+            b.iter(|| decode_col(&encoded, *n))
+        });
+    }
+
+    group.finish();
+}
+
 // ---------- row_count() hot-path ----------
 
 fn bench_row_count(c: &mut Criterion) {
@@ -244,11 +286,17 @@ fn bench_row_count(c: &mut Criterion) {
         ColumnData::Uint32((0..10_000u32).collect()),
         ColumnData::Uint32((0..10_000u32).collect()),
     ]);
+    let map = ColumnData::Map {
+        keys: Box::new(ColumnData::Uint32((0..100_000u32).collect())),
+        values: Box::new(ColumnData::Uint32((0..100_000u32).collect())),
+        offsets: (0..10_000u64).collect(),
+    };
 
     c.bench_function("row_count_flat", |b| b.iter(|| flat.row_count()));
     c.bench_function("row_count_nullable", |b| b.iter(|| nullable.row_count()));
     c.bench_function("row_count_array", |b| b.iter(|| array.row_count()));
     c.bench_function("row_count_tuple", |b| b.iter(|| tuple.row_count()));
+    c.bench_function("row_count_map", |b| b.iter(|| map.row_count()));
 }
 
 criterion_group!(
@@ -258,6 +306,7 @@ criterion_group!(
     bench_array_nullable,
     bench_tuple,
     bench_tuple_array,
+    bench_map,
     bench_row_count,
 );
 criterion_main!(benches);
