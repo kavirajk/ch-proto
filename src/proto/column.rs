@@ -115,6 +115,47 @@ pub enum ColumnData {
     Int256(Vec<[u8; 32]>),
     /// 256-bit unsigned integer, raw 32-byte LE bytes.
     Uint256(Vec<[u8; 32]>),
+    /// `LowCardinality(T)` — Tier 1 single-block-aware support.
+    ///
+    /// Wire format (per column):
+    /// - State prefix (once per column per query, only when first block has
+    ///   rows > 0): `Int64 LE = 1` (`sharedDictionariesWithAdditionalKeys`,
+    ///   the only defined version).
+    /// - Per block with rows > 0:
+    ///   - `UInt64 LE` metadata: low byte = key type (0=UInt8, 1=UInt16,
+    ///     2=UInt32, 3=UInt64); bit 9 = HasAdditionalKeysBit;
+    ///     bit 10 = NeedUpdateDictionary; bit 11 = NeedGlobalDictionaryBit.
+    ///   - `UInt64 LE` dict_size (typically includes a placeholder slot at
+    ///     index 0 for the empty/null entry).
+    ///   - dict values: `dict_size` values encoded as the inner type T.
+    ///   - `UInt64 LE` keys_count = num_rows of this block.
+    ///   - keys: `keys_count` indices, each `1 << key_type` bytes.
+    ///
+    /// Header blocks (rows == 0) are always empty — no state prefix or
+    /// per-block data. KNOWN LIMITATION: this implementation handles
+    /// queries with at most one data block per LowCardinality column.
+    /// Multi-block queries would re-read the state prefix and fail.
+    /// See SPEC §8.4.
+    LowCardinality {
+        dict: Box<ColumnData>,
+        /// Keys promoted to u64 for ergonomics. The wire encoding uses the
+        /// width specified by `key_width` (1, 2, 4, or 8 bytes).
+        keys: Vec<u64>,
+        /// 1, 2, 4, or 8 bytes per key. On encode, each key must fit in the
+        /// chosen width.
+        key_width: u8,
+    },
+    /// `JSON` — Tier 1 (String fallback) only.
+    ///
+    /// Wire format: `Int64 LE = 1` (JSONStringSerializationVersion) state
+    /// prefix once at column start, then a regular String column encoding of
+    /// `num_rows` JSON text values.
+    ///
+    /// The client auto-injects the `output_format_native_write_json_as_string`
+    /// setting on every query so that JSON columns always come back in this
+    /// shape. Tier 2 (FLATTENED, version 0/3/4) and the layered
+    /// Variant/Dynamic infrastructure are not implemented; see SPEC §8.4.2.1.
+    Json(Vec<String>),
     /// `Map(K, V)`: each row holds a variable-length sequence of key-value
     /// pairs. Wire format is identical to `Array(Tuple(K, V))`:
     ///   - `offsets` × num_rows UInt64 LE
@@ -252,6 +293,8 @@ impl ColumnData {
             ColumnData::Uint128(v) => v.len(),
             ColumnData::Int256(v) => v.len(),
             ColumnData::Uint256(v) => v.len(),
+            ColumnData::Json(v) => v.len(),
+            ColumnData::LowCardinality { keys, .. } => keys.len(),
         }
     }
 
@@ -426,6 +469,44 @@ impl ColumnData {
                     ));
                 }
                 Ok(())
+            }
+            ColumnData::LowCardinality {
+                dict,
+                keys,
+                key_width,
+            } => {
+                if !matches!(*key_width, 1 | 2 | 4 | 8) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("LowCardinality key_width must be 1, 2, 4, or 8; got {key_width}"),
+                    ));
+                }
+                let max_value: u64 = match *key_width {
+                    1 => u8::MAX as u64,
+                    2 => u16::MAX as u64,
+                    4 => u32::MAX as u64,
+                    _ => u64::MAX,
+                };
+                let dict_size = dict.row_count() as u64;
+                for (i, &k) in keys.iter().enumerate() {
+                    if k > max_value {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "LowCardinality key {k} at index {i} doesn't fit in key_width={key_width}"
+                            ),
+                        ));
+                    }
+                    if k >= dict_size {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "LowCardinality key {k} at index {i} >= dict_size {dict_size}"
+                            ),
+                        ));
+                    }
+                }
+                dict.validate()
             }
             // Flat types: self-consistent by construction.
             _ => Ok(()),
@@ -607,6 +688,56 @@ impl ColumnData {
             ColumnData::Int256(v) | ColumnData::Uint256(v) => {
                 for bytes in v {
                     w.write_all(bytes)?;
+                }
+            }
+            ColumnData::Json(v) => {
+                // JSON Tier 1 wire layout: Int64 LE state prefix = 1, then
+                // String column encoding of N rows.
+                if !v.is_empty() {
+                    w.write_i64(1)?;
+                }
+                for s in v {
+                    w.write_string(s)?;
+                }
+            }
+            ColumnData::LowCardinality {
+                dict,
+                keys,
+                key_width,
+            } => {
+                // Skip everything for an empty column (header block).
+                if keys.is_empty() {
+                    // Nothing on the wire — matches the server's empty-block
+                    // behaviour.
+                } else {
+                    // State prefix.
+                    w.write_i64(1)?;
+                    // Per-block metadata: key type in low byte + flags.
+                    let key_type_code: u64 = match *key_width {
+                        1 => 0,
+                        2 => 1,
+                        4 => 2,
+                        8 => 3,
+                        _ => 0, // validate() rejects other widths
+                    };
+                    let metadata: u64 = key_type_code | (1 << 9) | (1 << 10);
+                    w.write_u64(metadata)?;
+                    // Dict size.
+                    w.write_u64(dict.row_count() as u64)?;
+                    // Dict values.
+                    dict.encode(w)?;
+                    // Keys count.
+                    w.write_u64(keys.len() as u64)?;
+                    // Keys.
+                    for &k in keys {
+                        match *key_width {
+                            1 => w.write_u8(k as u8)?,
+                            2 => w.write_u16(k as u16)?,
+                            4 => w.write_u32(k as u32)?,
+                            8 => w.write_u64(k)?,
+                            _ => unreachable!(),
+                        }
+                    }
                 }
             }
         }
@@ -811,6 +942,113 @@ impl ColumnData {
                     v.push(bytes);
                 }
                 Ok(ColumnData::Uint256(v))
+            }
+            "LowCardinality" => {
+                // Header block (rows == 0): server emits nothing; we mirror
+                // that by returning an empty column with a placeholder dict.
+                let inner_dt_full = parse_composite_inner_type(data_type)?;
+                // For LC(Nullable(T)), the wire encodes the dict as plain T
+                // — null is represented by convention as dict[1] (after the
+                // empty placeholder at dict[0]). The Nullable wrapper has no
+                // null-map stream of its own. Strip Nullable for the dict
+                // decode; the in-memory shape preserves the LC structure
+                // (callers who want null awareness check key == 1, or use
+                // the original type string).
+                let inner_dt = if inner_dt_full.starts_with("Nullable(") {
+                    parse_composite_inner_type(&inner_dt_full)?
+                } else {
+                    inner_dt_full
+                };
+                if rows == 0 {
+                    let dict = Box::new(ColumnData::decode(r, &inner_dt, 0)?);
+                    return Ok(ColumnData::LowCardinality {
+                        dict,
+                        keys: Vec::new(),
+                        key_width: 1,
+                    });
+                }
+                // State prefix (Int64 LE = 1).
+                let state_prefix = r.read_i64()?;
+                if state_prefix != 1 {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        format!(
+                            "LowCardinality state prefix {state_prefix} not supported \
+                             (only `sharedDictionariesWithAdditionalKeys` = 1)"
+                        ),
+                    ));
+                }
+                // Per-block metadata.
+                let metadata = r.read_u64()?;
+                let key_type_code = (metadata & 0xFF) as u8;
+                let key_width: u8 = match key_type_code {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    3 => 8,
+                    other => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("unknown LowCardinality key type code: {other}"),
+                        ));
+                    }
+                };
+                // Dict size + values.
+                let dict_size = r.read_u64()? as usize;
+                let dict = Box::new(ColumnData::decode(r, &inner_dt, dict_size)?);
+                // Keys count + keys.
+                let keys_count = r.read_u64()? as usize;
+                let mut keys = Vec::with_capacity(keys_count);
+                for _ in 0..keys_count {
+                    let k: u64 = match key_width {
+                        1 => r.read_u8()? as u64,
+                        2 => r.read_u16()? as u64,
+                        4 => r.read_u32()? as u64,
+                        8 => r.read_u64()?,
+                        _ => unreachable!(),
+                    };
+                    keys.push(k);
+                }
+                Ok(ColumnData::LowCardinality {
+                    dict,
+                    keys,
+                    key_width,
+                })
+            }
+            "JSON" => {
+                // JSON Tier 1 (String fallback). The client auto-injects
+                // `output_format_native_write_json_as_string=1`; the server
+                // then emits an `Int64 LE = 1` state prefix followed by a
+                // String column.
+                //
+                // KNOWN LIMITATION: the state prefix is per-column-per-query
+                // (not per-block) and the server only emits it before the
+                // first block with rows > 0. The header block (rows = 0) and
+                // any subsequent blocks contain only the String values, no
+                // prefix. We approximate with `rows == 0 → no prefix`, which
+                // covers single-data-block queries (the common case) and the
+                // header block correctly. Multi-block JSON queries are not
+                // yet supported — see SPEC §8.4.
+                if rows == 0 {
+                    return Ok(ColumnData::Json(Vec::new()));
+                }
+                let version = r.read_i64()?;
+                if version != 1 {
+                    return Err(Error::new(
+                        ErrorKind::Unsupported,
+                        format!(
+                            "JSON serialization version {version} not supported \
+                             (this client only handles version 1, the String fallback). \
+                             Ensure `output_format_native_write_json_as_string=1` is set \
+                             on the query — the client should inject it automatically."
+                        ),
+                    ));
+                }
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_string()?);
+                }
+                Ok(ColumnData::Json(v))
             }
             "Int32" => {
                 let mut v = Vec::with_capacity(rows);
@@ -1295,11 +1533,12 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="LowCardinality(String)" (not yet
-        // supported — versioned type, see SPEC §8.4), has_custom=0
+        // Manually encode: name="x", type="Variant(UInt8, String)" (not yet
+        // supported — versioned type with discriminator scheme, see SPEC
+        // §8.4), has_custom=0
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("LowCardinality(String)").unwrap();
+        buf.write_string("Variant(UInt8, String)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
@@ -3919,5 +4158,247 @@ mod tests {
             }
             _ => panic!("expected Nullable"),
         }
+    }
+
+    // -- Phase 8: LowCardinality(T) --
+
+    #[test]
+    fn test_lowcardinality_string_roundtrip() {
+        let col = Column {
+            name: "lc".to_string(),
+            data_type: "LowCardinality(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::LowCardinality {
+                dict: Box::new(ColumnData::String(vec![
+                    "".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                ])),
+                keys: vec![1, 2, 1],
+                key_width: 1,
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::LowCardinality {
+                dict,
+                keys,
+                key_width,
+            } => {
+                assert_eq!(key_width, 1);
+                assert_eq!(keys, vec![1u64, 2, 1]);
+                match *dict {
+                    ColumnData::String(v) => assert_eq!(v, vec!["", "a", "b"]),
+                    _ => panic!("expected String dict"),
+                }
+            }
+            _ => panic!("expected LowCardinality"),
+        }
+    }
+
+    #[test]
+    fn test_lowcardinality_zero_rows() {
+        let col = Column {
+            name: "lc".to_string(),
+            data_type: "LowCardinality(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::LowCardinality {
+                dict: Box::new(ColumnData::String(vec![])),
+                keys: vec![],
+                key_width: 1,
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::LowCardinality { keys, .. } => assert!(keys.is_empty()),
+            _ => panic!("expected LowCardinality"),
+        }
+    }
+
+    #[test]
+    fn test_lowcardinality_uint16_keys() {
+        let dict_strings: Vec<String> = (0..300).map(|i| format!("v{i}")).collect();
+        let keys: Vec<u64> = (0..300).collect();
+        let col = Column {
+            name: "lc".to_string(),
+            data_type: "LowCardinality(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::LowCardinality {
+                dict: Box::new(ColumnData::String(dict_strings.clone())),
+                keys: keys.clone(),
+                key_width: 2,
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 300, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::LowCardinality {
+                dict,
+                keys: dk,
+                key_width,
+            } => {
+                assert_eq!(key_width, 2);
+                assert_eq!(dk, keys);
+                match *dict {
+                    ColumnData::String(v) => assert_eq!(v, dict_strings),
+                    _ => panic!("expected String dict"),
+                }
+            }
+            _ => panic!("expected LowCardinality"),
+        }
+    }
+
+    #[test]
+    fn test_lowcardinality_wire_layout() {
+        let col = Column {
+            name: "lc".to_string(),
+            data_type: "LowCardinality(String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::LowCardinality {
+                dict: Box::new(ColumnData::String(vec![
+                    "".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                ])),
+                keys: vec![1, 2, 1],
+                key_width: 1,
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let expected_tail: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&1i64.to_le_bytes()); // state prefix
+            let metadata: u64 = (1 << 9) | (1 << 10); // HasAdditional + NeedUpdate
+            v.extend_from_slice(&metadata.to_le_bytes());
+            v.extend_from_slice(&3u64.to_le_bytes()); // dict_size
+            v.extend_from_slice(&[0, 1, b'a', 1, b'b']); // dict strings
+            v.extend_from_slice(&3u64.to_le_bytes()); // keys_count
+            v.extend_from_slice(&[1, 2, 1]); // UInt8 keys
+            v
+        };
+        let tail = &buf[buf.len() - expected_tail.len()..];
+        assert_eq!(tail, expected_tail.as_slice());
+    }
+
+    #[test]
+    fn test_lowcardinality_validate_rejects_bad_key_width() {
+        let c = ColumnData::LowCardinality {
+            dict: Box::new(ColumnData::String(vec!["".to_string(), "a".to_string()])),
+            keys: vec![1],
+            key_width: 3,
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_lowcardinality_validate_rejects_oversized_key() {
+        let c = ColumnData::LowCardinality {
+            dict: Box::new(ColumnData::String(vec!["".to_string(), "a".to_string()])),
+            keys: vec![300],
+            key_width: 1,
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_lowcardinality_validate_rejects_out_of_dict_range() {
+        let c = ColumnData::LowCardinality {
+            dict: Box::new(ColumnData::String(vec!["".to_string(), "a".to_string()])),
+            keys: vec![5],
+            key_width: 1,
+        };
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -- Phase 8: JSON Tier 1 --
+
+    #[test]
+    fn test_json_tier1_roundtrip() {
+        let col = Column {
+            name: "j".to_string(),
+            data_type: "JSON".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Json(vec![
+                "{\"a\":1}".to_string(),
+                "{}".to_string(),
+                "{\"x\":\"y\"}".to_string(),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Json(v) => {
+                assert_eq!(v, vec!["{\"a\":1}", "{}", "{\"x\":\"y\"}"]);
+            }
+            _ => panic!("expected Json"),
+        }
+    }
+
+    #[test]
+    fn test_json_tier1_zero_rows() {
+        let col = Column {
+            name: "j".to_string(),
+            data_type: "JSON".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Json(vec![]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Json(v) => assert!(v.is_empty()),
+            _ => panic!("expected Json"),
+        }
+    }
+
+    #[test]
+    fn test_json_tier1_state_prefix_byte() {
+        let col = Column {
+            name: "j".to_string(),
+            data_type: "JSON".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Json(vec!["{}".to_string()]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let expected_tail = vec![
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // state prefix Int64 = 1
+            0x02, b'{', b'}',
+        ];
+        let tail = &buf[buf.len() - expected_tail.len()..];
+        assert_eq!(tail, expected_tail.as_slice());
+    }
+
+    #[test]
+    fn test_json_tier1_rejects_other_versions() {
+        // Hand-craft wire with version 0.
+        let mut buf = Vec::new();
+        buf.write_string("j").unwrap();
+        buf.write_string("JSON").unwrap();
+        buf.write_u8(0).unwrap();
+        buf.write_i64(0).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let err = Column::decode(&mut cursor, 1, PROTOCOL).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 }

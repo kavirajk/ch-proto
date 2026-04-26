@@ -412,6 +412,63 @@ On `EndOfStream` or handled `Exception`, connection returns to `READY`. On proto
 
 ---
 
+### 6.5 INSERT Phase
+
+INSERT is a variant of the Query Phase (§6.4) with two extra round-trip-shaped exchanges before EndOfStream. The client first sends an INSERT statement; the server responds with a **schema block** describing the target table; the client then streams one or more Data packets carrying actual rows; the client sends an empty Data packet to signal end-of-input; the server finishes with `EndOfStream` (or `Exception`).
+
+#### Precondition
+Connection state = `READY` (handshake complete). The SQL must be an INSERT statement of the form `INSERT INTO <table> [(<cols>)] VALUES` — no inline `VALUES (...)` literal; the row data flows via Data packets.
+
+#### Flow
+
+```
+Client                                  Server
+------                                  ------
+[Query packet — INSERT body]          → 
+[ExternalTable*, then empty terminator] →
+                                        ← [optional metadata: TableColumns, Progress, ...]
+                                        ← [Data packet: schema block (rows = 0)]
+[Data packet: rows N]                 →
+[Data packet: rows M]                 →   (additional blocks, optional)
+[Data packet: empty block (rows 0)]   →   (end-of-input terminator)
+                                        ← [optional Progress, ProfileInfo, Log, ProfileEvents]
+                                        ← [EndOfStream]
+```
+
+#### Step 1: Client sends Query packet
+Same as §6.4 step 1, with `body` = the INSERT SQL. The `compression` and `stage` flags carry through.
+
+#### Step 2: Client sends external tables + terminator
+Same as §6.4 step 2 — sends each external table (rare for INSERT) followed by the empty terminator. This is required even for INSERT; the terminator tells the server "no more external input from the client side at this stage" before the schema exchange begins.
+
+#### Step 3: Client reads metadata + schema block
+The server responds with the schema block — a Data packet whose Block has 0 rows but full column structure (names + types). This is the contract: the rows the client subsequently sends must match these column shapes.
+
+The schema block may be **preceded by zero or more metadata packets**: `TableColumns` (column-default metadata), `Progress`, `ProfileInfo`, `Log`, `ProfileEvents`. The client must drain these and continue reading until it sees the schema Data packet (or `Exception`, in which case the INSERT is aborted before any rows are sent).
+
+#### Step 4: Client sends data block(s)
+For each block of rows the client wants to insert:
+1. Write `VarUInt(ClientPacket::Data = 2)`.
+2. Write `String("")` for the (empty) external-table name.
+3. Encode the Block — its columns must align with the schema block's columns by **type** (column **name** is informational; the server matches by position when names are absent).
+
+Multiple Data packets may be sent in sequence, allowing streaming inserts that don't require buffering the full payload in memory.
+
+#### Step 5: Client sends end-of-input terminator
+Same wire shape as a regular Data packet but with an empty Block (0 columns, 0 rows). This tells the server "I'm done sending rows; please commit and respond."
+
+#### Step 6: Client reads response until EndOfStream
+The server may emit zero or more `Progress`, `ProfileInfo`, `Log`, `ProfileEvents`, or `TableColumns` packets, then finally `EndOfStream` (success) or `Exception` (failure — typically a schema mismatch, constraint violation, or per-row parse error).
+
+Connection returns to `READY` on `EndOfStream` or handled `Exception`. Protocol violations or I/O errors terminate the connection.
+
+#### Common pitfalls
+- **Sending data before the schema arrives.** The schema block is the server's confirmation that it parsed the INSERT and is ready to receive rows. Sending data prematurely (or skipping the schema read) confuses the server's input parser and triggers an Exception or a hung connection.
+- **Forgetting the end-of-input terminator.** Without the empty-Block terminator, the server keeps waiting for more rows and the connection hangs.
+- **Schema mismatch.** If a column's type in your Data packet differs from what the schema block declared, the server typically fails the INSERT with `TYPE_MISMATCH`. Match the schema's column types exactly (names are informational).
+
+---
+
 ## 7. Message Reference
 
 ### Notation
@@ -1987,42 +2044,173 @@ Three progressively-harder strategies for supporting JSON in a client, correspon
 
 Most production Go/Rust/Python clients sit at Tier 2. The Tier 1 fallback remains useful as a simpler path when full JSON support is not required.
 
-#### 8.4.3 Types in this group
+#### 8.4.3 LowCardinality(T)
 
-> **Not yet specified in this document.** The following types belong to this group but their full wire format is not yet documented:
->
-> - **`LowCardinality(T)`** — dictionary-encoded column with cross-block state (accumulating additional keys per block). Simplest of the versioned types; only one version defined.
-> - **`Variant(T1, T2, ...)`** — discriminated union. Each row has a discriminator byte/short indicating which alternative holds the value; then per-alternative streams carry the actual values.
-> - **`Dynamic`** — runtime-typed column. Each row's type is chosen from a set of variants that can grow across blocks. Built from `Variant` plus a structure prefix.
-> - **`Object`** (underlying `JSON`) — tree of dynamically-discovered paths, each path a `Dynamic` column. Complex due to the multi-layer composition (`Object` over `Dynamic` over `Variant`).
-> - **`JSON`** — thin wrapper over `Object`. Clients may bypass the full implementation by setting `output_format_native_write_json_as_string = 1`, in which case JSON arrives as a `String` column with the `JSONStringSerializationVersion` prefix — see §8.4.2.
->
-> Recommended implementation order for clients: `LowCardinality` → `Variant` → `Dynamic` → `Object` / `JSON`.
+The simplest versioned type. Replaces a column of N inner values with a small dictionary of unique values + N indices into that dictionary. ClickHouse stores high-repetition columns this way for compression; the wire format mirrors the storage layout.
+
+**Wire layout:**
+
+```
+[8 bytes:  Int64 LE state prefix = 1]              ← once per column per query (see §11.18)
+                                                     only emitted before the first block with rows > 0
+[per block with rows > 0]:
+  [8 bytes:  UInt64 LE metadata]                   ← key type code (low byte) + flag bits
+  [8 bytes:  UInt64 LE dict_size]                  ← number of dict entries (incl. placeholder slot)
+  [N bytes:  dict values]                          ← inner type's encoding for dict_size values
+  [8 bytes:  UInt64 LE keys_count]                 ← always equal to this block's row count
+  [K bytes:  keys]                                 ← (1 << key_type_code) bytes per key
+```
+
+**State prefix (Int64 LE = 1):** the single defined version,
+`sharedDictionariesWithAdditionalKeys`. Other values are reserved and not seen
+in practice.
+
+**Metadata UInt64:**
+
+| Bit range | Meaning |
+|-----------|---------|
+| 0..7      | Key type code: `0` = UInt8, `1` = UInt16, `2` = UInt32, `3` = UInt64. The smallest type that can index `dict_size` entries is chosen. |
+| 9 (`0x200`)  | `HasAdditionalKeysBit` — set when the block contains new dict entries (vs. only reusing previously-seen ones). |
+| 10 (`0x400`) | `NeedUpdateDictionary` — set when the dict provided in this block extends the global dict. |
+| 11 (`0x800`) | `NeedGlobalDictionaryBit` — set when this block references entries from a global dict shared across blocks. |
+
+For typical query responses (single block per column) the metadata is `0x600` (HasAdditionalKeys + NeedUpdateDictionary).
+
+**Dict values:** `dict_size` values encoded using the inner type T. By convention `dict[0]` is an empty/default placeholder. **For `LowCardinality(Nullable(T))` the wire encodes the dict as plain T (no null-map stream); `dict[1]` is the null marker** — values start at `dict[2..]`.
+
+**Keys:** indices into the dict. `keys.len() == this block's row count`. Each index is `1 << key_type_code` bytes (1, 2, 4, or 8). The reader reconstructs logical row N as `dict[keys[N]]`.
+
+**Empty column / header block (rows = 0):** the server emits **nothing** — no state prefix, no per-block data. Header blocks (which have all the column structure but 0 rows) skip the LowCardinality body entirely.
+
+**Byte-level example — `LowCardinality(String)` with values `['a', 'b', 'a', 'c', 'b']`:**
+
+```
+01 00 00 00 00 00 00 00      state prefix Int64 = 1
+00 06 00 00 00 00 00 00      metadata UInt64 = 0x600
+04 00 00 00 00 00 00 00      dict_size = 4
+00                           dict[0] = "" (placeholder)
+01 'a'                       dict[1] = "a"
+01 'b'                       dict[2] = "b"
+01 'c'                       dict[3] = "c"
+05 00 00 00 00 00 00 00      keys_count = 5
+01 02 01 03 02               keys (UInt8): 1, 2, 1, 3, 2
+```
+
+Reconstructed: `dict[1], dict[2], dict[1], dict[3], dict[2]` = `"a", "b", "a", "c", "b"`.
+
+**Implementation status (this client):** single-data-block queries supported in both directions. Multi-block LowCardinality (where the second+ block reuses the dict from block 1) is not yet handled — see §11.18 for the architectural reason.
+
+#### 8.4.4 JSON (Tier 1: String fallback)
+
+ClickHouse's `JSON` type is the most complex in the protocol — full support layers `Object` over `Dynamic` over `Variant` over `LowCardinality`-flavoured machinery. **Tier 1 sidesteps all of this**: when the client sets the per-query setting `output_format_native_write_json_as_string = 1`, the server flattens every JSON value to its serialised text and emits the column as a `String` with a state-prefix marker.
+
+**Tier 1 wire layout:**
+
+```
+[8 bytes:  Int64 LE state prefix = 1]              ← JSONStringSerializationVersion
+[per block with rows > 0]:
+  [N bytes: String column encoding for num_rows JSON text values]
+```
+
+**State prefix value:** `1` is `JSONStringSerializationVersion`. Other values (`0`, `3`, `4`) indicate the FLATTENED / V3 formats which Tier 1 cannot decode — a Tier 1 client must reject them.
+
+**Empty column (rows = 0):** the server emits no state prefix, no string data — same skip behaviour as LowCardinality (§11.18).
+
+**Byte-level example — single-row `JSON` value `'{"a":1}'`:**
+
+```
+01 00 00 00 00 00 00 00      state prefix Int64 = 1
+09 7B 22 61 22 3A 22 31 22   String: 9 bytes "{"a":"1"}"
+7D
+```
+
+(Note ClickHouse re-stringifies non-string JSON values when emitting in this mode — the `1` becomes `"1"`. The point of Tier 1 is to get JSON *somewhere*; faithful round-tripping of types is the job of Tier 2.)
+
+**Why "Tier 1"?** The implementation tier table in §8.4.2.1 distinguishes:
+- **Tier 1** — String fallback (this section). Decoding is just "Int64 prefix + String column". A complete client implementation in ~30 lines of code.
+- **Tier 2** — FLATTENED format (server version 3, deprecated alias for V3). Requires Variant + Dynamic + Object decoding. Thousands of lines.
+- **Tier 3** — V3 format. Same complexity tier as Tier 2.
+
+This client implements Tier 1 only. The decoder auto-injects the setting on every query so any `JSON` column on the wire arrives in Tier 1 shape.
+
+#### 8.4.5 Variant, Dynamic, JSON Tier 2/3 — not implemented
+
+Three closely-related types are **not implemented** in this client. Documented here for completeness, not as a wire-format spec:
+
+- **`Variant(T1, T2, ...)`** — discriminated union. Each row has a discriminator (UInt8 in BASIC mode, more complex in COMPACT mode) selecting which sub-column carries that row's value. `255` is the `NULL_DISCRIMINATOR`. Sub-columns are then encoded per-type, sized to the count of rows that selected each variant.
+
+- **`Dynamic`** — runtime-typed column. State prefix carries a serialisation version (`V1=1`, `V2=2`, `V3=4`, `FLATTENED=3`); then a list of variant type names discovered at runtime; then the rest is a `Variant` encoding using those types. Type list grows across blocks within a query.
+
+- **`JSON` Tier 2 (FLATTENED) and Tier 3 (V3)** — `Object`-rooted format: a list of dynamic paths discovered server-side, each path encoded as a `Dynamic` column, plus a shared-data column at the end. Built on top of `LowCardinality` state-prefix machinery, `Variant`, and `Dynamic` — depends on all of the above.
+
+**Why deferred:**
+- ch-go does not implement any of these (its coverage cap predates them).
+- clickhouse-go's implementation is the production reference, but it spans thousands of lines across `lib/column/{variant,dynamic,json,sharedvariant,json_reflect}.go`.
+- Getting BASIC vs COMPACT modes for `Variant` correct requires comprehensive empirical testing across server versions — work-in-progress on the ClickHouse side itself.
+- Tier 1 covers the practical use case for read-only JSON queries.
+
+A client that needs full Variant/Dynamic/JSON support today should use clickhouse-rs or use HTTP with `FORMAT JSON` / `FORMAT JSONEachRow` rather than the native protocol.
 
 ### 8.5 Types not yet categorized
 
-A catch-all for types recognized by the server that aren't documented above:
+Types recognized by the server but not yet specified or implemented:
 
-- **`Decimal(P, S)`**, **`Decimal32/64/128/256`** — fixed-point decimal numerics. Will fall under §8.1 (fixed-width).
 - **`AggregateFunction`**, **`SimpleAggregateFunction`** — serialized aggregation state. Structurally similar to §8.3 composites.
 - **`Interval`** — calendar/time interval. Fixed-width.
 - **Geo types** — `Point`, `Ring`, `Polygon`, `MultiPolygon`. Composites built on `Tuple` and `Array`.
-- **`Int16`, `UInt16`**, **`Int128`, `UInt128`**, **`Int256`, `UInt256`**, **`Float32`, `Float64`**, **`Date`**, **`Date32`**, **`DateTime64`**, **`UUID`**, **`IPv4`**, **`IPv6`**, **`Enum16`**, **`Bool`** — fixed-width, to be specified in §8.1.
-
-These will be moved into their respective groups (§8.1–8.4) as specifications are filled in.
+- **`Variant(...)`**, **`Dynamic`** — versioned types in the §8.4 family. Documented as deferred in §8.4.5.
 
 ---
 
 ## 9. Compression
 
-> **Placeholder.** This section will document block-level compression. The compression frame format is:
-> ```
-> [16 bytes: CityHash128 checksum]
-> [1 byte: method]         — 0x82=LZ4, 0x90=ZSTD, 0x02=None
-> [4 bytes: compressed_size]
-> [4 bytes: uncompressed_size]
-> [N bytes: compressed_data]
-> ```
+ClickHouse supports per-block compression for the column data carried inside Data, Totals, Extremes, Log, and ProfileEvents packets. Compression is **opt-in** — activated by the client setting `compression = 1` in the Query packet (§7.7) — and applies to both directions of the connection for the duration of that query.
+
+When compression is active, every `Block` body (the bytes after the `table_name` string of a Data packet) is wrapped in the compression frame defined below. The packet envelope itself (packet type code, table_name string, BlockInfo) is **not** compressed — only the columnar payload.
+
+### 9.1 Frame format
+
+```
+[16 bytes: CityHash128 checksum over the 9-byte header + compressed body]
+[1 byte:   method]                  ← 0x82 = LZ4, 0x90 = ZSTD, 0x02 = NONE
+[4 bytes:  compressed_size LE u32]  ← INCLUDES the 9-byte header, EXCLUDES the 16-byte checksum
+[4 bytes:  uncompressed_size LE u32]
+[N bytes:  compressed body]         ← N = compressed_size - 9
+```
+
+Total framed size: `16 + compressed_size` = `16 + 9 + body_size` = `25 + body_size`.
+
+**Method byte values:**
+
+| Byte | Method | Body encoding |
+|------|--------|---------------|
+| `0x02` | NONE | Body is the raw bytes (no compression). The frame is still required — sender uses it to satisfy the per-block framing contract; receiver still verifies the checksum. |
+| `0x82` | LZ4 | Body is the **LZ4 block format** — *not* the LZ4 frame format. No magic number. The Rust crate `lz4_flex::block::{compress, decompress}` produces and consumes this directly. |
+| `0x90` | ZSTD | Body is a raw zstd single-frame stream (whatever `zstd::stream::encode_all` produces). The standard zstd magic number is part of the body. |
+
+**Checksum:** ClickHouse uses **CityHash v1.0.2** (the historical variant), NOT modern Google CityHash. The two produce different outputs for the same input. The `clickhouse-rs-cityhash-sys` Rust crate is the established binding that produces compatible bytes.
+
+The checksum is computed over the 9 header bytes (method + compressed_size + uncompressed_size) **plus** the N body bytes — i.e., everything between the checksum and the end of the frame. The first 8 bytes of the 16-byte CityHash128 output are the low half (LE), the next 8 bytes are the high half (LE).
+
+**Validation on read:** decoders must recompute the CityHash128 over the received header+body and compare against the leading 16 bytes. Mismatch indicates corruption — fail loudly.
+
+### 9.2 Per-block boundaries
+
+Each Block is its own frame. A query response with multiple Data packets contains one frame per packet. There is no enclosing multi-block frame.
+
+The frame's `compressed_size` and `uncompressed_size` are independent counters — the sender pre-compresses, then writes the framing prefix, then the compressed bytes. Receivers stream the frame: read 16 + 9 bytes, then read exactly `compressed_size - 9` body bytes, then decompress to exactly `uncompressed_size` bytes.
+
+### 9.3 Negotiation
+
+Compression is per-query, not per-connection. The Query packet's `compression: bool` field (§7.7) requests it for that single query's response. The server honours the request and emits compressed Data/Totals/Extremes/Log/ProfileEvents bodies for the lifetime of that query; subsequent queries may differ.
+
+A client that supports compression should typically request it for queries returning large result sets (compression ratio is typically 5-15× on textual data) and skip it for tiny queries (the 25-byte framing overhead dominates).
+
+### 9.4 Implementation status (this client)
+
+Frame encode/decode primitives are implemented in `src/proto/compression.rs` with full unit-test coverage (LZ4, ZSTD, NONE; checksum verification; corruption detection). Connection-level integration — wrapping the inner stream's Block reads/writes when `compression = true` is requested — is **not yet wired up**. Today, setting `with_compression(true)` on QueryOptions sets the flag on the wire but the client cannot consume the resulting compressed responses.
+
+Wiring this in cleanly requires a stream-wrapping layer that intercepts Block boundaries, which is a larger refactor of the I/O path.
 
 ---
 
@@ -2363,6 +2551,32 @@ To convert canonical → wire (or wire → canonical, since the operation is its
 **Fix:** Apply the byte-swap at the encode/decode boundary, not in the in-memory representation. Most client libraries (this one included) expose canonical `Uuid` values to users and confine the swap to a single helper called from the column encoder/decoder.
 
 A natural lurking bug: a "reverse the whole 16 bytes" implementation is wrong (it puts byte 0 where byte 15 belongs, scrambling both halves together). The two halves must be reversed independently.
+
+---
+
+### 11.18 Versioned-type state prefix is per column per query — header blocks emit nothing
+
+**Symptom:** Decoding a `LowCardinality(...)` or `JSON` column from a normal SELECT response consumes too many bytes and the next read picks up garbage interpretable as the start of a fresh Data packet (e.g., `01 00 02 ff ff ff ff 00 ...` which is BlockInfo for a new block, or a column name like `\x17 'CAST(...'`). The decoder's state-prefix read appears to succeed but with nonsense values like `Int64 = -1090921627647`.
+
+**Cause:** Versioned types (`LowCardinality`, `Variant`, `Dynamic`, `JSON`, `Object`) carry their state prefix **once per column per query**, not per block. The server emits the prefix only **before the first block whose row count is greater than zero**. The header block (rows = 0) and any subsequent blocks contain only the per-block payload — no state prefix.
+
+A naive decoder that reads the state prefix on every block double-counts it on the data block, consuming bytes that belong to the next packet's header.
+
+**Wire-level evidence** (probe of `SELECT '{"a":1}'::JSON`):
+- Header Data packet: empty block (rows=0), no JSON column body.
+- Data Data packet: starts with `01 00 00 00 00 00 00 00` (state prefix), then `09 '{...}'` (String with text).
+
+If the decoder reads the state prefix on the header block, it consumes 8 bytes that don't exist — taking it 8 bytes into the next packet.
+
+**Fix (single-block-aware):** treat `rows == 0` as "no state prefix, no per-block data" — return an empty column immediately. This works for:
+- The header block (always rows = 0).
+- Any single-data-block query (the common case for ad-hoc SELECTs and `arrayJoin([...])`-style row generators).
+
+**What this fix does NOT cover:** queries returning multiple data blocks for the same versioned-type column (e.g., large SELECTs from a real table where the server batches results into multiple Data packets). The second+ data block has rows > 0 but no state prefix on the wire — our decoder would re-read the prefix from the per-block metadata bytes and fail.
+
+**Fully correct implementation** requires tracking per-column state across blocks within a query, similar to clickhouse-go's `ReadStatePrefix` / `WriteStatePrefix` lifecycle on the column object. That's a larger refactor of the Block decoder's responsibilities — currently each Block decode constructs fresh Column objects with no memory of previous blocks in the same response.
+
+This pitfall affects every type in §8.4. The same `rows == 0 → skip` workaround is applied identically to `LowCardinality` and `JSON` Tier 1 in this client.
 
 ---
 

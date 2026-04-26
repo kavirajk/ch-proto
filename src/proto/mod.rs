@@ -1,6 +1,7 @@
 pub mod block;
 pub mod client_info;
 pub mod column;
+pub mod compression;
 pub mod exception;
 pub mod external_table;
 pub(crate) mod feature;

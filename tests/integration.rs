@@ -1508,3 +1508,354 @@ fn test_nullable_decimal32() {
         other => panic!("expected Nullable, got {other:?}"),
     }
 }
+
+// =====================================================================
+// Phase 8: Versioned/stateful types (subset)
+// =====================================================================
+
+// -- JSON (Tier 1, String fallback) --
+//
+// The client auto-injects `output_format_native_write_json_as_string=1`
+// so JSON columns always come back as Tier 1 (a state-prefix Int64 = 1
+// followed by N rows of String). See SPEC §8.4.2.1.
+
+#[test]
+fn test_json_tier1_simple() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT '{\"a\":1}'::JSON").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Json(v) => {
+            // Server may re-stringify integers as JSON strings ("1") in this
+            // mode — value is JSON text, so just check it's non-empty and
+            // contains the key.
+            assert_eq!(v.len(), 1);
+            assert!(v[0].contains("\"a\""));
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_json_tier1_multi_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT arrayJoin(['{\"x\":1}'::JSON, '{\"y\":2}'::JSON, '{}'::JSON])")
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Json(v) => {
+            assert_eq!(v.len(), 3);
+            assert!(v[0].contains("\"x\""));
+            assert!(v[1].contains("\"y\""));
+            assert_eq!(v[2], "{}");
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+}
+
+// -- LowCardinality(T) --
+
+#[test]
+fn test_lowcardinality_string_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST('hello' AS LowCardinality(String))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::LowCardinality { dict, keys, .. } => {
+            // Dict has at least 2 entries (placeholder + "hello"); keys has one
+            // entry that indexes to "hello".
+            assert_eq!(keys.len(), 1);
+            match dict.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    let key_idx = keys[0] as usize;
+                    assert_eq!(v[key_idx], "hello");
+                }
+                other => panic!("expected String dict, got {other:?}"),
+            }
+        }
+        other => panic!("expected LowCardinality, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_lowcardinality_multi_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin(['a', 'b', 'a', 'c', 'b'])::LowCardinality(String)",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 5);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::LowCardinality { dict, keys, .. } => {
+            assert_eq!(keys.len(), 5);
+            let dict_strings = match dict.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => v.clone(),
+                other => panic!("expected String dict, got {other:?}"),
+            };
+            // Reconstruct logical values via dict indirection.
+            let logical: Vec<&str> = keys
+                .iter()
+                .map(|&k| dict_strings[k as usize].as_str())
+                .collect();
+            assert_eq!(logical, vec!["a", "b", "a", "c", "b"]);
+        }
+        other => panic!("expected LowCardinality, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_lowcardinality_fixed_string() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST('abc' AS LowCardinality(FixedString(3)))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::LowCardinality { dict, keys, .. } => {
+            assert_eq!(keys.len(), 1);
+            match dict.as_ref() {
+                ch_proto::proto::column::ColumnData::FixedString { n, data } => {
+                    assert_eq!(*n, 3);
+                    assert!(!data.is_empty());
+                }
+                other => panic!("expected FixedString dict, got {other:?}"),
+            }
+        }
+        other => panic!("expected LowCardinality, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_lowcardinality_nullable_inner() {
+    // LC(Nullable(T)) encodes the dict as plain T on the wire — there's no
+    // null-map stream. By convention dict[0] is an empty placeholder and
+    // dict[1] is the null marker. Real values start at dict[2..].
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST('hi' AS LowCardinality(Nullable(String)))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::LowCardinality { dict, keys, .. } => {
+            assert_eq!(keys.len(), 1);
+            match dict.as_ref() {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    // Dict has 3 entries: [empty placeholder, null marker, "hi"].
+                    // Key indexes into "hi" (at index 2).
+                    assert_eq!(v.len(), 3);
+                    assert_eq!(v[2], "hi");
+                    assert_eq!(keys[0], 2);
+                }
+                other => panic!("expected String dict (Nullable wrapper stripped on the wire), got {other:?}"),
+            }
+        }
+        other => panic!("expected LowCardinality, got {other:?}"),
+    }
+}
+
+// =====================================================================
+// Phase 10: INSERT path
+// =====================================================================
+
+use ch_proto::proto::block::{Block as ProtoBlock, BlockInfo};
+use ch_proto::proto::column::{Column, ColumnData, Serialization};
+
+/// Helper: create+drop the named table around `f`.
+fn with_table<F: FnOnce(&mut Connection)>(table: &str, ddl: &str, f: F) {
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let _ = conn.query(&format!("DROP TABLE IF EXISTS {table}"));
+    conn.query(ddl).unwrap();
+    f(&mut conn);
+    let _ = conn.query(&format!("DROP TABLE IF EXISTS {table}"));
+}
+
+#[test]
+fn test_insert_single_block_uint8() {
+    require_server();
+    with_table(
+        "ch_proto_insert_test_u8",
+        "CREATE TABLE ch_proto_insert_test_u8 (id UInt8) Engine=Memory",
+        |conn| {
+            let block = ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                }),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "UInt8".to_string(),
+                    serialization: Serialization::Default,
+                    data: ColumnData::Uint8(vec![10, 20, 30]),
+                }],
+                rows: 3,
+            };
+            conn.insert("INSERT INTO ch_proto_insert_test_u8 VALUES", block).unwrap();
+
+            // Verify by SELECT.
+            let result = conn.query("SELECT id FROM ch_proto_insert_test_u8 ORDER BY id").unwrap();
+            assert_eq!(result.row_count(), 3);
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint8(v) => assert_eq!(v, &vec![10, 20, 30]),
+                other => panic!("expected Uint8, got {other:?}"),
+            }
+        },
+    );
+}
+
+#[test]
+fn test_insert_two_columns() {
+    require_server();
+    with_table(
+        "ch_proto_insert_test_two",
+        "CREATE TABLE ch_proto_insert_test_two (id UInt32, name String) Engine=Memory",
+        |conn| {
+            let block = ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                }),
+                columns: vec![
+                    Column {
+                        name: "id".to_string(),
+                        data_type: "UInt32".to_string(),
+                        serialization: Serialization::Default,
+                        data: ColumnData::Uint32(vec![1, 2, 3]),
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        data_type: "String".to_string(),
+                        serialization: Serialization::Default,
+                        data: ColumnData::String(vec![
+                            "alice".to_string(),
+                            "bob".to_string(),
+                            "carol".to_string(),
+                        ]),
+                    },
+                ],
+                rows: 3,
+            };
+            conn.insert(
+                "INSERT INTO ch_proto_insert_test_two VALUES",
+                block,
+            )
+            .unwrap();
+
+            let result = conn
+                .query("SELECT id, name FROM ch_proto_insert_test_two ORDER BY id")
+                .unwrap();
+            assert_eq!(result.row_count(), 3);
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint32(v) => assert_eq!(v, &vec![1u32, 2, 3]),
+                other => panic!("expected Uint32, got {other:?}"),
+            }
+            match &result.rows[0].columns[1].data {
+                ColumnData::String(v) => assert_eq!(v, &vec!["alice", "bob", "carol"]),
+                other => panic!("expected String, got {other:?}"),
+            }
+        },
+    );
+}
+
+#[test]
+fn test_insert_empty_block() {
+    // A no-op INSERT — no blocks, just the terminator. Server should accept.
+    require_server();
+    with_table(
+        "ch_proto_insert_test_empty",
+        "CREATE TABLE ch_proto_insert_test_empty (id UInt8) Engine=Memory",
+        |conn| {
+            conn.insert_blocks(
+                "INSERT INTO ch_proto_insert_test_empty VALUES",
+                vec![],
+            )
+            .unwrap();
+            let result = conn
+                .query("SELECT count() FROM ch_proto_insert_test_empty")
+                .unwrap();
+            // count() returns UInt64.
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint64(v) => assert_eq!(v[0], 0),
+                other => panic!("expected Uint64, got {other:?}"),
+            }
+        },
+    );
+}
+
+#[test]
+fn test_insert_multiple_blocks() {
+    // Streaming INSERT: push multiple blocks.
+    require_server();
+    with_table(
+        "ch_proto_insert_test_multi",
+        "CREATE TABLE ch_proto_insert_test_multi (id UInt32) Engine=Memory",
+        |conn| {
+            let make_block = |values: Vec<u32>| ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                }),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "UInt32".to_string(),
+                    serialization: Serialization::Default,
+                    data: ColumnData::Uint32(values.clone()),
+                }],
+                rows: values.len(),
+            };
+            conn.insert_blocks(
+                "INSERT INTO ch_proto_insert_test_multi VALUES",
+                vec![make_block(vec![1, 2, 3]), make_block(vec![10, 20, 30])],
+            )
+            .unwrap();
+
+            let result = conn
+                .query("SELECT id FROM ch_proto_insert_test_multi ORDER BY id")
+                .unwrap();
+            assert_eq!(result.row_count(), 6);
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![1u32, 2, 3, 10, 20, 30]);
+                }
+                other => panic!("expected Uint32, got {other:?}"),
+            }
+        },
+    );
+}
+
+#[test]
+fn test_insert_rejects_bad_schema() {
+    // Schema mismatch: INSERT into UInt8 column with String data — server
+    // should respond with Exception.
+    require_server();
+    with_table(
+        "ch_proto_insert_test_bad",
+        "CREATE TABLE ch_proto_insert_test_bad (id UInt8) Engine=Memory",
+        |conn| {
+            let block = ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                }),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "String".to_string(), // wrong!
+                    serialization: Serialization::Default,
+                    data: ColumnData::String(vec!["x".to_string()]),
+                }],
+                rows: 1,
+            };
+            let res = conn.insert("INSERT INTO ch_proto_insert_test_bad VALUES", block);
+            assert!(res.is_err());
+        },
+    );
+}

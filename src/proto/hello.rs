@@ -43,6 +43,7 @@ impl ClientHello {
 }
 
 // Fields are ordered to match wire encoding order.
+#[derive(Debug)]
 pub struct ServerHello {
     pub name: String,
     pub version_major: u64,

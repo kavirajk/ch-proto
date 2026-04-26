@@ -16,12 +16,30 @@ use crate::{
         packet::{ClientPacket, ServerPacket, ServerResponse},
         profile::ProfileInfo,
         progress::Progress,
-        query::{Query, Stage},
+        query::{Query, Setting, Stage},
         table_columns::TableColumns,
         wire::{ProtoRead, ProtoWrite},
     },
     query_result::QueryResult,
 };
+
+/// Auto-inject `output_format_native_write_json_as_string=1` so JSON columns
+/// always come back in Tier 1 (String fallback) shape — the only JSON
+/// serialization version this client decodes (see SPEC §8.4.2.1). Skipped if
+/// the user already set this setting explicitly (their value wins).
+fn inject_json_string_setting(mut settings: Vec<Setting>) -> Vec<Setting> {
+    const KEY: &str = "output_format_native_write_json_as_string";
+    if !settings.iter().any(|s| s.key == KEY) {
+        settings.push(Setting {
+            key: KEY.to_string(),
+            value: "1".to_string(),
+            important: false,
+            custom: false,
+            obsolete: false,
+        });
+    }
+    settings
+}
 
 #[derive(Debug)]
 pub struct Connection {
@@ -114,6 +132,15 @@ impl Connection {
 
     pub fn query_with(&mut self, sql: &str, opts: QueryOptions) -> Result<QueryResult> {
         let protocol = self.protocol as u32;
+        self.send_query_and_tables(sql, opts)?;
+        self.read_query_response(protocol)
+    }
+
+    /// Internal: build and send a Query packet + the external tables block,
+    /// followed by the empty-data terminator that signals "no more client
+    /// input" (used for SELECTs and after INSERT body too).
+    fn send_query_and_tables(&mut self, sql: &str, opts: QueryOptions) -> Result<()> {
+        let protocol = self.protocol as u32;
         let query_id = opts
             .query_id
             .clone()
@@ -144,7 +171,7 @@ impl Connection {
                 obsolete_count_participating_replicas: Some(0),
                 count_current_replicas: Some(0),
             },
-            settings: opts.settings,
+            settings: inject_json_string_setting(opts.settings),
             cluster_secret: "".to_string(),
             stage: opts.stage.unwrap_or(Stage::Complete),
             compression: opts.compression.unwrap_or(false),
@@ -155,12 +182,19 @@ impl Connection {
 
         q.encode(&mut self.inner)?;
 
-        // External tables first (if any), then the empty Data marker for end-of-client-data
+        // External tables first (if any), then the empty Data marker that
+        // tells the server "no more external tables".
         for table in &opts.external_tables {
             table.encode(&mut self.inner, protocol)?;
         }
         ExternalTable::encode_empty(&mut self.inner, protocol)?;
         self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Internal: drain the response stream until EndOfStream / Exception,
+    /// returning a populated QueryResult. Used for SELECT-style queries.
+    fn read_query_response(&mut self, _protocol: u32) -> Result<QueryResult> {
 
         let mut result = QueryResult::new();
 
@@ -216,6 +250,109 @@ impl Connection {
         }
 
         Ok(result)
+    }
+
+    /// Execute an INSERT with a single in-memory block of data.
+    ///
+    /// Flow (SPEC §6.5):
+    /// 1. Send `Query("INSERT INTO ... VALUES")`.
+    /// 2. Send the external-tables terminator.
+    /// 3. Read a Data packet from the server — the **schema block** (0 rows,
+    ///    columns describe what the server expects).
+    /// 4. Send the user's data as one or more Data packets.
+    /// 5. Send the empty-block terminator.
+    /// 6. Drain response packets until EndOfStream / Exception.
+    ///
+    /// `block.columns` must match the server's expected column shape (names
+    /// and types). The schema block returned in step 3 is consulted only to
+    /// observe what the server expected; this implementation does not
+    /// auto-translate or reorder columns. Mismatches are surfaced as a
+    /// server-side Exception.
+    pub fn insert(&mut self, sql: &str, block: proto::block::Block) -> Result<()> {
+        self.insert_blocks(sql, vec![block])
+    }
+
+    /// Streaming INSERT: send `blocks` in order, then terminator, then drain
+    /// the response. Empty `blocks` is allowed (just sends a terminator) — the
+    /// server will accept and acknowledge as a no-op insert.
+    pub fn insert_blocks(&mut self, sql: &str, blocks: Vec<proto::block::Block>) -> Result<()> {
+        let protocol = self.protocol as u32;
+        self.send_query_and_tables(sql, QueryOptions::new())?;
+
+        // Step 3: drain metadata packets (TableColumns, Progress, ...) and
+        // wait for the schema Data packet (rows = 0). The server may emit
+        // these intermediate packets in any order before the schema block.
+        loop {
+            match self.read_response()? {
+                ServerResponse::Data(_schema) => {
+                    // Schema received — we don't currently consult it; the
+                    // caller is responsible for matching column shapes.
+                    break;
+                }
+                ServerResponse::Exception(e) => {
+                    return Err(Error::new(
+                        io::ErrorKind::Other,
+                        format!("INSERT setup failed: {e:?}"),
+                    ));
+                }
+                // Ignorable metadata that may precede the schema block.
+                ServerResponse::TableColumns(_)
+                | ServerResponse::Progress(_)
+                | ServerResponse::ProfileInfo(_)
+                | ServerResponse::Log(_)
+                | ServerResponse::ProfileEvents(_) => {}
+                other => {
+                    return Err(Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected schema Data packet from server, got {other:?}"),
+                    ));
+                }
+            }
+        }
+
+        // Step 4: send the user's blocks as Data packets.
+        for block in &blocks {
+            self.inner
+                .write_varuint(proto::packet::ClientPacket::Data as u64)?;
+            // Empty table_name — INSERT data isn't tied to an external table.
+            self.inner.write_string("")?;
+            block.encode(&mut self.inner, protocol)?;
+        }
+
+        // Step 5: empty-block terminator (signals end-of-input).
+        self.inner
+            .write_varuint(proto::packet::ClientPacket::Data as u64)?;
+        self.inner.write_string("")?;
+        proto::block::Block::new().encode(&mut self.inner, protocol)?;
+        self.inner.flush()?;
+
+        // Step 6: drain until EndOfStream / Exception.
+        loop {
+            match self.read_response()? {
+                ServerResponse::EndOfStream => break,
+                ServerResponse::Exception(e) => {
+                    return Err(Error::new(
+                        io::ErrorKind::Other,
+                        format!("INSERT failed: {e:?}"),
+                    ));
+                }
+                // Server may emit Progress / ProfileInfo / Log / etc. between
+                // sending the body and EndOfStream. Drain quietly.
+                ServerResponse::Progress(_)
+                | ServerResponse::ProfileInfo(_)
+                | ServerResponse::Log(_)
+                | ServerResponse::ProfileEvents(_)
+                | ServerResponse::TableColumns(_) => {}
+                other => {
+                    return Err(Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected response during INSERT: {other:?}"),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {

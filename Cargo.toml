@@ -28,3 +28,11 @@ harness = false
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4"] }
 hostname = "0.4"
+# Pure Rust LZ4 — block format (matches ClickHouse compression frame).
+lz4_flex = "0.13"
+# zstd binding. ClickHouse's compression frame for ZSTD is a raw zstd
+# single-frame stream.
+zstd = "0.13"
+# ClickHouse uses CityHash v1.0.2 (NOT modern Google CityHash). This crate
+# is the established Rust binding from the clickhouse-rs ecosystem.
+clickhouse-rs-cityhash-sys = "0.1"

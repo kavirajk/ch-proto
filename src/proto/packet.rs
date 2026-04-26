@@ -79,6 +79,7 @@ impl TryFrom<u8> for ServerPacket {
     }
 }
 
+#[derive(Debug)]
 pub enum ServerResponse {
     Hello(ServerHello),
     Exception(ServerException),
