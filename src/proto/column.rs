@@ -61,6 +61,7 @@ pub enum ColumnData {
         // but still.
         offsets: Vec<u64>,
     },
+    Tuple(Vec<ColumnData>),
 }
 
 impl Column {
@@ -144,6 +145,12 @@ impl ColumnData {
             }
             ColumnData::Nullable { nulls, .. } => nulls.len(),
             ColumnData::Array { offsets, .. } => offsets.len(),
+            ColumnData::Tuple(v) => {
+                // the invariant of all the row length of all the
+                // types in v should be equal and that invariant is maintained
+                // during apppend
+                v.first().map_or(0, |d| d.row_count())
+            }
         }
     }
 
@@ -179,7 +186,10 @@ impl ColumnData {
                             ErrorKind::InvalidInput,
                             format!(
                                 "Array offsets not monotonic: offsets[{}]={} < offsets[{}]={}",
-                                i, offsets[i], i - 1, offsets[i - 1]
+                                i,
+                                offsets[i],
+                                i - 1,
+                                offsets[i - 1]
                             ),
                         ));
                     }
@@ -196,6 +206,20 @@ impl ColumnData {
                     ));
                 }
                 inner.validate()
+            }
+            ColumnData::Tuple(v) => {
+                if !v.windows(2).all(|w| w[0].row_count() == w[1].row_count()) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Tuple invariant broken: not all elements have same number values"),
+                    ));
+                }
+
+                for inner in v {
+                    inner.validate()?;
+                }
+
+                Ok(())
             }
             ColumnData::FixedString { n, data } => {
                 if *n == 0 {
@@ -277,6 +301,11 @@ impl ColumnData {
                     w.write_u64(off)?;
                 }
                 inner.encode(w)?;
+            }
+            ColumnData::Tuple(values) => {
+                for v in values {
+                    v.encode(w)?;
+                }
             }
         }
         Ok(())
@@ -371,6 +400,20 @@ impl ColumnData {
 
                 Ok(ColumnData::Nullable { inner, nulls })
             }
+            "Tuple" => {
+                let inner_dts = parse_tuple_inner_types(data_type)?;
+                let mut dts: Vec<ColumnData> = Vec::with_capacity(inner_dts.len());
+
+                for dt in &inner_dts {
+                    // each columnData is part of one element of Tuple(Vec<ColumnData>) for say
+                    // Tuple(String, Int8, Int32). Each of those element has to have `row` number of
+                    // values
+                    let cd = ColumnData::decode(r, dt, rows)?;
+                    dts.push(cd);
+                }
+
+                Ok(ColumnData::Tuple(dts))
+            }
 
             "Array" => {
                 let inner_dt = parse_composite_inner_type(data_type)?;
@@ -413,6 +456,81 @@ impl ColumnData {
         }
     }
 }
+
+// Pase the list of different types in Tuple(T1, T2,..). It's different than
+// generic composite type with single inner type. Hence different helper.
+// Tuple(Int8, String, Tuple(Int)) will return ["Int8", "String", "Tuple(Int)"].
+fn parse_tuple_inner_types(data_type: &str) -> Result<Vec<String>> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Tuple type string: {data_type}"),
+        )
+    };
+    let begin = data_type.find('(').ok_or_else(err)?;
+    let end = data_type.rfind(')').ok_or_else(err)?;
+    if begin + 1 >= end {
+        return Err(err());
+    }
+
+    let inner = data_type[begin + 1..end].trim().to_string();
+    let dts: Vec<String> = split_with_composite(&inner)?;
+    Ok(dts)
+}
+
+// split the data type considering the composite nested depth.
+// e.g
+// "Int8, Float32, Int64" => ["Int8", "Float32", "Int64"]
+// "Int8, Tuple(Int8, String), Int64" => ["Int8", "Tuple(Int8, String)", "Int64"]
+fn split_with_composite(data_type: &str) -> Result<Vec<String>> {
+    let mut depth = 0;
+    let mut res: Vec<String> = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for (i, c) in data_type.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' => {
+                if depth == 0 && start < end {
+                    res.push(data_type[start..=end].trim().to_string());
+                    start = i + 1;
+                }
+            }
+            _ => {}
+        }
+        end = i;
+    }
+    if depth != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{data_type} string is invalid ClickHouse database"),
+        ));
+    }
+    res.push(data_type[start..=end].trim().to_string());
+    Ok(res)
+}
+#[test]
+fn test_split_depth() {
+    let mut input = "Int8, Int64, Float32";
+    let expected = vec!["Int8", "Int64", "Float32"];
+
+    let got = split_with_composite(input).unwrap();
+    assert_eq!(expected, got);
+
+    input = "Int8, Int64, Tuple(Float32, String), String, Tuple(String, Tuple(Int8, String))";
+    let expected = vec![
+        "Int8",
+        "Int64",
+        "Tuple(Float32, String)",
+        "String",
+        "Tuple(String, Tuple(Int8, String))",
+    ];
+
+    let got = split_with_composite(input).unwrap();
+    assert_eq!(expected, got);
+}
+
 // Parse the `T` in composite types like `Nullable(T)`, `Array(T)`
 // from full type string.
 // NOTE: T can be another ColumnData type. Hence the String return type.
@@ -1241,10 +1359,16 @@ mod tests {
         let mut cursor = Cursor::new(buf.as_slice());
         let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
         match decoded.data {
-            ColumnData::Array { inner, offsets: outer_offsets } => {
+            ColumnData::Array {
+                inner,
+                offsets: outer_offsets,
+            } => {
                 assert_eq!(outer_offsets, vec![1, 1, 3]);
                 match *inner {
-                    ColumnData::Array { inner: inner2, offsets: mid_offsets } => {
+                    ColumnData::Array {
+                        inner: inner2,
+                        offsets: mid_offsets,
+                    } => {
                         assert_eq!(mid_offsets, vec![2, 3, 5]);
                         match *inner2 {
                             ColumnData::Uint32(v) => assert_eq!(v, vec![1, 2, 3, 4, 5]),
@@ -1314,7 +1438,7 @@ mod tests {
         let expected_tail = vec![
             0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[0] = 2
             0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offsets[1] = 3
-            0x05, 0x0A, 0x14,                                // UInt8 values: 5, 10, 20
+            0x05, 0x0A, 0x14, // UInt8 values: 5, 10, 20
         ];
         let tail = &buf[buf.len() - expected_tail.len()..];
         assert_eq!(tail, expected_tail.as_slice());
@@ -1331,7 +1455,10 @@ mod tests {
 
     #[test]
     fn test_row_count_fixed_string() {
-        let c = ColumnData::FixedString { n: 4, data: vec![0; 12] };
+        let c = ColumnData::FixedString {
+            n: 4,
+            data: vec![0; 12],
+        };
         assert_eq!(c.row_count(), 3);
     }
 
@@ -1350,7 +1477,7 @@ mod tests {
         // Array row count is offsets.len(), NOT inner.row_count().
         let c = ColumnData::Array {
             inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4, 5])), // 5 inner values
-            offsets: vec![2, 3, 5],                                    // 3 outer rows
+            offsets: vec![2, 3, 5],                                   // 3 outer rows
         };
         assert_eq!(c.row_count(), 3);
     }
@@ -1396,7 +1523,10 @@ mod tests {
     #[test]
     fn test_validate_rejects_fixed_string_with_bad_length() {
         // n=4, but data has 7 bytes (not a multiple of 4).
-        let c = ColumnData::FixedString { n: 4, data: vec![0; 7] };
+        let c = ColumnData::FixedString {
+            n: 4,
+            data: vec![0; 7],
+        };
         let mut buf = Vec::new();
         let err = c.encode(&mut buf).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
