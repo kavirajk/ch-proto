@@ -208,17 +208,23 @@ impl ColumnData {
                 inner.validate()
             }
             ColumnData::Tuple(v) => {
-                if !v.windows(2).all(|w| w[0].row_count() == w[1].row_count()) {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("Tuple invariant broken: not all elements have same number values"),
-                    ));
+                // All inner element columns must agree on row count, and each
+                // must itself be internally consistent.
+                if let Some(first) = v.first() {
+                    let expected = first.row_count();
+                    for (i, inner) in v.iter().enumerate() {
+                        if inner.row_count() != expected {
+                            return Err(Error::new(
+                                ErrorKind::InvalidInput,
+                                format!(
+                                    "Tuple invariant broken: element {i} row_count={} != element 0 row_count={expected}",
+                                    inner.row_count()
+                                ),
+                            ));
+                        }
+                        inner.validate()?;
+                    }
                 }
-
-                for inner in v {
-                    inner.validate()?;
-                }
-
                 Ok(())
             }
             ColumnData::FixedString { n, data } => {
@@ -510,26 +516,6 @@ fn split_with_composite(data_type: &str) -> Result<Vec<String>> {
     res.push(data_type[start..=end].trim().to_string());
     Ok(res)
 }
-#[test]
-fn test_split_depth() {
-    let mut input = "Int8, Int64, Float32";
-    let expected = vec!["Int8", "Int64", "Float32"];
-
-    let got = split_with_composite(input).unwrap();
-    assert_eq!(expected, got);
-
-    input = "Int8, Int64, Tuple(Float32, String), String, Tuple(String, Tuple(Int8, String))";
-    let expected = vec![
-        "Int8",
-        "Int64",
-        "Tuple(Float32, String)",
-        "String",
-        "Tuple(String, Tuple(Int8, String))",
-    ];
-
-    let got = split_with_composite(input).unwrap();
-    assert_eq!(expected, got);
-}
 
 // Parse the `T` in composite types like `Nullable(T)`, `Array(T)`
 // from full type string.
@@ -645,10 +631,10 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="Tuple(UInt32)" (not yet supported), has_custom=0
+        // Manually encode: name="x", type="Map(String, UInt32)" (not yet supported), has_custom=0
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("Tuple(UInt32)").unwrap();
+        buf.write_string("Map(String, UInt32)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
@@ -1556,5 +1542,315 @@ mod tests {
         let mut buf = Vec::new();
         c.encode(&mut buf).unwrap();
         // No panic, no error.
+    }
+
+    // -- Tuple(...) --
+
+    #[test]
+    fn test_tuple_uint32_string_roundtrip() {
+        // Tuple(UInt32, String) with 3 rows: (10, "a"), (20, "bb"), (30, "ccc")
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(UInt32, String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Uint32(vec![10, 20, 30]),
+                ColumnData::String(vec!["a".to_string(), "bb".to_string(), "ccc".to_string()]),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Tuple(elems) => {
+                assert_eq!(elems.len(), 2);
+                match &elems[0] {
+                    ColumnData::Uint32(v) => assert_eq!(v, &vec![10, 20, 30]),
+                    _ => panic!("expected Uint32 element 0"),
+                }
+                match &elems[1] {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["a", "bb", "ccc"]),
+                    _ => panic!("expected String element 1"),
+                }
+            }
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_zero_rows() {
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(UInt32, String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Uint32(vec![]),
+                ColumnData::String(vec![]),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 0, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Tuple(elems) => {
+                assert_eq!(elems.len(), 2);
+                assert_eq!(elems[0].row_count(), 0);
+                assert_eq!(elems[1].row_count(), 0);
+            }
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_single_element() {
+        // Tuple(Int32) — single-element tuple is legal in ClickHouse.
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(Int32)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![ColumnData::Int32(vec![-1, 0, 1])]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Tuple(elems) => {
+                assert_eq!(elems.len(), 1);
+                match &elems[0] {
+                    ColumnData::Int32(v) => assert_eq!(v, &vec![-1, 0, 1]),
+                    _ => panic!("expected Int32"),
+                }
+            }
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_nested_tuple() {
+        // Tuple(UInt8, Tuple(Int32, String)) with 2 rows.
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(UInt8, Tuple(Int32, String))".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Uint8(vec![1, 2]),
+                ColumnData::Tuple(vec![
+                    ColumnData::Int32(vec![100, 200]),
+                    ColumnData::String(vec!["x".to_string(), "y".to_string()]),
+                ]),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Tuple(elems) => {
+                assert_eq!(elems.len(), 2);
+                match &elems[0] {
+                    ColumnData::Uint8(v) => assert_eq!(v, &vec![1, 2]),
+                    _ => panic!("expected Uint8"),
+                }
+                match &elems[1] {
+                    ColumnData::Tuple(inner) => {
+                        assert_eq!(inner.len(), 2);
+                        match &inner[0] {
+                            ColumnData::Int32(v) => assert_eq!(v, &vec![100, 200]),
+                            _ => panic!("expected Int32"),
+                        }
+                        match &inner[1] {
+                            ColumnData::String(v) => assert_eq!(v, &vec!["x", "y"]),
+                            _ => panic!("expected String"),
+                        }
+                    }
+                    _ => panic!("expected nested Tuple"),
+                }
+            }
+            _ => panic!("expected outer Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_with_array_inner() {
+        // Tuple(Array(UInt32), String) — composite-of-composite.
+        // 2 rows: ([1,2,3], "hi"), ([4], "bye")
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(Array(UInt32), String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Array {
+                    inner: Box::new(ColumnData::Uint32(vec![1, 2, 3, 4])),
+                    offsets: vec![3, 4],
+                },
+                ColumnData::String(vec!["hi".to_string(), "bye".to_string()]),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Tuple(elems) => {
+                assert_eq!(elems.len(), 2);
+                match &elems[0] {
+                    ColumnData::Array { inner, offsets } => {
+                        assert_eq!(offsets, &vec![3u64, 4]);
+                        match inner.as_ref() {
+                            ColumnData::Uint32(v) => assert_eq!(v, &vec![1, 2, 3, 4]),
+                            _ => panic!("expected Uint32 innermost"),
+                        }
+                    }
+                    _ => panic!("expected Array element"),
+                }
+                match &elems[1] {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["hi", "bye"]),
+                    _ => panic!("expected String element"),
+                }
+            }
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_wire_layout() {
+        // Tuple(UInt8, UInt8) with 3 rows: (1,4), (2,5), (3,6).
+        // Wire: per-element streams concatenated — first all UInt8 values for
+        // element 0, then all UInt8 values for element 1. No length prefix.
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(UInt8, UInt8)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Uint8(vec![1, 2, 3]),
+                ColumnData::Uint8(vec![4, 5, 6]),
+            ]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // Last 6 bytes should be: [1,2,3] then [4,5,6].
+        let tail = &buf[buf.len() - 6..];
+        assert_eq!(tail, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    }
+
+    #[test]
+    fn test_tuple_row_count_is_inner_row_count() {
+        // Tuple's row_count must come from inner element columns, not from
+        // the count of element types. (Regression: previously v.len() == 2.)
+        let c = ColumnData::Tuple(vec![
+            ColumnData::Uint32(vec![10, 20, 30, 40, 50]),
+            ColumnData::String(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ]),
+        ]);
+        assert_eq!(c.row_count(), 5);
+    }
+
+    #[test]
+    fn test_tuple_row_count_empty() {
+        // Empty tuple has 0 rows.
+        let c = ColumnData::Tuple(vec![]);
+        assert_eq!(c.row_count(), 0);
+    }
+
+    #[test]
+    fn test_validate_rejects_mismatched_tuple_row_counts() {
+        // First element has 3 rows, second has 2 — invariant broken.
+        let c = ColumnData::Tuple(vec![
+            ColumnData::Uint32(vec![1, 2, 3]),
+            ColumnData::String(vec!["a".to_string(), "b".to_string()]),
+        ]);
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_validate_recurses_into_tuple_inner() {
+        // Outer Tuple row counts match (both 2 outer rows), but the inner
+        // Array offsets are non-monotonic — must be caught by recursion.
+        let c = ColumnData::Tuple(vec![
+            ColumnData::Array {
+                inner: Box::new(ColumnData::Uint32(vec![1, 2, 3])),
+                offsets: vec![3, 1], // non-monotonic
+            },
+            ColumnData::String(vec!["a".to_string(), "b".to_string()]),
+        ]);
+        let mut buf = Vec::new();
+        let err = c.encode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_split_with_composite_flat() {
+        let got = split_with_composite("Int8, Int64, Float32").unwrap();
+        assert_eq!(got, vec!["Int8", "Int64", "Float32"]);
+    }
+
+    #[test]
+    fn test_split_with_composite_nested() {
+        let input =
+            "Int8, Int64, Tuple(Float32, String), String, Tuple(String, Tuple(Int8, String))";
+        let expected = vec![
+            "Int8",
+            "Int64",
+            "Tuple(Float32, String)",
+            "String",
+            "Tuple(String, Tuple(Int8, String))",
+        ];
+        assert_eq!(split_with_composite(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_split_with_composite_single() {
+        // No commas — single piece returned as-is.
+        let got = split_with_composite("Int32").unwrap();
+        assert_eq!(got, vec!["Int32"]);
+    }
+
+    #[test]
+    fn test_split_with_composite_array_inside() {
+        // Comma inside Array(...) must NOT split the outer.
+        // (Today Array takes a single inner type, but the splitter must still
+        // respect depth so Tuple(Array(UInt32), String) and similar work.)
+        let got = split_with_composite("Array(UInt32), String").unwrap();
+        assert_eq!(got, vec!["Array(UInt32)", "String"]);
+    }
+
+    #[test]
+    fn test_split_with_composite_unbalanced_parens() {
+        // Missing close paren — depth ends > 0, must error.
+        assert!(split_with_composite("Tuple(Int8, Int32").is_err());
+    }
+
+    #[test]
+    fn test_parse_tuple_inner_types_basic() {
+        let got = parse_tuple_inner_types("Tuple(Int8, String, UInt32)").unwrap();
+        assert_eq!(got, vec!["Int8", "String", "UInt32"]);
+    }
+
+    #[test]
+    fn test_parse_tuple_inner_types_nested() {
+        let got = parse_tuple_inner_types("Tuple(Tuple(Int8, Int32), String)").unwrap();
+        assert_eq!(got, vec!["Tuple(Int8, Int32)", "String"]);
+    }
+
+    #[test]
+    fn test_parse_tuple_inner_types_invalid() {
+        assert!(parse_tuple_inner_types("Tuple").is_err());
+        assert!(parse_tuple_inner_types("Tuple()").is_err());
     }
 }

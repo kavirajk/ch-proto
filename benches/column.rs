@@ -149,6 +149,84 @@ fn bench_array_nullable(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------- Tuple ----------
+
+fn bench_tuple(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tuple_uint32_string");
+
+    for rows in [10usize, 1_000, 10_000].iter() {
+        let uints: Vec<u32> = (0..*rows as u32).collect();
+        let strings: Vec<String> = (0..*rows).map(|i| format!("v{i}")).collect();
+
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(UInt32, String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Uint32(uints),
+                ColumnData::String(strings),
+            ]),
+        };
+
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let encoded = buf.clone();
+
+        // One "element" per logical row, even though the wire carries N+M values.
+        group.throughput(Throughput::Elements(*rows as u64));
+        group.bench_with_input(BenchmarkId::new("encode", rows), rows, |b, _| {
+            b.iter(|| encode_col(&col, &mut buf))
+        });
+        group.bench_with_input(BenchmarkId::new("decode", rows), rows, |b, n| {
+            b.iter(|| decode_col(&encoded, *n))
+        });
+    }
+
+    group.finish();
+}
+
+// ---------- Nested: Tuple(Array(UInt32), String) ----------
+
+fn bench_tuple_array(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tuple_array_uint32_string");
+
+    for rows in [10usize, 1_000, 10_000].iter() {
+        let avg_len = 10u64;
+        let total_elements = *rows as u64 * avg_len;
+
+        let values: Vec<u32> = (0..total_elements as u32).collect();
+        let offsets: Vec<u64> = (1..=*rows as u64).map(|i| i * avg_len).collect();
+        let strings: Vec<String> = (0..*rows).map(|i| format!("s{i}")).collect();
+
+        let col = Column {
+            name: "t".to_string(),
+            data_type: "Tuple(Array(UInt32), String)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Tuple(vec![
+                ColumnData::Array {
+                    inner: Box::new(ColumnData::Uint32(values)),
+                    offsets,
+                },
+                ColumnData::String(strings),
+            ]),
+        };
+
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let encoded = buf.clone();
+
+        group.throughput(Throughput::Elements(*rows as u64));
+        group.bench_with_input(BenchmarkId::new("encode", rows), rows, |b, _| {
+            b.iter(|| encode_col(&col, &mut buf))
+        });
+        group.bench_with_input(BenchmarkId::new("decode", rows), rows, |b, n| {
+            b.iter(|| decode_col(&encoded, *n))
+        });
+    }
+
+    group.finish();
+}
+
 // ---------- row_count() hot-path ----------
 
 fn bench_row_count(c: &mut Criterion) {
@@ -162,10 +240,15 @@ fn bench_row_count(c: &mut Criterion) {
         inner: Box::new(ColumnData::Uint32((0..100_000u32).collect())),
         offsets: (0..10_000u64).collect(),
     };
+    let tuple = ColumnData::Tuple(vec![
+        ColumnData::Uint32((0..10_000u32).collect()),
+        ColumnData::Uint32((0..10_000u32).collect()),
+    ]);
 
     c.bench_function("row_count_flat", |b| b.iter(|| flat.row_count()));
     c.bench_function("row_count_nullable", |b| b.iter(|| nullable.row_count()));
     c.bench_function("row_count_array", |b| b.iter(|| array.row_count()));
+    c.bench_function("row_count_tuple", |b| b.iter(|| tuple.row_count()));
 }
 
 criterion_group!(
@@ -173,6 +256,8 @@ criterion_group!(
     bench_nullable,
     bench_array,
     bench_array_nullable,
+    bench_tuple,
+    bench_tuple_array,
     bench_row_count,
 );
 criterion_main!(benches);

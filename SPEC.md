@@ -1317,12 +1317,124 @@ Total: 20 bytes.
 - **Forgetting that empty rows produce duplicate offsets.** A row with zero elements does not advance the offset; an offsets stream like `[5, 5, 5]` means three empty rows.
 - **Computing total from `num_rows × avg_len`.** The total element count is `offsets.last()`, not derivable from `num_rows` alone.
 
-#### 8.3.3 Other composite types (not yet specified)
+#### 8.3.3 Tuple(T1, T2, ...)
 
-> **Not yet specified in this document:** `Tuple(T1, T2, ...)`, `Map(K, V)`, `Nested(...)`.
+**Type string:** `Tuple(T1, T2, ..., Tn)` where each `Ti` is any ClickHouse type. Examples: `Tuple(UInt32, String)`, `Tuple(Int32)`, `Tuple(Array(UInt32), String)`, `Tuple(UInt8, Tuple(Int32, String))`.
+
+ClickHouse also supports **named tuples** with the syntax `Tuple(a UInt32, b String)`. The names are metadata only — they do not affect the wire format. (This client treats element names as part of the type string for now and does not expose them; see §11.16.)
+
+**Semantic model:** each row holds a fixed-arity heterogeneous record — exactly one value of `T1`, one of `T2`, …, one of `Tn`. The arity is fixed by the type string; every row has the same shape. Conceptually a Tuple column is *N* parallel columns, one per element type, sharing the same row count.
+
+**Wire layout:** *N* concatenated streams, one per element type, in declaration order:
+
+```
+[stream for T1]    inner type T1's encoding for num_rows values
+[stream for T2]    inner type T2's encoding for num_rows values
+ ...
+[stream for Tn]    inner type Tn's encoding for num_rows values
+```
+
+Each stream is the standard encoding of `Ti` for **`num_rows` values** — the same row count as the outer column. There is no length prefix, no offsets stream, no separators between streams. Decoders rely on knowing `num_rows` from the enclosing Block (§7.11) and the type string from the column header.
+
+**Key invariants:**
+
+1. The Tuple has at least one element (`n >= 1`). ClickHouse rejects empty tuples at type-parse time.
+2. Every element stream encodes exactly `num_rows` values of its declared type.
+3. An empty column (`num_rows == 0`) writes zero bytes — every per-element stream is empty.
+
+There is no decoder validation specific to Tuple — each element decode succeeds or fails on its own. Tuple is a structural container; correctness is delegated to its element types.
+
+**Why per-element streams (rather than per-row interleaving)?**
+
+ClickHouse's columnar in-memory layout stores each tuple element as its own column. The wire format mirrors that layout exactly — element `i`'s on-wire bytes are the same bytes ClickHouse holds in memory for that sub-column. Decoders can demux a Tuple straight into separate columns without reshuffling row-major data.
+
+A row-major encoding (`row0_T1 row0_T2 row1_T1 row1_T2 ...`) would require both sides to interleave/de-interleave on every block, and would defeat per-element vectorised reads.
+
+**Nesting: `Tuple(Tuple(...), ...)`.** A nested tuple is just one element whose type is itself a Tuple. The outer Tuple's stream for that element is the inner Tuple's full multi-stream encoding for `num_rows` values. There are no extra layers of bookkeeping.
+
+For `Tuple(UInt8, Tuple(Int32, String))` with 2 rows `(1, (100, 'x'))`, `(2, (200, 'y'))`:
+- Element 0 stream: `Uint8` encoding of `[1, 2]`.
+- Element 1 stream: `Tuple(Int32, String)` encoding of `[(100, 'x'), (200, 'y')]`, which itself decomposes into:
+  - Inner element 0 stream: `Int32` encoding of `[100, 200]`.
+  - Inner element 1 stream: `String` encoding of `["x", "y"]`.
+
+**Composition with Array, Nullable.** `Tuple` composes freely with the other composites. Each element's stream is whatever that element type would encode for `num_rows` values:
+
+- `Tuple(Array(UInt32), String)` with 2 rows `([1,2,3], "hi")`, `([4], "bye")`:
+  - Element 0: `Array(UInt32)` encoding for 2 rows → offsets `[3, 4]` (16 bytes) + values `[1, 2, 3, 4]` (16 bytes).
+  - Element 1: `String` encoding for 2 rows → `[2 'h' 'i'] [3 'b' 'y' 'e']` (8 bytes).
+- `Tuple(Nullable(UInt32), String)` with 1 row `(NULL, 'present')`:
+  - Element 0: `Nullable(UInt32)` for 1 row → null-map `[1]` (1 byte) + placeholder `Uint32` value (4 bytes).
+  - Element 1: `String` for 1 row → `[7 'p' 'r' 'e' 's' 'e' 'n' 't']` (8 bytes).
+
+**Byte-level example — `Tuple(UInt8, UInt8)` with 3 rows `(1,4), (2,5), (3,6)`:**
+
+```
+Element 0 stream (3 × UInt8 = 3 bytes):
+01 02 03
+
+Element 1 stream (3 × UInt8 = 3 bytes):
+04 05 06
+```
+
+Total: 6 bytes of column data. Note the ordering — it is **not** row-major `01 04 02 05 03 06`. Reading the raw bytes back in declaration order yields `[1, 2, 3]` for element 0 and `[4, 5, 6]` for element 1.
+
+Framed as part of the Column wire layout (§7.11):
+
+```
+01 't'                                  Column.name = "t"
+13 'T' 'u' 'p' 'l' 'e' '('              Column.type = "Tuple(UInt8, UInt8)" (19 chars)
+   'U' 'I' 'n' 't' '8' ',' ' '
+   'U' 'I' 'n' 't' '8' ')'
+00                                       has_custom_serialization = 0
+01 02 03                                 element 0: UInt8 stream
+04 05 06                                 element 1: UInt8 stream
+```
+
+Total column bytes on the wire: 28.
+
+**Byte-level example — `Tuple(UInt32, String)` with 2 rows `(10, "a")`, `(20, "bb")`:**
+
+```
+Element 0 stream (2 × UInt32 LE = 8 bytes):
+0A 00 00 00                  10
+14 00 00 00                  20
+
+Element 1 stream (2 strings, 5 bytes total):
+01 'a'                       "a"
+02 'b' 'b'                   "bb"
+```
+
+Total: 13 bytes of column data.
+
+**Decoder algorithm:**
+
+1. Parse the type string to extract element types `T1, T2, ..., Tn`. **Do not split naively on `,`** — element types may themselves contain commas inside parentheses (`Tuple(Int32, String)` as an element, or `Map(String, UInt32)`). Use a depth-aware scanner: increment on `(`, decrement on `)`, split only when depth `== 0`. Reject if depth doesn't end at `0` (unbalanced parens).
+2. For each `Ti` in order, recursively decode `num_rows` values of type `Ti`.
+3. Return the *N*-element vector of decoded element columns.
+
+**Encoder algorithm:**
+
+1. Verify all element columns have the same row count.
+2. For each element column in declaration order, write its standard encoding for `num_rows` values.
+
+No length prefix, no element separator — bytes are written end-to-end and the receiver demuxes using the type string.
+
+**Invariant when constructing in memory:** every element column has the same `row_count()`, and that common value is the Tuple column's logical row count. Implementations must validate this at encode time and recurse into each element to validate nested invariants (see §11.16).
+
+**Common mistakes:**
+
+- **Splitting the type string naively on commas.** `Tuple(Tuple(Int8, Int32), String)` contains commas at multiple paren depths. A naive `split(",")` produces the garbage list `["Tuple(Int8", "Int32)", "String"]`. Use depth-aware splitting.
+- **Encoding row-major.** Writing `(row0_T1, row0_T2, row1_T1, ...)` instead of `(all T1 values, all T2 values)` corrupts the stream. The values stream for Tuple is element-major.
+- **Treating the inner element vector length as `row_count`.** `ColumnData::Tuple(Vec<...>)` holds *N* element columns; `vec.len()` is *N* (the arity), not the row count. The row count lives inside each element.
+- **Skipping recursion in `validate()`.** Checking that all element row counts agree is necessary but not sufficient — a `Tuple(Array(...), ...)` whose Array has non-monotonic offsets must also be rejected before encode. Recurse into each element.
+- **Using `decode(r, dt, 1)` for inner elements.** Each element's stream contains `num_rows` values, not 1 — pass the outer `num_rows` down unchanged.
+
+#### 8.3.4 Other composite types (not yet specified)
+
+> **Not yet specified in this document:** `Map(K, V)`, `Nested(...)`.
 >
 > Planned wire format sketches (to be fleshed out):
-> - **`Tuple(T1, T2, ...)`** — one stream per element type, each encoding `num_rows` values of its type.
 > - **`Map(K, V)`** — equivalent to `Array(Tuple(K, V))`; shares `Array`'s offsets stream + a paired `Tuple(K, V)` values stream.
 > - **`Nested(name1 T1, ...)`** — syntactic sugar that expands to several parallel `Array(T_i)` columns in the block's column list.
 
@@ -1695,6 +1807,67 @@ For example, declaring the client's max version as `Feature::ADDENDUM.version()`
 **Fix:** The client's declared `protocol_version` in ClientHello (§7.1) must be at least the maximum version of any feature the client wants to use. In practice, declare the highest version supported by the implementation (i.e., the "Status" line of this spec) and let version negotiation pick the actual working version.
 
 This is a **silent failure mode**: no error is emitted during encoding, and the server often accepts the malformed packet and simply executes the query without the expected feature data. Hard to debug without diffing against known-good packet captures.
+
+---
+
+### 11.16 Tuple parsing requires depth-aware comma splitting; row count comes from inner elements
+
+**Symptom — type parsing:** A `Tuple(Tuple(Int8, Int32), String)` decode fails with a cryptic "unknown type" error, or a `Tuple(Map(String, UInt32))` blows up at the inner Map decode. The decoder believes the element types are fragments like `"Tuple(Int8"` or `"Map(String"` because the type string was split on every comma.
+
+**Cause:** Unlike `Nullable(T)` and `Array(T)`, which have a single inner type that can be extracted with `find('(')` / `rfind(')')`, `Tuple(...)` carries *N* element types separated by `,`. A naive `inner.split(',')` does not know that some commas live inside nested parentheses (other Tuples, Maps, parameterised DateTime, etc.) and splits in the wrong places.
+
+**Fix:** Split with a depth counter. Walk the inner string char by char; track depth (`+1` on `(`, `-1` on `)`); only split when depth `== 0`. Reject the type string if depth doesn't end at `0` (unbalanced parens).
+
+```rust
+fn split_with_composite(s: &str) -> Result<Vec<String>> {
+    let mut depth = 0i32;
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 { return Err(/* unbalanced */); }
+    out.push(s[start..].trim().to_string());
+    Ok(out)
+}
+```
+
+The same pattern applies the moment any other multi-arg type (`Map(K, V)`, `Variant(T1, T2, ...)`, named tuple element lists) lands in the decoder.
+
+**Symptom — row counting:** Validation passes when it shouldn't, encodes produce malformed streams, or `Array(Tuple(...))` fails at the outer Array's invariant check (`inner.row_count() != offsets.last()`) for a tuple that's actually consistent.
+
+**Cause:** A Tuple's `ColumnData` is most naturally modeled as `Tuple(Vec<ColumnData>)` — a vector of *N* element columns. The temptation is to make `row_count()` return `vec.len()`. But `vec.len()` is the **arity** (number of element types), not the row count. Element columns are *parallel*; the row count is the row count of any one of them.
+
+**Fix:** Implement `row_count()` for Tuple as `vec.first().map_or(0, |c| c.row_count())`. Validate at encode time that all elements agree on row count (and recurse into each to catch nested invariants):
+
+```rust
+ColumnData::Tuple(v) => {
+    if let Some(first) = v.first() {
+        let expected = first.row_count();
+        for (i, inner) in v.iter().enumerate() {
+            if inner.row_count() != expected {
+                return Err(/* element i diverges from element 0 */);
+            }
+            inner.validate()?;       // recurse — catches nested Array offsets, etc.
+        }
+    }
+    Ok(())
+}
+```
+
+**Symptom — decoding inner streams:** A multi-row Tuple decodes only the first row's worth of data per element, then either errors out reading past the buffer or produces nonsense for subsequent rows.
+
+**Cause:** Calling `ColumnData::decode(r, element_type, 1)` for each element treats the wire as one value per element rather than `num_rows` values. Tuple's wire format is per-element streams of `num_rows` values each (§8.3.3); the outer `num_rows` must be passed through unchanged.
+
+**Fix:** `ColumnData::decode(r, element_type, rows)` — same `rows` for every element.
 
 ---
 

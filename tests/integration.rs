@@ -611,3 +611,172 @@ fn test_array_of_nullable() {
         other => panic!("expected Array, got {other:?}"),
     }
 }
+
+// -- Tuple(...) --
+
+#[test]
+fn test_tuple_uint32_string_single_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Single-row Tuple(UInt32, String): (42, 'hi')
+    let result = conn
+        .query("SELECT (42, 'hi')::Tuple(UInt32, String)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Tuple(elems) => {
+            assert_eq!(elems.len(), 2);
+            match &elems[0] {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![42u32]);
+                }
+                other => panic!("expected Uint32 element 0, got {other:?}"),
+            }
+            match &elems[1] {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["hi".to_string()]);
+                }
+                other => panic!("expected String element 1, got {other:?}"),
+            }
+        }
+        other => panic!("expected Tuple, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tuple_multi_row() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Three rows of Tuple(UInt32, String): (10,'a'), (20,'bb'), (30,'ccc')
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                (10, 'a')::Tuple(UInt32, String), \
+                (20, 'bb')::Tuple(UInt32, String), \
+                (30, 'ccc')::Tuple(UInt32, String)\
+             ])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Tuple(elems) => {
+            assert_eq!(elems.len(), 2);
+            match &elems[0] {
+                ch_proto::proto::column::ColumnData::Uint32(v) => {
+                    assert_eq!(v, &vec![10u32, 20, 30]);
+                }
+                other => panic!("expected Uint32 element 0, got {other:?}"),
+            }
+            match &elems[1] {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["a".to_string(), "bb".to_string(), "ccc".to_string()]);
+                }
+                other => panic!("expected String element 1, got {other:?}"),
+            }
+        }
+        other => panic!("expected Tuple, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tuple_nested() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Tuple(UInt8, Tuple(Int32, String)) single row: (1, (100, 'x'))
+    let result = conn
+        .query("SELECT (1, (100, 'x'))::Tuple(UInt8, Tuple(Int32, String))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Tuple(elems) => {
+            assert_eq!(elems.len(), 2);
+            match &elems[0] {
+                ch_proto::proto::column::ColumnData::Uint8(v) => assert_eq!(v, &vec![1u8]),
+                other => panic!("expected Uint8 element 0, got {other:?}"),
+            }
+            match &elems[1] {
+                ch_proto::proto::column::ColumnData::Tuple(inner) => {
+                    assert_eq!(inner.len(), 2);
+                    match &inner[0] {
+                        ch_proto::proto::column::ColumnData::Int32(v) => {
+                            assert_eq!(v, &vec![100i32]);
+                        }
+                        other => panic!("expected Int32, got {other:?}"),
+                    }
+                    match &inner[1] {
+                        ch_proto::proto::column::ColumnData::String(v) => {
+                            assert_eq!(v, &vec!["x".to_string()]);
+                        }
+                        other => panic!("expected String, got {other:?}"),
+                    }
+                }
+                other => panic!("expected nested Tuple, got {other:?}"),
+            }
+        }
+        other => panic!("expected outer Tuple, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tuple_with_array_inner() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Tuple(Array(UInt32), String) single row: ([1,2,3], 'hello')
+    let result = conn
+        .query("SELECT ([1, 2, 3], 'hello')::Tuple(Array(UInt32), String)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Tuple(elems) => {
+            assert_eq!(elems.len(), 2);
+            match &elems[0] {
+                ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+                    assert_eq!(offsets, &vec![3u64]);
+                    match inner.as_ref() {
+                        ch_proto::proto::column::ColumnData::Uint32(v) => {
+                            assert_eq!(v, &vec![1u32, 2, 3]);
+                        }
+                        other => panic!("expected Uint32 innermost, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Array element 0, got {other:?}"),
+            }
+            match &elems[1] {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["hello".to_string()]);
+                }
+                other => panic!("expected String element 1, got {other:?}"),
+            }
+        }
+        other => panic!("expected Tuple, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_tuple_with_nullable_inner() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // Tuple(Nullable(UInt32), String) single row: (NULL, 'present')
+    let result = conn
+        .query("SELECT (CAST(NULL AS Nullable(UInt32)), 'present')::Tuple(Nullable(UInt32), String)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Tuple(elems) => {
+            assert_eq!(elems.len(), 2);
+            match &elems[0] {
+                ch_proto::proto::column::ColumnData::Nullable { nulls, .. } => {
+                    assert_eq!(nulls, &vec![1u8]);
+                }
+                other => panic!("expected Nullable element 0, got {other:?}"),
+            }
+            match &elems[1] {
+                ch_proto::proto::column::ColumnData::String(v) => {
+                    assert_eq!(v, &vec!["present".to_string()]);
+                }
+                other => panic!("expected String element 1, got {other:?}"),
+            }
+        }
+        other => panic!("expected Tuple, got {other:?}"),
+    }
+}
