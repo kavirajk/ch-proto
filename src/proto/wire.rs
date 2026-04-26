@@ -58,12 +58,37 @@ pub trait ProtoWrite: Write {
         Ok(())
     }
 
+    fn write_u128(&mut self, x: u128) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_i16(&mut self, x: i16) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
     fn write_i32(&mut self, x: i32) -> io::Result<()> {
         let _ = self.write(&x.to_le_bytes())?;
         Ok(())
     }
 
     fn write_i64(&mut self, x: i64) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_i128(&mut self, x: i128) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_f32(&mut self, x: f32) -> io::Result<()> {
+        let _ = self.write(&x.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn write_f64(&mut self, x: f64) -> io::Result<()> {
         let _ = self.write(&x.to_le_bytes())?;
         Ok(())
     }
@@ -136,23 +161,49 @@ pub trait ProtoRead: Read {
     fn read_u64(&mut self) -> io::Result<u64> {
         let mut buf = [0; 8];
         self.read_exact(&mut buf)?;
-        Ok(u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]))
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_u128(&mut self) -> io::Result<u128> {
+        let mut buf = [0; 16];
+        self.read_exact(&mut buf)?;
+        Ok(u128::from_le_bytes(buf))
+    }
+
+    fn read_i16(&mut self) -> io::Result<i16> {
+        let mut buf = [0; 2];
+        self.read_exact(&mut buf)?;
+        Ok(i16::from_le_bytes(buf))
     }
 
     fn read_i32(&mut self) -> io::Result<i32> {
         let mut buf = [0; 4];
         self.read_exact(&mut buf)?;
-        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+        Ok(i32::from_le_bytes(buf))
     }
 
     fn read_i64(&mut self) -> io::Result<i64> {
         let mut buf = [0; 8];
         self.read_exact(&mut buf)?;
-        Ok(i64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]))
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    fn read_i128(&mut self) -> io::Result<i128> {
+        let mut buf = [0; 16];
+        self.read_exact(&mut buf)?;
+        Ok(i128::from_le_bytes(buf))
+    }
+
+    fn read_f32(&mut self) -> io::Result<f32> {
+        let mut buf = [0; 4];
+        self.read_exact(&mut buf)?;
+        Ok(f32::from_le_bytes(buf))
+    }
+
+    fn read_f64(&mut self) -> io::Result<f64> {
+        let mut buf = [0; 8];
+        self.read_exact(&mut buf)?;
+        Ok(f64::from_le_bytes(buf))
     }
 
     fn read_bool(&mut self) -> io::Result<bool> {

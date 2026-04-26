@@ -1110,3 +1110,401 @@ fn test_map_complex_value_array() {
         other => panic!("expected Map, got {other:?}"),
     }
 }
+
+// =====================================================================
+// Phase 7: fixed-width and parameterized types
+// =====================================================================
+
+// -- Int16 / Float32 / Float64 / Bool --
+
+#[test]
+fn test_int16_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toInt16(-32768)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Int16(v) => assert_eq!(v, &vec![-32768i16]),
+        other => panic!("expected Int16, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_float32_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toFloat32(1.5)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Float32(v) => assert_eq!(v, &vec![1.5f32]),
+        other => panic!("expected Float32, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_float64_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toFloat64(1.5)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Float64(v) => assert_eq!(v, &vec![1.5f64]),
+        other => panic!("expected Float64, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_bool_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT arrayJoin([true, false, true])").unwrap();
+    assert_eq!(result.row_count(), 3);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Bool(v) => {
+            assert_eq!(v, &vec![true, false, true]);
+        }
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
+// -- Date / Date32 --
+
+#[test]
+fn test_date_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 2024-01-15 = 19737 days since 1970-01-01.
+    let result = conn.query("SELECT toDate('2024-01-15')").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Date(v) => assert_eq!(v, &vec![19737u16]),
+        other => panic!("expected Date, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_date32_select_pre_epoch() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 1900-01-01 = -25567 days since 1970-01-01.
+    let result = conn.query("SELECT toDate32('1900-01-01')").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Date32(v) => assert_eq!(v, &vec![-25567i32]),
+        other => panic!("expected Date32, got {other:?}"),
+    }
+}
+
+// -- DateTime64 --
+
+#[test]
+fn test_datetime64_scale_3_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toDateTime64('2024-01-15 12:30:45.123', 3, 'UTC')")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::DateTime64 { scale, values } => {
+            assert_eq!(*scale, 3);
+            assert_eq!(values, &vec![1705321845123i64]);
+        }
+        other => panic!("expected DateTime64, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_datetime64_scale_0_no_tz() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toDateTime64('2024-01-15 12:30:45', 0)")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::DateTime64 { scale, values } => {
+            assert_eq!(*scale, 0);
+            assert_eq!(values, &vec![1705321845i64]);
+        }
+        other => panic!("expected DateTime64, got {other:?}"),
+    }
+}
+
+// -- UUID --
+
+#[test]
+fn test_uuid_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toUUID('550e8400-e29b-41d4-a716-446655440000')")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Uuid(v) => {
+            let expected =
+                uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+            assert_eq!(v, &vec![expected]);
+        }
+        other => panic!("expected UUID, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_uuid_zero() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toUUID('00000000-0000-0000-0000-000000000000')")
+        .unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Uuid(v) => {
+            assert_eq!(v, &vec![uuid::Uuid::nil()]);
+        }
+        other => panic!("expected UUID, got {other:?}"),
+    }
+}
+
+// -- IPv4 / IPv6 --
+
+#[test]
+fn test_ipv4_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toIPv4('192.168.1.10')").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Ipv4(v) => {
+            // 192.168.1.10 as u32 in network/canonical order.
+            assert_eq!(v, &vec![0xC0A8010Au32]);
+        }
+        other => panic!("expected IPv4, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ipv6_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toIPv6('2001:db8::1')").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Ipv6(v) => {
+            assert_eq!(v.len(), 1);
+            // 2001:db8::1 in network byte order.
+            let mut expected = [0u8; 16];
+            expected[0] = 0x20;
+            expected[1] = 0x01;
+            expected[2] = 0x0D;
+            expected[3] = 0xB8;
+            expected[15] = 0x01;
+            assert_eq!(v[0], expected);
+        }
+        other => panic!("expected IPv6, got {other:?}"),
+    }
+}
+
+// -- Enum16 --
+
+#[test]
+fn test_enum16_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT CAST(30000 AS Enum16('a' = 1, 'b' = 30000))")
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Enum16(v) => assert_eq!(v, &vec![30000i16]),
+        other => panic!("expected Enum16, got {other:?}"),
+    }
+}
+
+// -- Decimal --
+
+#[test]
+fn test_decimal32_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    // 123.4567 with scale 4 → underlying 1234567.
+    let result = conn.query("SELECT toDecimal32('123.4567', 4)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Decimal32 { scale, values } => {
+            assert_eq!(*scale, 4);
+            assert_eq!(values, &vec![1234567i32]);
+        }
+        other => panic!("expected Decimal32, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decimal64_select_negative() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toDecimal64('-1.5', 1)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Decimal64 { scale, values } => {
+            assert_eq!(*scale, 1);
+            assert_eq!(values, &vec![-15i64]);
+        }
+        other => panic!("expected Decimal64, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decimal128_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toDecimal128('123.4567', 4)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Decimal128 { scale, values } => {
+            assert_eq!(*scale, 4);
+            assert_eq!(values, &vec![1234567i128]);
+        }
+        other => panic!("expected Decimal128, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decimal256_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toDecimal256('123.4567', 4)").unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Decimal256 { scale, values } => {
+            assert_eq!(*scale, 4);
+            assert_eq!(values.len(), 1);
+            // 1234567 little-endian in the first 4 bytes, rest zero.
+            let mut expected = [0u8; 32];
+            expected[0] = 0x87;
+            expected[1] = 0xD6;
+            expected[2] = 0x12;
+            assert_eq!(values[0], expected);
+        }
+        other => panic!("expected Decimal256, got {other:?}"),
+    }
+}
+
+// -- Int128 / UInt128 / Int256 / UInt256 --
+
+#[test]
+fn test_int128_max() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toInt128('170141183460469231731687303715884105727')")
+        .unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Int128(v) => {
+            assert_eq!(v, &vec![i128::MAX]);
+        }
+        other => panic!("expected Int128, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_uint128_max() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query("SELECT toUInt128('340282366920938463463374607431768211455')")
+        .unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Uint128(v) => assert_eq!(v, &vec![u128::MAX]),
+        other => panic!("expected UInt128, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_int256_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toInt256('123')").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Int256(v) => {
+            let mut expected = [0u8; 32];
+            expected[0] = 0x7B;
+            assert_eq!(v, &vec![expected]);
+        }
+        other => panic!("expected Int256, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_uint256_select() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT toUInt256('123')").unwrap();
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Uint256(v) => {
+            let mut expected = [0u8; 32];
+            expected[0] = 0x7B;
+            assert_eq!(v, &vec![expected]);
+        }
+        other => panic!("expected UInt256, got {other:?}"),
+    }
+}
+
+// -- Composability with Phase 7 types --
+
+#[test]
+fn test_array_of_uuid() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT [\
+                toUUID('550e8400-e29b-41d4-a716-446655440000'), \
+                toUUID('00000000-0000-0000-0000-000000000000')\
+             ]",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Array { inner, offsets } => {
+            assert_eq!(offsets, &vec![2u64]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Uuid(v) => {
+                    let u =
+                        uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+                    assert_eq!(v, &vec![u, uuid::Uuid::nil()]);
+                }
+                other => panic!("expected UUID inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullable_decimal32() {
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                CAST(toDecimal32('1.23', 2) AS Nullable(Decimal(9, 2))), \
+                CAST(NULL AS Nullable(Decimal(9, 2)))\
+             ])",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 2);
+    match &result.rows[0].columns[0].data {
+        ch_proto::proto::column::ColumnData::Nullable { inner, nulls } => {
+            assert_eq!(nulls, &vec![0u8, 1]);
+            match inner.as_ref() {
+                ch_proto::proto::column::ColumnData::Decimal32 { scale, values } => {
+                    assert_eq!(*scale, 2);
+                    assert_eq!(values[0], 123);
+                }
+                other => panic!("expected Decimal32 inner, got {other:?}"),
+            }
+        }
+        other => panic!("expected Nullable, got {other:?}"),
+    }
+}

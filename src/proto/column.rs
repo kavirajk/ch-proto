@@ -1,4 +1,5 @@
 use std::io::{Error, ErrorKind, Result};
+use uuid::Uuid;
 
 use super::{
     feature::Feature,
@@ -62,6 +63,58 @@ pub enum ColumnData {
         offsets: Vec<u64>,
     },
     Tuple(Vec<ColumnData>),
+    Int16(Vec<i16>),
+    /// IEEE 754 single-precision, 4 bytes LE.
+    Float32(Vec<f32>),
+    /// IEEE 754 double-precision, 8 bytes LE.
+    Float64(Vec<f64>),
+    /// `Bool` is wire-compatible with `UInt8` (1 byte, 0/1) but the type
+    /// string is literally `Bool` — kept as a distinct variant so the type
+    /// string round-trips correctly.
+    Bool(Vec<bool>),
+    /// `Date`: UInt16 LE days since `1970-01-01`.
+    Date(Vec<u16>),
+    /// `Date32`: Int32 LE days since `1970-01-01`. Negative for dates
+    /// before the epoch.
+    Date32(Vec<i32>),
+    /// `DateTime64(scale)` (or `DateTime64(scale, 'TZ')`): Int64 LE ticks
+    /// at the given scale. Scale `0` = seconds, `3` = ms, `6` = µs, `9` = ns.
+    /// Timezone (if any) is preserved on the type string but not in this
+    /// in-memory shape — it affects display only, not the integer value.
+    DateTime64 {
+        scale: u8,
+        values: Vec<i64>,
+    },
+    /// `UUID`: 16 bytes on the wire as **two byte-swapped LE UInt64 halves**.
+    /// We expose canonical [`Uuid`] values; the byte-swap is applied at the
+    /// encode/decode boundary (see SPEC §11.17).
+    Uuid(Vec<Uuid>),
+    /// `IPv4`: 4 bytes LE. The wire bytes are the canonical 32-bit IPv4
+    /// integer in little-endian — i.e., the network-order bytes reversed.
+    /// Stored as `u32` here; presentation as `a.b.c.d` is the caller's job.
+    Ipv4(Vec<u32>),
+    /// `IPv6`: 16 bytes verbatim in network byte order. Stored as `[u8; 16]`
+    /// — same byte order as `std::net::Ipv6Addr::octets()`.
+    Ipv6(Vec<[u8; 16]>),
+    /// `Enum16` is wire-compatible with `Int16`. Variant labels live in the
+    /// type string, byte layout is Int16 LE.
+    Enum16(Vec<i16>),
+    /// `Decimal(P, S)`. Width is implied by precision: P ≤ 9 → 4B, ≤ 18 → 8B,
+    /// ≤ 38 → 16B, ≤ 76 → 32B. Stored here as the underlying signed integer
+    /// in the matching width; scale is metadata for the caller.
+    Decimal32 { scale: u8, values: Vec<i32> },
+    Decimal64 { scale: u8, values: Vec<i64> },
+    Decimal128 { scale: u8, values: Vec<i128> },
+    /// 256-bit decimal — Rust has no `i256`, so we keep raw 32-byte LE
+    /// two's-complement bytes. Sign interpretation is up to the caller.
+    Decimal256 { scale: u8, values: Vec<[u8; 32]> },
+    Int128(Vec<i128>),
+    Uint128(Vec<u128>),
+    /// 256-bit signed integer, raw 32-byte LE two's-complement bytes.
+    /// Stored as raw bytes because Rust has no native `i256`.
+    Int256(Vec<[u8; 32]>),
+    /// 256-bit unsigned integer, raw 32-byte LE bytes.
+    Uint256(Vec<[u8; 32]>),
     /// `Map(K, V)`: each row holds a variable-length sequence of key-value
     /// pairs. Wire format is identical to `Array(Tuple(K, V))`:
     ///   - `offsets` × num_rows UInt64 LE
@@ -180,6 +233,25 @@ impl ColumnData {
             }
             ColumnData::Map { offsets, .. } => offsets.len(),
             ColumnData::Nested { offsets, .. } => offsets.len(),
+            ColumnData::Int16(v) => v.len(),
+            ColumnData::Float32(v) => v.len(),
+            ColumnData::Float64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::Date(v) => v.len(),
+            ColumnData::Date32(v) => v.len(),
+            ColumnData::DateTime64 { values, .. } => values.len(),
+            ColumnData::Uuid(v) => v.len(),
+            ColumnData::Ipv4(v) => v.len(),
+            ColumnData::Ipv6(v) => v.len(),
+            ColumnData::Enum16(v) => v.len(),
+            ColumnData::Decimal32 { values, .. } => values.len(),
+            ColumnData::Decimal64 { values, .. } => values.len(),
+            ColumnData::Decimal128 { values, .. } => values.len(),
+            ColumnData::Decimal256 { values, .. } => values.len(),
+            ColumnData::Int128(v) => v.len(),
+            ColumnData::Uint128(v) => v.len(),
+            ColumnData::Int256(v) => v.len(),
+            ColumnData::Uint256(v) => v.len(),
         }
     }
 
@@ -441,6 +513,102 @@ impl ColumnData {
                     col.encode(w)?;
                 }
             }
+            ColumnData::Int16(v) | ColumnData::Enum16(v) => {
+                for &x in v {
+                    w.write_i16(x)?;
+                }
+            }
+            ColumnData::Float32(v) => {
+                for &x in v {
+                    w.write_f32(x)?;
+                }
+            }
+            ColumnData::Float64(v) => {
+                for &x in v {
+                    w.write_f64(x)?;
+                }
+            }
+            ColumnData::Bool(v) => {
+                for &b in v {
+                    w.write_bool(b)?;
+                }
+            }
+            ColumnData::Date(v) => {
+                for &x in v {
+                    w.write_u16(x)?;
+                }
+            }
+            ColumnData::Date32(v) => {
+                for &x in v {
+                    w.write_i32(x)?;
+                }
+            }
+            ColumnData::DateTime64 { values, .. } => {
+                for &x in values {
+                    w.write_i64(x)?;
+                }
+            }
+            ColumnData::Uuid(v) => {
+                for u in v {
+                    // Wire format: two byte-swapped LE UInt64 halves.
+                    // canonical bytes 0..7 reversed → first 8 wire bytes;
+                    // canonical bytes 8..15 reversed → next 8 wire bytes.
+                    let bytes = u.as_bytes();
+                    let mut hi = [0u8; 8];
+                    hi.copy_from_slice(&bytes[..8]);
+                    hi.reverse();
+                    w.write_all(&hi)?;
+                    let mut lo = [0u8; 8];
+                    lo.copy_from_slice(&bytes[8..]);
+                    lo.reverse();
+                    w.write_all(&lo)?;
+                }
+            }
+            ColumnData::Ipv4(v) => {
+                for &x in v {
+                    w.write_u32(x)?;
+                }
+            }
+            ColumnData::Ipv6(v) => {
+                for octets in v {
+                    w.write_all(octets)?;
+                }
+            }
+            ColumnData::Decimal32 { values, .. } => {
+                for &x in values {
+                    w.write_i32(x)?;
+                }
+            }
+            ColumnData::Decimal64 { values, .. } => {
+                for &x in values {
+                    w.write_i64(x)?;
+                }
+            }
+            ColumnData::Decimal128 { values, .. } => {
+                for &x in values {
+                    w.write_i128(x)?;
+                }
+            }
+            ColumnData::Decimal256 { values, .. } => {
+                for bytes in values {
+                    w.write_all(bytes)?;
+                }
+            }
+            ColumnData::Int128(v) => {
+                for &x in v {
+                    w.write_i128(x)?;
+                }
+            }
+            ColumnData::Uint128(v) => {
+                for &x in v {
+                    w.write_u128(x)?;
+                }
+            }
+            ColumnData::Int256(v) | ColumnData::Uint256(v) => {
+                for bytes in v {
+                    w.write_all(bytes)?;
+                }
+            }
         }
         Ok(())
     }
@@ -485,6 +653,164 @@ impl ColumnData {
                     v.push(r.read_u8()? as i8);
                 }
                 Ok(ColumnData::Int8(v))
+            }
+            // Enum16 is wire-compatible with Int16. We expose Enum16 as its
+            // own variant so the type string round-trips, but the bytes are
+            // identical to Int16. (See SPEC §11.8 / §11.18.)
+            "Int16" | "Enum16" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i16()?);
+                }
+                if base_type == "Enum16" {
+                    Ok(ColumnData::Enum16(v))
+                } else {
+                    Ok(ColumnData::Int16(v))
+                }
+            }
+            "Float32" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_f32()?);
+                }
+                Ok(ColumnData::Float32(v))
+            }
+            "Float64" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_f64()?);
+                }
+                Ok(ColumnData::Float64(v))
+            }
+            "Bool" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_bool()?);
+                }
+                Ok(ColumnData::Bool(v))
+            }
+            "Date" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u16()?);
+                }
+                Ok(ColumnData::Date(v))
+            }
+            "Date32" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i32()?);
+                }
+                Ok(ColumnData::Date32(v))
+            }
+            "DateTime64" => {
+                let scale = parse_datetime64_scale(data_type)?;
+                let mut values = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    values.push(r.read_i64()?);
+                }
+                Ok(ColumnData::DateTime64 { scale, values })
+            }
+            "UUID" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    let mut hi = [0u8; 8];
+                    r.read_exact(&mut hi)?;
+                    hi.reverse();
+                    let mut lo = [0u8; 8];
+                    r.read_exact(&mut lo)?;
+                    lo.reverse();
+                    let mut bytes = [0u8; 16];
+                    bytes[..8].copy_from_slice(&hi);
+                    bytes[8..].copy_from_slice(&lo);
+                    v.push(Uuid::from_bytes(bytes));
+                }
+                Ok(ColumnData::Uuid(v))
+            }
+            "IPv4" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u32()?);
+                }
+                Ok(ColumnData::Ipv4(v))
+            }
+            "IPv6" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    let mut bytes = [0u8; 16];
+                    r.read_exact(&mut bytes)?;
+                    v.push(bytes);
+                }
+                Ok(ColumnData::Ipv6(v))
+            }
+            "Decimal" => {
+                // Decimal(P, S) — width is implied by P (see SPEC §8.1.x).
+                let (precision, scale) = parse_decimal_p_s(data_type)?;
+                match decimal_byte_width(precision)? {
+                    4 => {
+                        let mut values = Vec::with_capacity(rows);
+                        for _ in 0..rows {
+                            values.push(r.read_i32()?);
+                        }
+                        Ok(ColumnData::Decimal32 { scale, values })
+                    }
+                    8 => {
+                        let mut values = Vec::with_capacity(rows);
+                        for _ in 0..rows {
+                            values.push(r.read_i64()?);
+                        }
+                        Ok(ColumnData::Decimal64 { scale, values })
+                    }
+                    16 => {
+                        let mut values = Vec::with_capacity(rows);
+                        for _ in 0..rows {
+                            values.push(r.read_i128()?);
+                        }
+                        Ok(ColumnData::Decimal128 { scale, values })
+                    }
+                    32 => {
+                        let mut values = Vec::with_capacity(rows);
+                        for _ in 0..rows {
+                            let mut bytes = [0u8; 32];
+                            r.read_exact(&mut bytes)?;
+                            values.push(bytes);
+                        }
+                        Ok(ColumnData::Decimal256 { scale, values })
+                    }
+                    _ => unreachable!("decimal_byte_width returns only 4/8/16/32"),
+                }
+            }
+            "Int128" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i128()?);
+                }
+                Ok(ColumnData::Int128(v))
+            }
+            "UInt128" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u128()?);
+                }
+                Ok(ColumnData::Uint128(v))
+            }
+            "Int256" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    let mut bytes = [0u8; 32];
+                    r.read_exact(&mut bytes)?;
+                    v.push(bytes);
+                }
+                Ok(ColumnData::Int256(v))
+            }
+            "UInt256" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    let mut bytes = [0u8; 32];
+                    r.read_exact(&mut bytes)?;
+                    v.push(bytes);
+                }
+                Ok(ColumnData::Uint256(v))
             }
             "Int32" => {
                 let mut v = Vec::with_capacity(rows);
@@ -808,6 +1134,72 @@ fn parse_composite_inner_type(data_type: &str) -> Result<String> {
     }
 
     Ok(data_type[open + 1..close].trim().to_string())
+}
+
+/// Parse the scale `N` from a `DateTime64(N)` or `DateTime64(N, 'TZ')` type
+/// string. Scale is the first comma-separated parameter; it determines the
+/// time unit (0 = seconds, 3 = ms, 6 = µs, 9 = ns).
+fn parse_datetime64_scale(data_type: &str) -> Result<u8> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid DateTime64 type string: {data_type}"),
+        )
+    };
+    let open = data_type.find('(').ok_or_else(err)?;
+    let close = data_type.rfind(')').ok_or_else(err)?;
+    if close <= open + 1 {
+        return Err(err());
+    }
+    let inner = data_type[open + 1..close].trim();
+    // Take the part before the first comma (timezone is optional).
+    let scale_part = inner.split(',').next().unwrap_or(inner).trim();
+    let n: u8 = scale_part.parse().map_err(|_| err())?;
+    if n > 9 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("DateTime64 scale must be 0..=9, got {n}"),
+        ));
+    }
+    Ok(n)
+}
+
+/// Parse `(P, S)` from a `Decimal(P, S)` type string.
+fn parse_decimal_p_s(data_type: &str) -> Result<(u8, u8)> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Decimal type string: {data_type}"),
+        )
+    };
+    let open = data_type.find('(').ok_or_else(err)?;
+    let close = data_type.rfind(')').ok_or_else(err)?;
+    if close <= open + 1 {
+        return Err(err());
+    }
+    let inner = data_type[open + 1..close].trim();
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(err());
+    }
+    let p: u8 = parts[0].parse().map_err(|_| err())?;
+    let s: u8 = parts[1].parse().map_err(|_| err())?;
+    Ok((p, s))
+}
+
+/// Map Decimal precision to underlying integer width in bytes.
+/// Per ClickHouse: P ≤ 9 → 4B, ≤ 18 → 8B, ≤ 38 → 16B, ≤ 76 → 32B.
+fn decimal_byte_width(precision: u8) -> Result<usize> {
+    match precision {
+        1..=9 => Ok(4),
+        10..=18 => Ok(8),
+        19..=38 => Ok(16),
+        39..=76 => Ok(32),
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Decimal precision must be 1..=76, got {precision}"),
+        )),
+    }
 }
 
 /// Parse the `N` in `FixedString(N)` from the full type string.
@@ -2750,5 +3142,782 @@ mod tests {
         assert!(parse_nested_inner_types("Nested()").is_err());
         // No parens at all.
         assert!(parse_nested_inner_types("Nested").is_err());
+    }
+
+    // -- Phase 7: Int16 / Float32 / Float64 / Bool --
+
+    #[test]
+    fn test_int16_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Int16".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Int16(vec![-32768, -1, 0, 1, 32767]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 5, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Int16(v) => assert_eq!(v, vec![-32768, -1, 0, 1, 32767]),
+            _ => panic!("expected Int16"),
+        }
+    }
+
+    #[test]
+    fn test_int16_wire_layout() {
+        // Probe-confirmed: -1 → ff ff (LE i16).
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Int16".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Int16(vec![-1]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 2..];
+        assert_eq!(tail, &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_float32_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Float32".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Float32(vec![1.5, -1.5, 0.0, f32::INFINITY]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Float32(v) => {
+                assert_eq!(v[0], 1.5);
+                assert_eq!(v[1], -1.5);
+                assert_eq!(v[2], 0.0);
+                assert!(v[3].is_infinite() && v[3] > 0.0);
+            }
+            _ => panic!("expected Float32"),
+        }
+    }
+
+    #[test]
+    fn test_float32_wire_layout() {
+        // Probe-confirmed: 1.5 → 00 00 c0 3f (IEEE 754 LE).
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Float32".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Float32(vec![1.5]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(tail, &[0x00, 0x00, 0xC0, 0x3F]);
+    }
+
+    #[test]
+    fn test_float32_nan_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Float32".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Float32(vec![f32::NAN]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Float32(v) => assert!(v[0].is_nan()),
+            _ => panic!("expected Float32"),
+        }
+    }
+
+    #[test]
+    fn test_float64_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Float64".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Float64(vec![1.5, -2.5, 1e100, 0.0]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Float64(v) => {
+                assert_eq!(v, vec![1.5, -2.5, 1e100, 0.0]);
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_float64_wire_layout() {
+        // Probe-confirmed: 1.5 → 00 00 00 00 00 00 f8 3f (IEEE 754 LE).
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Float64".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Float64(vec![1.5]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 8..];
+        assert_eq!(tail, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F]);
+    }
+
+    #[test]
+    fn test_bool_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Bool".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Bool(vec![true, false, true]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Bool(v) => assert_eq!(v, vec![true, false, true]),
+            _ => panic!("expected Bool"),
+        }
+    }
+
+    #[test]
+    fn test_bool_wire_layout() {
+        // Probe-confirmed: [true, false, true] → 01 00 01 (1 byte each).
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Bool".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Bool(vec![true, false, true]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 3..];
+        assert_eq!(tail, &[0x01, 0x00, 0x01]);
+    }
+
+    // -- Phase 7: Date / Date32 --
+
+    #[test]
+    fn test_date_roundtrip() {
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Date".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Date(vec![0, 1, 19737, 65535]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Date(v) => assert_eq!(v, vec![0, 1, 19737, 65535]),
+            _ => panic!("expected Date"),
+        }
+    }
+
+    #[test]
+    fn test_date_wire_layout() {
+        // Probe-confirmed: 1970-01-02 → 1 day → 01 00 (UInt16 LE).
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Date".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Date(vec![1]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 2..];
+        assert_eq!(tail, &[0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_date32_roundtrip() {
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Date32".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Date32(vec![-25567, -1, 0, 19723]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Date32(v) => assert_eq!(v, vec![-25567, -1, 0, 19723]),
+            _ => panic!("expected Date32"),
+        }
+    }
+
+    #[test]
+    fn test_date32_wire_layout() {
+        // Probe-confirmed: 1900-01-01 → -25567 days → 21 9c ff ff (Int32 LE).
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Date32".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Date32(vec![-25567]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(tail, &[0x21, 0x9C, 0xFF, 0xFF]);
+    }
+
+    // -- Phase 7: DateTime64 --
+
+    #[test]
+    fn test_datetime64_scale_3_roundtrip() {
+        // 2024-01-15 12:30:45.123 UTC → 1705321845123 ms.
+        let col = Column {
+            name: "ts".to_string(),
+            data_type: "DateTime64(3, 'UTC')".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::DateTime64 {
+                scale: 3,
+                values: vec![1705321845123],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::DateTime64 { scale, values } => {
+                assert_eq!(scale, 3);
+                assert_eq!(values, vec![1705321845123]);
+            }
+            _ => panic!("expected DateTime64"),
+        }
+    }
+
+    #[test]
+    fn test_datetime64_scale_0_no_tz() {
+        // 2024-01-15 12:30:45 UTC → 1705321845 seconds.
+        let col = Column {
+            name: "ts".to_string(),
+            data_type: "DateTime64(0)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::DateTime64 {
+                scale: 0,
+                values: vec![1705321845],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::DateTime64 { scale, values } => {
+                assert_eq!(scale, 0);
+                assert_eq!(values, vec![1705321845]);
+            }
+            _ => panic!("expected DateTime64"),
+        }
+    }
+
+    #[test]
+    fn test_parse_datetime64_scale() {
+        assert_eq!(parse_datetime64_scale("DateTime64(0)").unwrap(), 0);
+        assert_eq!(parse_datetime64_scale("DateTime64(3)").unwrap(), 3);
+        assert_eq!(parse_datetime64_scale("DateTime64(9)").unwrap(), 9);
+        assert_eq!(
+            parse_datetime64_scale("DateTime64(6, 'America/Los_Angeles')").unwrap(),
+            6
+        );
+        assert_eq!(parse_datetime64_scale("DateTime64( 3 , 'UTC')").unwrap(), 3);
+    }
+
+    #[test]
+    fn test_parse_datetime64_scale_invalid() {
+        assert!(parse_datetime64_scale("DateTime64").is_err());
+        assert!(parse_datetime64_scale("DateTime64()").is_err());
+        assert!(parse_datetime64_scale("DateTime64(10)").is_err()); // out of range
+        assert!(parse_datetime64_scale("DateTime64(abc)").is_err());
+    }
+
+    // -- Phase 7: UUID --
+
+    #[test]
+    fn test_uuid_roundtrip() {
+        let u1 = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let u2 = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
+        let u3 = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let col = Column {
+            name: "u".to_string(),
+            data_type: "UUID".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uuid(vec![u1, u2, u3]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Uuid(v) => assert_eq!(v, vec![u1, u2, u3]),
+            _ => panic!("expected UUID"),
+        }
+    }
+
+    #[test]
+    fn test_uuid_wire_layout_byte_swap() {
+        // Probe-confirmed: 550e8400-e29b-41d4-a716-446655440000 →
+        //   d4 41 9b e2 00 84 0e 55 00 00 44 55 66 44 16 a7
+        // (each 8-byte half byte-reversed from canonical big-endian)
+        let u = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let col = Column {
+            name: "u".to_string(),
+            data_type: "UUID".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uuid(vec![u]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 16..];
+        assert_eq!(
+            tail,
+            &[
+                0xD4, 0x41, 0x9B, 0xE2, 0x00, 0x84, 0x0E, 0x55, // high half byte-reversed
+                0x00, 0x00, 0x44, 0x55, 0x66, 0x44, 0x16, 0xA7, // low half byte-reversed
+            ]
+        );
+    }
+
+    // -- Phase 7: IPv4 / IPv6 --
+
+    #[test]
+    fn test_ipv4_roundtrip() {
+        let col = Column {
+            name: "ip".to_string(),
+            data_type: "IPv4".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Ipv4(vec![0xC0A8010A, 0x7F000001, 0]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Ipv4(v) => assert_eq!(v, vec![0xC0A8010A, 0x7F000001, 0]),
+            _ => panic!("expected IPv4"),
+        }
+    }
+
+    #[test]
+    fn test_ipv4_wire_layout() {
+        // Probe-confirmed: 192.168.1.10 → u32 = 0xC0A8010A → wire bytes
+        // 0a 01 a8 c0 (LE).
+        let col = Column {
+            name: "ip".to_string(),
+            data_type: "IPv4".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Ipv4(vec![0xC0A8010A]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(tail, &[0x0A, 0x01, 0xA8, 0xC0]);
+    }
+
+    #[test]
+    fn test_ipv6_roundtrip() {
+        // 2001:db8::1
+        let mut addr = [0u8; 16];
+        addr[0] = 0x20;
+        addr[1] = 0x01;
+        addr[2] = 0x0D;
+        addr[3] = 0xB8;
+        addr[15] = 0x01;
+        let col = Column {
+            name: "ip".to_string(),
+            data_type: "IPv6".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Ipv6(vec![addr]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Ipv6(v) => assert_eq!(v, vec![addr]),
+            _ => panic!("expected IPv6"),
+        }
+    }
+
+    #[test]
+    fn test_ipv6_wire_layout() {
+        // Probe-confirmed: 2001:db8::1 → 16 bytes verbatim in network order.
+        let mut addr = [0u8; 16];
+        addr[0] = 0x20;
+        addr[1] = 0x01;
+        addr[2] = 0x0D;
+        addr[3] = 0xB8;
+        addr[15] = 0x01;
+        let col = Column {
+            name: "ip".to_string(),
+            data_type: "IPv6".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Ipv6(vec![addr]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 16..];
+        assert_eq!(
+            tail,
+            &[
+                0x20, 0x01, 0x0D, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x01,
+            ]
+        );
+    }
+
+    // -- Phase 7: Enum16 --
+
+    #[test]
+    fn test_enum16_roundtrip() {
+        let col = Column {
+            name: "e".to_string(),
+            data_type: "Enum16('a' = 1, 'b' = 30000)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Enum16(vec![1, 30000, -1]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Enum16(v) => assert_eq!(v, vec![1, 30000, -1]),
+            _ => panic!("expected Enum16"),
+        }
+    }
+
+    #[test]
+    fn test_enum16_wire_layout() {
+        // Probe-confirmed: 30000 → 30 75 (Int16 LE).
+        let col = Column {
+            name: "e".to_string(),
+            data_type: "Enum16('a' = 1, 'b' = 30000)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Enum16(vec![30000]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 2..];
+        assert_eq!(tail, &[0x30, 0x75]);
+    }
+
+    // -- Phase 7: Decimal --
+
+    #[test]
+    fn test_decimal32_roundtrip() {
+        // 123.4567 with scale 4 → 1234567.
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Decimal(9, 4)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Decimal32 {
+                scale: 4,
+                values: vec![1234567, -1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Decimal32 { scale, values } => {
+                assert_eq!(scale, 4);
+                assert_eq!(values, vec![1234567, -1, 0]);
+            }
+            _ => panic!("expected Decimal32"),
+        }
+    }
+
+    #[test]
+    fn test_decimal32_wire_layout() {
+        // Probe-confirmed: 123.4567 with scale 4 → 1234567 → 87 d6 12 00.
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Decimal(9, 4)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Decimal32 {
+                scale: 4,
+                values: vec![1234567],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 4..];
+        assert_eq!(tail, &[0x87, 0xD6, 0x12, 0x00]);
+    }
+
+    #[test]
+    fn test_decimal64_roundtrip_negative() {
+        // -1.5 with scale 1 → -15.
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Decimal(18, 1)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Decimal64 {
+                scale: 1,
+                values: vec![-15],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Decimal64 { scale, values } => {
+                assert_eq!(scale, 1);
+                assert_eq!(values, vec![-15]);
+            }
+            _ => panic!("expected Decimal64"),
+        }
+    }
+
+    #[test]
+    fn test_decimal128_roundtrip() {
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Decimal(38, 4)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Decimal128 {
+                scale: 4,
+                values: vec![1234567],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Decimal128 { scale, values } => {
+                assert_eq!(scale, 4);
+                assert_eq!(values, vec![1234567]);
+            }
+            _ => panic!("expected Decimal128"),
+        }
+    }
+
+    #[test]
+    fn test_decimal256_roundtrip() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x87;
+        bytes[1] = 0xD6;
+        bytes[2] = 0x12;
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Decimal(76, 4)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Decimal256 {
+                scale: 4,
+                values: vec![bytes],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 1, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Decimal256 { scale, values } => {
+                assert_eq!(scale, 4);
+                assert_eq!(values, vec![bytes]);
+            }
+            _ => panic!("expected Decimal256"),
+        }
+    }
+
+    #[test]
+    fn test_parse_decimal_p_s() {
+        assert_eq!(parse_decimal_p_s("Decimal(9, 4)").unwrap(), (9, 4));
+        assert_eq!(parse_decimal_p_s("Decimal(18, 0)").unwrap(), (18, 0));
+        assert_eq!(parse_decimal_p_s("Decimal(76, 38)").unwrap(), (76, 38));
+        assert_eq!(parse_decimal_p_s("Decimal( 38 , 4 )").unwrap(), (38, 4));
+    }
+
+    #[test]
+    fn test_parse_decimal_p_s_invalid() {
+        assert!(parse_decimal_p_s("Decimal").is_err());
+        assert!(parse_decimal_p_s("Decimal()").is_err());
+        assert!(parse_decimal_p_s("Decimal(9)").is_err());
+        assert!(parse_decimal_p_s("Decimal(9, 4, 1)").is_err());
+        assert!(parse_decimal_p_s("Decimal(abc, 4)").is_err());
+    }
+
+    #[test]
+    fn test_decimal_byte_width() {
+        assert_eq!(decimal_byte_width(1).unwrap(), 4);
+        assert_eq!(decimal_byte_width(9).unwrap(), 4);
+        assert_eq!(decimal_byte_width(10).unwrap(), 8);
+        assert_eq!(decimal_byte_width(18).unwrap(), 8);
+        assert_eq!(decimal_byte_width(19).unwrap(), 16);
+        assert_eq!(decimal_byte_width(38).unwrap(), 16);
+        assert_eq!(decimal_byte_width(39).unwrap(), 32);
+        assert_eq!(decimal_byte_width(76).unwrap(), 32);
+        assert!(decimal_byte_width(0).is_err());
+        assert!(decimal_byte_width(77).is_err());
+    }
+
+    // -- Phase 7: Int128 / UInt128 / Int256 / UInt256 --
+
+    #[test]
+    fn test_int128_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Int128".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Int128(vec![i128::MAX, i128::MIN, 0, -1]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Int128(v) => assert_eq!(v, vec![i128::MAX, i128::MIN, 0, -1]),
+            _ => panic!("expected Int128"),
+        }
+    }
+
+    #[test]
+    fn test_int128_wire_layout() {
+        // Probe-confirmed: i128::MAX → ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 7f
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Int128".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Int128(vec![i128::MAX]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let tail = &buf[buf.len() - 16..];
+        let mut expected = [0xFFu8; 16];
+        expected[15] = 0x7F;
+        assert_eq!(tail, &expected);
+    }
+
+    #[test]
+    fn test_uint128_roundtrip() {
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "UInt128".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uint128(vec![u128::MAX, 0, 1]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Uint128(v) => assert_eq!(v, vec![u128::MAX, 0, 1]),
+            _ => panic!("expected UInt128"),
+        }
+    }
+
+    #[test]
+    fn test_int256_roundtrip() {
+        let mut a = [0u8; 32];
+        a[0] = 0x7B; // 123
+        let b = [0xFFu8; 32]; // -1 in two's complement
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Int256".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Int256(vec![a, b]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Int256(v) => assert_eq!(v, vec![a, b]),
+            _ => panic!("expected Int256"),
+        }
+    }
+
+    #[test]
+    fn test_uint256_roundtrip() {
+        let mut a = [0u8; 32];
+        a[0] = 0x7B;
+        let b = [0xFFu8; 32];
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "UInt256".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Uint256(vec![a, b]),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Uint256(v) => assert_eq!(v, vec![a, b]),
+            _ => panic!("expected UInt256"),
+        }
+    }
+
+    // Round-trip composability: Phase 7 types as inner types of composites.
+
+    #[test]
+    fn test_array_of_float64_roundtrip() {
+        let col = Column {
+            name: "a".to_string(),
+            data_type: "Array(Float64)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Array {
+                inner: Box::new(ColumnData::Float64(vec![1.5, -2.5, 3.0, 4.5])),
+                offsets: vec![2, 4],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 2, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Array { inner, offsets } => {
+                assert_eq!(offsets, vec![2, 4]);
+                match *inner {
+                    ColumnData::Float64(v) => assert_eq!(v, vec![1.5, -2.5, 3.0, 4.5]),
+                    _ => panic!("expected Float64 inner"),
+                }
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_uuid_roundtrip() {
+        let u = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let zero = Uuid::nil();
+        let col = Column {
+            name: "u".to_string(),
+            data_type: "Nullable(UUID)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Uuid(vec![u, zero, u])),
+                nulls: vec![0, 1, 0],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![0, 1, 0]);
+                match *inner {
+                    ColumnData::Uuid(v) => assert_eq!(v, vec![u, zero, u]),
+                    _ => panic!("expected Uuid inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
+        }
     }
 }

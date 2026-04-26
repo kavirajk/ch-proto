@@ -934,18 +934,35 @@ All multi-byte integer types are encoded **little-endian**. Signed integers use 
 
 #### Byte layout summary
 
-| Type string    | Bytes per value | Logical value                              | Wire encoding |
-|----------------|-----------------|--------------------------------------------|---------------|
-| `UInt8`        | 1               | Unsigned 8-bit integer                     | Raw byte      |
-| `UInt16`       | 2               | Unsigned 16-bit integer                    | Little-endian |
-| `UInt32`       | 4               | Unsigned 32-bit integer                    | Little-endian |
-| `UInt64`       | 8               | Unsigned 64-bit integer                    | Little-endian |
-| `Int8`         | 1               | Signed 8-bit integer, two's complement     | Raw byte      |
-| `Int32`        | 4               | Signed 32-bit integer, two's complement    | Little-endian |
-| `Int64`        | 8               | Signed 64-bit integer, two's complement    | Little-endian |
-| `DateTime`     | 4               | Unix timestamp in seconds since epoch      | Little-endian UInt32 |
-| `DateTime(tz)` | 4               | Same as `DateTime`; timezone is metadata   | Little-endian UInt32 |
-| `Enum8`        | 1               | Signed 8-bit integer (variant index)       | Raw byte      |
+| Type string             | Bytes per value | Logical value                                   | Wire encoding |
+|-------------------------|-----------------|-------------------------------------------------|---------------|
+| `UInt8`                 | 1               | Unsigned 8-bit integer                          | Raw byte      |
+| `UInt16`                | 2               | Unsigned 16-bit integer                         | Little-endian |
+| `UInt32`                | 4               | Unsigned 32-bit integer                         | Little-endian |
+| `UInt64`                | 8               | Unsigned 64-bit integer                         | Little-endian |
+| `UInt128`               | 16              | Unsigned 128-bit integer                        | Little-endian |
+| `UInt256`               | 32              | Unsigned 256-bit integer                        | Little-endian |
+| `Int8`                  | 1               | Signed 8-bit integer, two's complement          | Raw byte      |
+| `Int16`                 | 2               | Signed 16-bit integer, two's complement         | Little-endian |
+| `Int32`                 | 4               | Signed 32-bit integer, two's complement         | Little-endian |
+| `Int64`                 | 8               | Signed 64-bit integer, two's complement         | Little-endian |
+| `Int128`                | 16              | Signed 128-bit integer, two's complement        | Little-endian |
+| `Int256`                | 32              | Signed 256-bit integer, two's complement        | Little-endian |
+| `Float32`               | 4               | IEEE 754 single-precision                       | Little-endian |
+| `Float64`               | 8               | IEEE 754 double-precision                       | Little-endian |
+| `Bool`                  | 1               | `0x00` = false, `0x01` = true                   | Raw byte      |
+| `Date`                  | 2               | Days since `1970-01-01`                         | Little-endian UInt16 |
+| `Date32`                | 4               | Days since `1970-01-01` (signed; pre-1970 ok)   | Little-endian Int32 |
+| `DateTime`              | 4               | Unix timestamp in seconds since epoch           | Little-endian UInt32 |
+| `DateTime(tz)`          | 4               | Same as `DateTime`; timezone is metadata        | Little-endian UInt32 |
+| `DateTime64(s)`         | 8               | Ticks at scale `s` (10^-s seconds since epoch)  | Little-endian Int64 |
+| `DateTime64(s, tz)`     | 8               | Same as `DateTime64(s)`; timezone is metadata   | Little-endian Int64 |
+| `UUID`                  | 16              | 128-bit identifier                              | Two byte-swapped LE UInt64 halves (§11.17) |
+| `IPv4`                  | 4               | IPv4 address                                    | Little-endian UInt32 |
+| `IPv6`                  | 16              | IPv6 address                                    | Network byte order, no swap |
+| `Enum8`                 | 1               | Signed 8-bit integer (variant index)            | Raw byte      |
+| `Enum16`                | 2               | Signed 16-bit integer (variant index)           | Little-endian |
+| `Decimal(P, S)`         | 4 / 8 / 16 / 32 | Signed integer representing `value × 10^S`. Width depends on `P` (≤9→4B, ≤18→8B, ≤38→16B, ≤76→32B) | Little-endian signed integer (raw bytes for 32-byte case) |
 
 #### 8.1.1 Integer types
 
@@ -1003,23 +1020,231 @@ Clients that care about the human-readable name must parse the type string; clie
 01 02 01
 ```
 
-> **Note:** `Enum16` (a 2-byte counterpart) is also used by some ProfileEvents columns and follows the same principle — wire-compatible with `Int16`. `Enum16` is declared here for completeness but not yet implemented in the reference decoder. When implemented, it will use little-endian 2-byte signed integers.
+**Enum16** (a 2-byte counterpart of `Enum8`) follows the same principle — wire-compatible with `Int16`, with variant labels in the type string. See §8.1.11 for `Enum16` specifics.
 
-#### 8.1.4 Fixed-width types not yet implemented
+#### 8.1.4 Float32 and Float64
 
-These types are fixed-width and will use the same "N bytes per row, concatenated" pattern, but are not yet part of the reference implementation:
+Standard IEEE 754 binary floats — 4 bytes single-precision (`binary32`) and 8 bytes double-precision (`binary64`), each in little-endian byte order. The encoding is a direct byte dump of the IEEE 754 bit pattern.
 
-- `Int16` — 2 bytes, little-endian signed. Currently aliased to `Enum16` only.
-- `Float32`, `Float64` — 4 and 8 bytes, IEEE 754 binary float, little-endian.
-- `Bool` — 1 byte, `0x00` = false, `0x01` = true. Internally a domain over `UInt8`.
-- `Date` — 2 bytes, little-endian UInt16 (days since `1970-01-01`).
-- `Date32` — 4 bytes, little-endian Int32 (days since `1970-01-01`, allows pre-1970 dates).
-- `DateTime64(scale)` — 8 bytes, little-endian Int64 (ticks; scale in type string controls subsecond precision; 3 = ms, 6 = µs, 9 = ns).
-- `UUID` — 16 bytes, but with a historical quirk: transmitted as two little-endian UInt64 halves, **each byte-swapped**. See §11.x (planned) for the exact byte reordering.
-- `IPv4` — 4 bytes, raw IPv4 address (typically little-endian on the wire, but this is domain-specific).
-- `IPv6` — 16 bytes, raw IPv6 address in network byte order.
-- `Int128`, `UInt128`, `Int256`, `UInt256` — 16 / 32 bytes, little-endian.
-- `Decimal32(S)`, `Decimal64(S)`, `Decimal128(S)`, `Decimal256(S)` — 4 / 8 / 16 / 32 bytes, little-endian signed integer representing the decimal value scaled by `10^S`. The scale `S` is in the type string.
+NaN, ±Infinity, and ±0.0 round-trip without modification — the protocol does not normalise. Subnormals are preserved.
+
+**Example** — `Float32` value `1.5` (sign=0, exponent=01111111, mantissa=10000…0 → `0x3FC00000`):
+
+```
+00 00 C0 3F                              little-endian IEEE 754
+```
+
+**Example** — `Float64` value `1.5` (`0x3FF8000000000000`):
+
+```
+00 00 00 00 00 00 F8 3F                  little-endian IEEE 754
+```
+
+#### 8.1.5 Bool
+
+`Bool` is wire-compatible with `UInt8` — 1 byte per row, `0x00` = false, `0x01` = true. The type string on the wire is literally `Bool` (not `UInt8`), so a decoder that dispatches on the type string must recognise `Bool` separately. Internally in ClickHouse it is a `Domain` over `UInt8`; on the wire only the type-string text differs.
+
+**Example** — `Bool` column with values `[true, false, true]` (3 rows = 3 bytes):
+
+```
+01 00 01
+```
+
+#### 8.1.6 Date and Date32
+
+Both encode dates as integer day counts relative to the Unix epoch `1970-01-01`. `Date` is **unsigned 16-bit** (range: `1970-01-01` to roughly `2149-06-06`); `Date32` is **signed 32-bit** (range covers years -32768 through 32767, allowing pre-epoch dates). Neither carries a time component.
+
+| Type     | Bytes | Encoding              | Day-zero      | Range                           |
+|----------|-------|-----------------------|---------------|---------------------------------|
+| `Date`   | 2     | Little-endian UInt16  | `1970-01-01`  | `1970-01-01` to `2149-06-06`    |
+| `Date32` | 4     | Little-endian Int32   | `1970-01-01`  | wide signed range, pre-1970 ok  |
+
+**Example** — `Date` value `1970-01-02` (1 day since epoch):
+
+```
+01 00                                    UInt16 LE = 1
+```
+
+**Example** — `Date32` value `1900-01-01` (-25567 days since epoch):
+
+```
+21 9C FF FF                              Int32 LE = -25567
+```
+
+#### 8.1.7 DateTime64(scale[, timezone])
+
+8 bytes, little-endian **Int64** representing ticks at scale `10^-scale` seconds since the Unix epoch. The `scale` parameter (0..=9) lives in the type string and determines the time unit:
+
+| Scale | Tick size       | Common name |
+|-------|-----------------|-------------|
+| 0     | 1 second        | seconds     |
+| 3     | 1 millisecond   | ms          |
+| 6     | 1 microsecond   | µs          |
+| 9     | 1 nanosecond    | ns          |
+
+Type string formats:
+- `DateTime64(s)` — implicit server default timezone.
+- `DateTime64(s, 'UTC')`, `DateTime64(s, 'America/Los_Angeles')` — explicit timezone.
+
+The timezone affects display only; it is **not** part of the wire value. Two `DateTime64(s, tz)` columns with the same `s` and the same instant produce identical bytes regardless of `tz`.
+
+Negative values represent ticks before the epoch.
+
+**Example** — `DateTime64(3, 'UTC')` value `2024-01-15 12:30:45.123 UTC` (1705321845123 ms since epoch):
+
+```
+83 51 1A 0D 8D 01 00 00                  Int64 LE = 1705321845123
+```
+
+**Example** — `DateTime64(0)` value `2024-01-15 12:30:45 UTC` (1705321845 seconds since epoch):
+
+```
+75 25 A5 65 00 00 00 00                  Int64 LE = 1705321845
+```
+
+**Decoder algorithm:** dispatch on base type `DateTime64`, parse the scale from the first parenthesised parameter (the timezone, if present after a comma, is informational), read `8 * num_rows` bytes as Int64 LE values, return alongside the scale so the caller knows the tick unit.
+
+#### 8.1.8 UUID
+
+16 bytes, but the wire encoding has a **historical quirk**: each 8-byte half is byte-reversed from the canonical UUID big-endian form. See §11.17 for context and a worked example.
+
+**Logical model:** a 128-bit identifier in the standard form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, where the bytes are conventionally written in big-endian (network) order.
+
+**Wire model:** the 16 canonical bytes split into two 8-byte halves; each half is then written **little-endian** (i.e., byte-reversed within the half). Equivalent description:
+- Wire bytes 0..7 = canonical bytes 0..7 reversed.
+- Wire bytes 8..15 = canonical bytes 8..15 reversed.
+
+**Example** — UUID `550e8400-e29b-41d4-a716-446655440000`:
+
+Canonical bytes (16): `55 0E 84 00 E2 9B 41 D4 A7 16 44 66 55 44 00 00`
+
+Wire bytes (16):
+
+```
+D4 41 9B E2 00 84 0E 55                  high half byte-reversed
+00 00 44 55 66 44 16 A7                  low half byte-reversed
+```
+
+**Example** — nil UUID (`00000000-0000-0000-0000-000000000000`): 16 bytes of `0x00` (no swap visible since reversed is the same).
+
+**Encoder/decoder algorithm:** at the encode boundary, take the 16 canonical bytes and reverse bytes 0..7 in place, then reverse bytes 8..15 in place, then write the 16 bytes verbatim. At decode, read 16 bytes and apply the same operation (it is its own inverse).
+
+#### 8.1.9 IPv4 and IPv6
+
+Two related but differently-encoded address types.
+
+**`IPv4`** — 4 bytes, encoded as **little-endian UInt32** representing the canonical 32-bit address (i.e., the same `u32` you'd get by parsing `a.b.c.d` as `(a << 24) | (b << 16) | (c << 8) | d`). The wire bytes are therefore the network-order bytes **reversed**.
+
+For `192.168.1.10`:
+- Canonical 32-bit value: `0xC0A8010A` = `(192 << 24) | (168 << 16) | (1 << 8) | 10`.
+- Wire bytes: `0A 01 A8 C0` (LE encoding of `0xC0A8010A`).
+- Network-order bytes: `C0 A8 01 0A` — note: not what's on the wire.
+
+```
+0A 01 A8 C0                              IPv4: 192.168.1.10
+```
+
+**`IPv6`** — 16 bytes, written **verbatim in network byte order** (no swap). This is the same byte order used by `inet_pton(AF_INET6, ...)`, by `Ipv6Addr::octets()` in Rust's stdlib, and by the canonical text representation when expanded.
+
+For `2001:db8::1`:
+
+```
+20 01 0D B8 00 00 00 00                  network-order bytes 0..7
+00 00 00 00 00 00 00 01                  network-order bytes 8..15
+```
+
+The asymmetry between `IPv4` (LE u32) and `IPv6` (raw network bytes) is intentional in ClickHouse — `IPv4` is stored as a u32 to enable arithmetic and compact range queries, while `IPv6` keeps the raw byte representation common to most networking APIs.
+
+#### 8.1.10 Enum16
+
+Wire-compatible with `Int16` — 2 bytes per row, little-endian two's complement. The full variant mapping lives in the type string:
+
+```
+Enum16('a' = 1, 'b' = 30000, 'c' = -1)
+```
+
+A decoder may strip the `(...)` parameter suffix and dispatch as `Int16`; clients that need the human-readable label parse the type string themselves.
+
+**Example** — `Enum16('a' = 1, 'b' = 30000)` value `30000`:
+
+```
+30 75                                    Int16 LE = 30000
+```
+
+#### 8.1.11 Decimal(P, S)
+
+A signed integer scaled by a power of 10. The integer's byte width is implied by the **precision** `P`; the **scale** `S` is the negative exponent (number of digits after the decimal point). Both `P` and `S` are in the type string.
+
+**Width derivation from precision:**
+
+| Precision (P)   | Backing integer | Bytes |
+|-----------------|-----------------|-------|
+| 1 ≤ P ≤ 9       | Int32           | 4     |
+| 10 ≤ P ≤ 18     | Int64           | 8     |
+| 19 ≤ P ≤ 38     | Int128          | 16    |
+| 39 ≤ P ≤ 76     | Int256          | 32    |
+
+The wire encoding is the backing integer in little-endian, two's complement. The logical decimal value is `wire_integer × 10^(-S)`.
+
+**Type string normalisation:** ClickHouse always emits `Decimal(P, S)` regardless of how the type was declared — `Decimal32(S)`, `Decimal64(S)`, etc. all normalise to `Decimal(P, S)` on the wire (with `P` set to the natural maximum for that width: 9, 18, 38, 76 respectively). A decoder that recognises only `Decimal(P, S)` covers every spelling the server emits.
+
+**Example** — `Decimal(9, 4)` value `123.4567` → backing integer `1234567`:
+
+```
+87 D6 12 00                              Int32 LE = 1234567
+```
+
+**Example** — `Decimal(18, 1)` value `-1.5` → backing integer `-15`:
+
+```
+F1 FF FF FF FF FF FF FF                  Int64 LE = -15
+```
+
+**Example** — `Decimal(38, 4)` value `123.4567` (16 bytes total, 12 trailing zeros):
+
+```
+87 D6 12 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+**Decoder algorithm:** dispatch on base type `Decimal`, parse `(P, S)`, derive the byte width from `P` (per table above), read `width * num_rows` bytes, and return the backing integer values plus the scale `S` so the caller knows where to put the decimal point.
+
+#### 8.1.12 Wide integers — Int128, UInt128, Int256, UInt256
+
+Straight 16- or 32-byte little-endian two's-complement integers. No surprises beyond width.
+
+| Type     | Bytes | Encoding              |
+|----------|-------|-----------------------|
+| `Int128` | 16    | Little-endian, signed |
+| `UInt128`| 16    | Little-endian, unsigned |
+| `Int256` | 32    | Little-endian, signed |
+| `UInt256`| 32    | Little-endian, unsigned |
+
+Rust has native `i128` / `u128` but no `i256` / `u256` — implementations typically expose 256-bit integers as raw `[u8; 32]` arrays and let callers convert to a big-int type if needed.
+
+**Example** — `Int128` value `i128::MAX` (`0x7FFFFFFF...FFFF`):
+
+```
+FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 7F
+```
+
+**Example** — `UInt128` value `u128::MAX`:
+
+```
+FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+```
+
+**Example** — `Int256` value `123` (1 byte of data, 31 trailing zeros):
+
+```
+7B 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+#### 8.1.13 Time, Time64 (server-version dependent)
+
+`Time` and `Time64` are **not present as distinct wire types on every server version.** Empirically, on ClickHouse 25.3.14.14 the type families page lists `TIME` as an alias and `Time64` is reported as `Unknown data type family: Time64.` A `CAST(... AS Time)` succeeds but the resulting column is reported as `Int64` on the wire — the alias resolves before the data leaves the server.
+
+Until a server version surfaces `Time` / `Time64` as distinct wire types (with their own type strings on the column header), this client treats them as their underlying integer types. When dedicated wire types appear, the encoding is expected to follow the existing pattern (`Time` → `Int32` ticks, `Time64(scale)` → `Int64` ticks) — but this should be verified empirically against the target server version before being relied on.
 
 ### 8.2 Variable-length types
 
@@ -2112,6 +2337,32 @@ ColumnData::Tuple(v) => {
 **Cause:** Calling `ColumnData::decode(r, element_type, 1)` for each element treats the wire as one value per element rather than `num_rows` values. Tuple's wire format is per-element streams of `num_rows` values each (§8.3.3); the outer `num_rows` must be passed through unchanged.
 
 **Fix:** `ColumnData::decode(r, element_type, rows)` — same `rows` for every element.
+
+---
+
+### 11.17 UUID is transmitted as two byte-swapped LE UInt64 halves
+
+**Symptom:** A UUID column round-trips with garbled bytes — the canonical UUID `550e8400-e29b-41d4-a716-446655440000` decodes as `d44119be-2008-4055-0000-44556644a716` (or a similarly-shuffled value), and SQL queries that filter by UUID literal don't match.
+
+**Cause:** ClickHouse's wire format for `UUID` is not the canonical 16 big-endian bytes you might expect. Each 8-byte half is **byte-reversed** independently (i.e., each half is written little-endian as if it were a `UInt64`). This is a historical quirk tied to ClickHouse internals (issue #34369) and is not something the protocol can change without breaking compatibility.
+
+To convert canonical → wire (or wire → canonical, since the operation is its own inverse):
+1. Take the 16 canonical bytes.
+2. Reverse bytes `0..7` in place.
+3. Reverse bytes `8..15` in place.
+4. Write the resulting 16 bytes verbatim.
+
+**Worked example** — UUID `550e8400-e29b-41d4-a716-446655440000`:
+
+| Step                        | Bytes                                              |
+|-----------------------------|----------------------------------------------------|
+| Canonical (big-endian)      | `55 0E 84 00 E2 9B 41 D4 A7 16 44 66 55 44 00 00` |
+| Reverse first half          | `D4 41 9B E2 00 84 0E 55 A7 16 44 66 55 44 00 00` |
+| Reverse second half (wire)  | `D4 41 9B E2 00 84 0E 55 00 00 44 55 66 44 16 A7` |
+
+**Fix:** Apply the byte-swap at the encode/decode boundary, not in the in-memory representation. Most client libraries (this one included) expose canonical `Uuid` values to users and confine the swap to a single helper called from the column encoder/decoder.
+
+A natural lurking bug: a "reverse the whole 16 bytes" implementation is wrong (it puts byte 0 where byte 15 belongs, scrambling both halves together). The two halves must be reversed independently.
 
 ---
 
