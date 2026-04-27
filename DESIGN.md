@@ -18,57 +18,299 @@
 
 ---
 
-## Current State (as of latest work)
+## Status Summary
 
-### Implementation — what works
+Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 
-**Client declares protocol:** `54459` (Feature::PARAMETERS). Negotiated with server yields the actual working version.
+| Phase | Topic | Problems | Status |
+|-------|-------|----------|--------|
+| 1     | Wire primitives & I/O scaffold              | 1–5    | ✅ |
+| 2     | Handshake                                    | 6–9    | ✅ |
+| 3     | Ping                                         | 10     | ✅ |
+| 4     | Query phase scaffold                         | 11–19  | ✅ |
+| 5     | Basic data types                             | 20–24  | ✅ |
+| 6     | Composite types (Nullable / Array / Tuple / Map / Nested) | 25–29 | ✅ |
+| 7     | More fixed-width and parameterized types     | 30–36  | ✅ |
+| 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 done; Variant / Dynamic / JSON Tier 2 deferred) |
+| 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
+| 10    | INSERT path                                  | 44–45  | ✅ |
+| 11    | Bring spec up to server v54483               | 46–65  | ⏳ |
+| 12    | Polish and presentation                      | 66–69  | ⏳ |
+| 13    | Spec completion                              | 70–73  | ⚠️ (composite + versioned + compression sections done; chunked-protocol pending) |
 
-**Connection lifecycle (fully wired):**
-- TCP connect with `TCP_NODELAY` (via default `TcpStream`), `SO_KEEPALIVE` and `TCP_KEEPIDLE` **not yet applied client-side**.
-- Handshake (ClientHello ↔ ServerHello with version negotiation).
-- Addendum (sends empty quota_key when negotiated version ≥ 54458).
-- Ping/Pong.
-- Query with full response loop (handles Data, Progress, ProfileInfo, Totals, Extremes, Log, ProfileEvents, TableColumns, EndOfStream, Exception).
+**Test coverage at the time of writing:** 253 unit tests + 88 integration tests, all passing.
 
-**Query options (builder pattern `QueryOptions`):**
-- `with_query_id`, `with_stage`, `with_compression`, `with_setting`, `with_param`, `with_external_table`
-- `query()` delegates to `query_with(sql, QueryOptions::new())`.
+**Spec deliverables:**
 
-**Column types implemented:**
-- Fixed-width: `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Int8`, `Int32`, `Int64`, `DateTime`, `Enum8` (alias for Int8)
-- Variable-length: `String`, `FixedString(N)`
+- `NATIVE_PROTOCOL.md` — TCP wire protocol (state machine, packets, configuration).
+- `NATIVE_FORMAT.md` — Block/Column structure, data types, compression frame.
+- `IMPLEMENTATION_NOTES.md` — gotchas in Symptom/Cause/Fix form + reference Rust client status.
+- `SPEC.md` — short redirect note pointing to the three above.
 
-**QueryResult structure:** exposes header (schema), result rows (Vec<Block>), totals, extremes, profile, logs, profile_events.
+References to spec sections in this document use the original SPEC.md numbering (e.g., "§7.11"). The mapping to the post-split layout is:
 
-**Test coverage:** 121 unit tests + 32 integration tests, all passing.
-
-### Spec — what's written
-
-| Section | Status |
-|---|---|
-| §1 Overview | Complete, with scope (protocol + Native format) and "Native format is the only wire format over TCP" explanation |
-| §2 Wire Format Primitives | Complete (VarUInt, fixed ints, String, Bool) |
-| §3 Security | Complete (TLS, auth, inter-server secret) |
-| §4 Protocol Versioning & Feature Gates | Complete, feature table current |
-| §5 Packet Envelope | Complete |
-| §6 Connection Lifecycle | Complete with state descriptions and phase-by-phase explanations |
-| §7 Message Reference | Complete for all implemented messages |
-| §8.1 Fixed-width types | Complete for implemented types + listed not-yet-implemented |
-| §8.2 Variable-length types | Complete (String, FixedString) |
-| §8.3 Composite types (fixed shape) | Placeholder only |
-| §8.4 Versioned/stateful types | Concept explained, version table complete, sub-types not yet specified |
-| §8.5 Types not yet categorized | Complete |
-| §9 Compression | Placeholder only |
-| §10 Packet Type Reference | Complete |
-| §11 Implementation Notes | 15 entries covering real debugging wins |
-| §12 Configuration | Complete (TCP + app-level) |
+| Old SPEC.md range | New location |
+|-------------------|--------------|
+| §1 Overview, §2 Wire Primitives, §7.11 Block & Column, §8 Data Types, §9 Compression | `NATIVE_FORMAT.md` |
+| §3 Security, §4 Versioning, §5 Packet Envelope, §6 Lifecycle, §7 (other messages), §10 Packet Type Reference, §12 Configuration | `NATIVE_PROTOCOL.md` |
+| §11 Implementation Notes | `IMPLEMENTATION_NOTES.md` |
 
 ### Known problems with DESIGN.md's old assumptions (now fixed)
 
 - **~~Stage A: v54460, Stage B: v54483~~** — The two-stage split was ambitious but the "current" target kept moving. Replaced with a single current-target plan (54483) and "tiers" of type support.
-- **~~Problem 23: "54475: JSON column type support"~~** — **Wrong.** Protocol version 54475 is `QUERY_AND_LINE_NUMBERS` (script_query_number / script_line_number in ClientInfo). JSON support is gated by serialization-version prefixes inside the column data (§8.4.2 in the spec), not by a protocol-version feature. See spec §11.x and DESIGN.md Problem 23 below.
+- **~~Problem 23: "54475: JSON column type support"~~** — **Wrong.** Protocol version 54475 is `QUERY_AND_LINE_NUMBERS` (script_query_number / script_line_number in ClientInfo). JSON support is gated by serialization-version prefixes inside the column data (§8.4.2 in the spec), not by a protocol-version feature.
 - **~~Feature name mismatch~~** — ch-go has `FeatureJSONStrings = 54475` which is a naming error that carried into the original DESIGN.md. Do not add a feature at 54475 named after JSON.
+
+---
+
+## Completed Phases
+
+### Phase 1: Wire primitives & I/O scaffold ✅
+
+The minimum byte-level toolkit that everything else depends on.
+
+#### Problem 1: VarUInt (LEB-128) ✅
+
+7-bit data + 1-bit continuation, little-endian, up to 10 bytes for full UInt64 range.
+
+**Implementation:** `read_varuint` / `write_varuint` on a `ProtoRead` / `ProtoWrite` trait over `std::io::Read` / `std::io::Write`. Bench harness in `benches/varint.rs`.
+
+**Tests:**
+- Roundtrip across single-byte (`0..=127`), two-byte (`128..=16383`), and multi-byte boundaries.
+- Specific encodings against ch-go's outputs (`300` → `AC 02`, etc.).
+
+**Spec work:** §2.1.
+
+**References:**
+- ch-go: `proto/uvariant.go`
+- ClickHouse: `src/IO/VarInt.h`
+
+---
+
+#### Problem 2: Fixed-width integers ✅
+
+Little-endian encode/decode for `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Int8` (UInt8 cast), `Int32`, `Int64`. Wide ints (`Int128`/`UInt128`/`Int256`/`UInt256`) added later in Phase 7.
+
+**Implementation:** `read_uN` / `write_uN` and signed variants on the wire traits. Two's complement comes for free from Rust's `to_le_bytes` on the matching type.
+
+**Spec work:** §2.2.
+
+---
+
+#### Problem 3: Length-prefixed String ✅
+
+`[VarUInt: byte_length] [byte_length bytes]`. Empty string is a single `0x00`. Bytes are not required to be valid UTF-8 on the wire; this client decodes via `String::from_utf8` and returns `InvalidData` on non-UTF-8 bytes (acceptable for protocol messages but not for general `String` columns — see Problem 23).
+
+**Spec work:** §2.3.
+
+---
+
+#### Problem 4: Bool ✅
+
+Single byte. `0x00` = false, non-zero = true (canonical `0x01`). `read_bool` / `write_bool` on the wire traits.
+
+**Spec work:** §2.4.
+
+---
+
+#### Problem 5: ProtoRead / ProtoWrite traits + TCP connect ✅
+
+Two extension traits over `std::io::Read` and `std::io::Write` providing all the per-primitive helpers above (varuint, fixed-width int, string, bool). `Connection::connect` opens a `TcpStream` to the target address. `TCP_NODELAY` is on by default for `TcpStream`. `SO_KEEPALIVE` / `TCP_KEEPIDLE` not yet applied client-side — see Problem 66.
+
+**References:**
+- ClickHouse: `src/IO/ReadHelpers.h`, `src/IO/WriteHelpers.h`, `src/IO/ReadBufferFromPocoSocket.h`, `src/Client/Connection.cpp`.
+
+---
+
+### Phase 2: Handshake ✅
+
+Authentication and version negotiation over a fresh TCP connection.
+
+#### Problem 6: ClientHello encode ✅
+
+Fields: `client_name`, `version_major`, `version_minor`, `protocol_version`, `database`, `user`, `password`. No feature gating — all body fields are always present. Sent as the first message after TCP connect.
+
+**Spec work:** §7.1.
+
+---
+
+#### Problem 7: ServerHello decode (feature-gated) ✅
+
+Fields: `server_name`, `version_major`, `version_minor`, `protocol_version`, plus feature-gated `timezone` (TIMEZONE / v54058), `display_name` (DISPLAY_NAME / v54372), `version_patch` (VERSION_PATCH / v54401). Decoder must consult the **negotiated** protocol version, not the client's declared version.
+
+**Spec work:** §7.2.
+
+---
+
+#### Problem 8: Version negotiation ✅
+
+`negotiated_version = min(client_protocol_version, server_protocol_version)`. Computed immediately after ServerHello decode; used for every subsequent feature-gate check on the connection.
+
+**Implementation note:** the client must declare the highest protocol version it actually supports (currently `54459` for `Feature::PARAMETERS`). Declaring lower silently disables features at encode time — see Implementation Notes §1.10.
+
+---
+
+#### Problem 9: Addendum (post-handshake quota_key) ✅
+
+When `negotiated_version >= 54458` (`ADDENDUM`), the client sends a single `String quota_key` field as raw fields with no packet type prefix. External clients send empty string. Sending the addendum when the server doesn't expect it (or skipping it when it does) misaligns every subsequent message — gating must use the **negotiated** version.
+
+**Spec work:** §7.3.
+
+---
+
+### Phase 3: Ping ✅
+
+#### Problem 10: Ping/Pong ✅
+
+Both packets carry no body — they are a single `0x04` byte on the wire (the VarUInt-encoded packet type). Stateless and uncorrelated with any query. Multiple sequential Pings on the same connection are valid.
+
+**Implementation:** `Connection::ping` writes a Ping, flushes, and reads exactly one Pong (or Exception). The connection state oscillates `READY → READY` with no intermediate state change.
+
+**Spec work:** §6.3, §7.4, §7.5.
+
+---
+
+### Phase 4: Query phase scaffold ✅
+
+The bulk of the protocol — submitting a SQL statement and consuming the response stream.
+
+#### Problem 11: Query packet ✅
+
+Outer fields: `query_id`, `client_info` (Problem 12), `settings` (Problem 13), `cluster_secret` (inter-server), `stage`, `compression`, `query_body`, `parameters` (Problem 14, gated by `PARAMETERS` v54459). External clients send `cluster_secret = ""`, `stage = Complete (2)`, `compression = false` by default.
+
+**Spec work:** §7.7.
+
+---
+
+#### Problem 12: ClientInfo encode ✅
+
+Embedded inline in the Query body when `WRITE_CLIENT_INFO` (v54420) is active. 19 fields with cascading feature gates (QUOTA_KEY_IN_CLIENT_INFO, INITIAL_QUERY_START_TIME, OPEN_TELEMETRY, DISTRIBUTED_DEPTH, VERSION_PATCH, PARALLEL_REPLICAS).
+
+**Specific gotchas pinned to this problem (preserved in `IMPLEMENTATION_NOTES.md`):**
+- `initial_address` must be a non-empty `host:port` string (e.g., `"127.0.0.1:0"`).
+- `initial_time` is a fixed-width Int64 (8 bytes LE), **not** VarUInt — even though most other numeric fields in ClientInfo are VarUInt.
+
+**Spec work:** §7.8.
+
+---
+
+#### Problem 13: Setting list ✅
+
+`(String key, VarUInt flags, String value)` tuples in the Query body, terminated by an empty `key`. Flags: `0x01` = Important, `0x02` = Custom, `0x04` = Obsolete.
+
+**Spec work:** §7.9.
+
+---
+
+#### Problem 14: Parameter list ✅
+
+Encoded identically to settings with the `Custom` flag (`0x02`) set. Terminated by empty key. Parameter values must be **single-quoted on the wire** (`42` → `'42'`, `it's` → `'it''s'`); a bare value is silently dropped server-side. See `IMPLEMENTATION_NOTES.md` §1.9.
+
+**Spec work:** §7.10.
+
+---
+
+#### Problem 15: External tables + end-of-client-data marker ✅
+
+Zero or more external-table Data packets, followed by an **empty Data packet** (`table_name = ""`, `num_columns = 0`, `num_rows = 0`). The server does not begin executing the query until it receives this marker — even for SELECTs with no input data.
+
+**Implementation:** `ExternalTable::encode_empty` writes the terminator. `QueryOptions::with_external_table` adds non-empty entries.
+
+**Spec work:** §6.4 step 2, §7.11.
+
+---
+
+#### Problem 16: BlockInfo ✅
+
+Field-tagged encoding: `[VarUInt field_id] [value]` repeating, terminated by `field_id = 0`. Field 1 = `is_overflows: UInt8`, field 2 = `bucket_number: Int32` (default `-1`, **not** `0`). Forward-compatible — unknown field IDs are skipped.
+
+**Spec work:** §7.11 BlockInfo subsection.
+
+---
+
+#### Problem 17: Block decode + Column header ✅
+
+Block: `[BlockInfo] [VarUInt: num_columns] [VarUInt: num_rows] [Column × num_columns]`. Column header: `[String: name] [String: type] [UInt8: has_custom_serialization (gated by CUSTOM_SERIALIZATION v54454)] [data]`. The `has_custom_serialization` byte must be present at v54454+ — omitting it misaligns every subsequent column by one byte.
+
+**Spec work:** §7.11.
+
+---
+
+#### Problem 18: Response loop ✅
+
+After the Query packet + EOI marker, the client loops reading response packets until `EndOfStream` or `Exception`. Dispatches by packet type code: Data (header / result / boundary marker), Progress, ProfileInfo, Totals, Extremes, Log, ProfileEvents, TableColumns, Exception, EndOfStream. Critical rule: **`num_rows == 0` is not a query terminator** — only `EndOfStream` (or `Exception`) ends the stream.
+
+**Spec work:** §6.4 step 4.
+
+---
+
+#### Problem 19: Auxiliary response packets ✅
+
+- **Progress** (cumulative metrics; not deltas — replace previous, do not sum).
+- **ProfileInfo** (sent once near end of query).
+- **Totals / Extremes** — same wire format as Data; carry a single Block.
+- **Log** — Block with fixed schema of 8 columns (event_time, ..., text).
+- **ProfileEvents** — Block with fixed schema of 6 columns. The `value` column's wire type varies between packets (Int64 vs UInt64 depending on the events being reported).
+- **TableColumns** — `String external_table` + `String columns_description` (free-form text).
+- **Exception** — error code + name + message + stack_trace + has_nested (chained exceptions).
+
+All of these must be fully decoded (even if the value is discarded) so the stream position advances correctly.
+
+**Spec work:** §7.12–§7.18.
+
+---
+
+### Phase 5: Basic data types ✅
+
+The minimum viable type set for `SELECT 1`-style queries plus simple INSERTs.
+
+#### Problem 20: Integer types — UInt8/16/32/64, Int8/32/64 ✅
+
+Direct binary encodings of integer values. `bytes_per_value × num_rows` bytes per column, little-endian for everything except UInt8/Int8 (raw byte). Two's complement for signed.
+
+**Implementation:** `ColumnData::Uint8(Vec<u8>)`, `Uint16`, `Uint32`, `Uint64`, `Int8`, `Int32`, `Int64` variants.
+
+**Spec work:** §8.1.1.
+
+---
+
+#### Problem 21: DateTime ✅
+
+Wire-compatible with UInt32 — Unix timestamp in seconds, 4 bytes LE. Type string may carry a timezone parameter (`DateTime('UTC')`, `DateTime('America/New_York')`); timezone is metadata only, not part of the wire value.
+
+**Implementation:** strip the `(...)` parameter suffix to dispatch on the base type. `ColumnData::DateTime(Vec<u32>)`.
+
+**Spec work:** §8.1.2.
+
+---
+
+#### Problem 22: Enum8 (alias for Int8) ✅
+
+Wire-compatible with Int8. The full variant mapping lives in the type string (`Enum8('active' = 1, 'inactive' = 2)`); the wire bytes are identical to Int8.
+
+**Implementation:** strip the `(...)` parameter suffix and dispatch as `Int8`. Round-tripping the type string verbatim is sufficient.
+
+**Spec work:** §8.1.3.
+
+---
+
+#### Problem 23: String ✅
+
+Sequence of `num_rows` length-prefixed byte strings: `[VarUInt: byte_length] [bytes]`. No row separators beyond the length prefixes. Empty strings are a single `0x00`. Embedded NUL is valid.
+
+**Implementation:** `ColumnData::String(Vec<String>)`. UTF-8 validity is enforced on decode (acceptable for protocol-internal strings; can be relaxed if non-UTF-8 byte columns become a target use case).
+
+**Spec work:** §8.2.1.
+
+---
+
+#### Problem 24: FixedString(N) ✅
+
+Exactly `N × num_rows` raw bytes — no length prefixes. Server right-pads short values with NUL to `N` bytes; padding is part of the stored value and arrives on the wire. Treat as raw bytes, not text.
+
+**Implementation:** parse `N` from the type string; `ColumnData::FixedString { n: usize, data: Vec<u8> }` where `data.len() == n × num_rows`.
+
+**Spec work:** §8.2.2.
 
 ---
 
@@ -76,7 +318,7 @@
 
 Problems are sequenced so each one can be picked up independently. Each has a clear "done" criterion.
 
-### Phase 6: Composite types (fixed shape) — §8.3 of the spec
+### Phase 6: Composite types (fixed shape) — §8.3 of the spec ✅
 
 Types in this group have a stable unversioned wire format. Sub-stream layouts are known statically from the type string.
 
