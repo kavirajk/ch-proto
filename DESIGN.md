@@ -320,9 +320,9 @@ Problems are sequenced so each one can be picked up independently. Each has a cl
 
 ### Phase 6: Composite types (fixed shape) — §8.3 of the spec ✅
 
-Types in this group have a stable unversioned wire format. Sub-stream layouts are known statically from the type string.
+Types in this group have a stable unversioned wire format. Sub-stream layouts are known statically from the type string. **All problems in this phase are complete.**
 
-#### Problem 25: `Nullable(T)`
+#### Problem 25: `Nullable(T)` ✅
 
 **Wire format:** `num_rows × UInt8` null-map (0 = present, 1 = null), then the inner type's encoding for all `num_rows` rows. Values at null positions are placeholder bytes that must still be consumed.
 
@@ -344,7 +344,7 @@ Types in this group have a stable unversioned wire format. Sub-stream layouts ar
 
 ---
 
-#### Problem 26: `Array(T)`
+#### Problem 26: `Array(T)` ✅
 
 **Wire format:** `num_rows × UInt64` cumulative end-offsets, then `offsets[num_rows - 1]` values of the inner type.
 
@@ -366,7 +366,7 @@ Types in this group have a stable unversioned wire format. Sub-stream layouts ar
 
 ---
 
-#### Problem 27: `Tuple(T1, T2, ...)`
+#### Problem 27: `Tuple(T1, T2, ...)` ✅
 
 **Wire format:** each element type encoded as a separate stream of `num_rows` values, concatenated in declaration order.
 
@@ -386,7 +386,7 @@ Types in this group have a stable unversioned wire format. Sub-stream layouts ar
 
 ---
 
-#### Problem 28: `Map(K, V)`
+#### Problem 28: `Map(K, V)` ✅
 
 **Wire format:** equivalent to `Array(Tuple(K, V))` — one offsets stream + a paired values stream.
 
@@ -406,13 +406,13 @@ Types in this group have a stable unversioned wire format. Sub-stream layouts ar
 
 ---
 
-#### Problem 29: `Nested(...)`
+#### Problem 29: `Nested(...)` ✅
 
-Syntactic sugar — `Nested(a T1, b T2)` is equivalent to a pair of `Array(T1)` and `Array(T2)` columns, not a single composite. On the wire it's multiple top-level columns. Verify that the server flattens `Nested` before transmission (usually yes).
+Behavior depends on the server-side `flatten_nested` setting. With `flatten_nested = 1` (default), `Nested(a T1, b T2)` becomes parallel `Array(T_i)` columns with dotted names (`n.a Array(T1)`, `n.b Array(T2)`) — handled by the existing Array decoder. With `flatten_nested = 0`, the column appears on the wire with type string `Nested(...)` and is byte-identical to `Array(Tuple(...))` after the type string. The implementation supports both, including a dedicated `ColumnData::Nested { fields: Vec<(String, ColumnData)>, offsets }` variant for the `flatten_nested = 0` case.
 
-**Tests:** integration only, confirming that `Nested` columns arrive as parallel Array columns.
+**Tests:** unit tests for the Nested encoding plus integration tests using `::Nested(...)` casts (which reach the `flatten_nested = 0` shape without DDL).
 
-**Spec work:** §8.3 `Nested` subsection documenting the flattening behavior.
+**Spec work:** §8.3 `Nested` subsection documenting both cases. ✅
 
 **References:**
 - ch-go: uses `Array` + naming convention (no dedicated `col_nested.go`)
@@ -420,11 +420,11 @@ Syntactic sugar — `Nested(a T1, b T2)` is equivalent to a pair of `Array(T1)` 
 
 ---
 
-### Phase 7: More fixed-width and parameterized types — §8.1
+### Phase 7: More fixed-width and parameterized types — §8.1 ✅
 
-These are fixed-width but with parameter parsing or special encoding.
+Fixed-width types with parameter parsing or special encoding. **All problems in this phase are complete.** Time/Time64 deferred per server reality (resolves to Int64 on this server version).
 
-#### Problem 30: Remaining integer types
+#### Problem 30: Remaining integer types ✅
 
 - `Int16` (2 bytes LE signed) — add to ColumnData and match list.
 - `Float32` (4 bytes, IEEE 754 LE).
@@ -439,7 +439,7 @@ These are fixed-width but with parameter parsing or special encoding.
 
 ---
 
-#### Problem 31: `Date`, `Date32`, `DateTime64`, `Time`, `Time64`
+#### Problem 31: `Date`, `Date32`, `DateTime64`, `Time`, `Time64` ⚠️ (Time/Time64 deferred)
 
 Date/time family. All fixed-width; scale/timezone parameters live in the type string and affect interpretation, not bytes.
 
@@ -463,7 +463,7 @@ Date/time family. All fixed-width; scale/timezone parameters live in the type st
 
 ---
 
-#### Problem 32: `UUID`
+#### Problem 32: `UUID` ✅
 
 **Wire format:** 16 bytes, transmitted as **two little-endian UInt64 halves, each byte-swapped** (historical quirk tied to ClickHouse issue #34369).
 
@@ -483,7 +483,7 @@ Date/time family. All fixed-width; scale/timezone parameters live in the type st
 
 ---
 
-#### Problem 33: `IPv4`, `IPv6`
+#### Problem 33: `IPv4`, `IPv6` ✅
 
 - `IPv4` — 4 bytes.
 - `IPv6` — 16 bytes (FixedString(16)-compatible).
@@ -496,7 +496,7 @@ Date/time family. All fixed-width; scale/timezone parameters live in the type st
 
 ---
 
-#### Problem 34: `Enum16`
+#### Problem 34: `Enum16` ✅
 
 Wire-compatible with `Int16` (2 bytes LE signed). Same principle as `Enum8` (§11.8 in spec): variant labels live in the type string, byte layout is Int16.
 
@@ -510,7 +510,7 @@ Wire-compatible with `Int16` (2 bytes LE signed). Same principle as `Enum8` (§1
 
 ---
 
-#### Problem 35: `Decimal(P, S)` and `Decimal32/64/128/256`
+#### Problem 35: `Decimal(P, S)` and `Decimal32/64/128/256` ✅
 
 **Wire format:** 4/8/16/32 bytes LE signed integer representing `value * 10^S` where `S` is the scale.
 
@@ -526,7 +526,7 @@ Wire-compatible with `Int16` (2 bytes LE signed). Same principle as `Enum8` (§1
 
 ---
 
-#### Problem 36: `Int128`, `UInt128`, `Int256`, `UInt256`
+#### Problem 36: `Int128`, `UInt128`, `Int256`, `UInt256` ✅
 
 Straight-up 16 or 32 byte little-endian two's-complement integers.
 
@@ -538,11 +538,11 @@ Straight-up 16 or 32 byte little-endian two's-complement integers.
 
 ---
 
-### Phase 8: Versioned/stateful types — §8.4
+### Phase 8: Versioned/stateful types — §8.4 ⚠️
 
-Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state.
+Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state. **Status:** LowCardinality (single-block) and JSON Tier 1 (String fallback) implemented; Variant, Dynamic, and JSON Tier 2/3 deferred — see §8.4.5 of `NATIVE_FORMAT.md` for the rationale.
 
-#### Problem 37: `LowCardinality(T)` — simplest of the versioned types
+#### Problem 37: `LowCardinality(T)` — simplest of the versioned types ⚠️ (single-block; multi-block pending)
 
 **Wire format:**
 - State prefix: `Int64(1)` — `key_serialization_version = sharedDictionariesWithAdditionalKeys` (only defined value).
@@ -562,7 +562,7 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 38: `Variant(T1, T2, ...)`
+#### Problem 38: `Variant(T1, T2, ...)` ❌ Deferred
 
 **Wire format:**
 - State prefix: `UInt64 LE` discriminators mode (0=BASIC, 1=COMPACT).
@@ -584,7 +584,7 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 39: `Dynamic`
+#### Problem 39: `Dynamic` ❌ Deferred
 
 **Wire format:**
 - State prefix: `UInt64 LE` serialization version (V1=1, V2=2, V3=4, FLATTENED=3).
@@ -605,7 +605,7 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 40: `JSON` (Tier 1: String fallback only)
+#### Problem 40: `JSON` (Tier 1: String fallback only) ✅
 
 **Wire format when version = 1 (STRING mode):**
 - `UInt64 LE(1)` — `JSONStringSerializationVersion`.
@@ -626,7 +626,7 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 41: `JSON` (Tier 2: FLATTENED mode)
+#### Problem 41: `JSON` (Tier 2: FLATTENED mode) ❌ Deferred
 
 **Wire format when version = 3 (FLATTENED) or version = 0 (deprecated, auto-upgraded):**
 - `UInt64 LE` serialization version.
@@ -647,9 +647,11 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-### Phase 9: Compression — §9 of spec
+### Phase 9: Compression — §9 of spec ⚠️
 
-#### Problem 42: LZ4 compression
+Frame primitives (LZ4, ZSTD, NONE; CityHash102 checksum verification; corruption detection) are implemented. Connection-level integration — wrapping the inner stream's Block reads/writes when `compression = true` is requested — is not yet wired up.
+
+#### Problem 42: LZ4 compression ⚠️ (frame primitives done; connection integration pending)
 
 **Frame format per block:**
 - 16 bytes — CityHash128 checksum (over everything that follows).
@@ -673,7 +675,7 @@ Activated by the `compression` flag in the Query packet.
 
 ---
 
-#### Problem 43: ZSTD compression
+#### Problem 43: ZSTD compression ⚠️ (same status as Problem 42)
 
 Same frame format, method byte `0x90`. Uses `zstd` crate. Spec work already covered by Problem 42.
 
@@ -683,9 +685,11 @@ Same frame format, method byte `0x90`. Uses `zstd` crate. Spec work already cove
 
 ---
 
-### Phase 10: INSERT path — §6 (new state machine)
+### Phase 10: INSERT path — §6 (new state machine) ✅
 
-#### Problem 44: INSERT with a single block
+INSERT phase implemented end-to-end with both single-block and multi-block (streaming) APIs. Schema-block exchange, end-of-input terminator, and metadata-packet drain all working. See `NATIVE_PROTOCOL.md` §5.5 for the spec.
+
+#### Problem 44: INSERT with a single block ✅
 
 Currently `query()` only handles SELECT-style responses. INSERT flow is:
 
@@ -707,7 +711,7 @@ Currently `query()` only handles SELECT-style responses. INSERT flow is:
 
 ---
 
-#### Problem 45: Streaming INSERT (multiple blocks)
+#### Problem 45: Streaming INSERT (multiple blocks) ✅
 
 Extension of Problem 44. Let the caller push blocks incrementally.
 
@@ -717,9 +721,9 @@ Extension of Problem 44. Let the caller push blocks incrementally.
 
 ---
 
-### Phase 11: Bring spec up to server v54483 — new feature sections
+### Phase 11: Bring spec up to server v54483 — new feature sections ⏳
 
-Document the features added between v54460 (current spec's cap) and v54483. Each feature goes into the §4.3 feature table; most also add fields to existing message types.
+Document the features added between v54460 (current spec's cap) and v54483. Each feature goes into `NATIVE_PROTOCOL.md` §3.3 (feature table); most also add fields to existing message types.
 
 #### Problem 46: v54461 — password complexity rules
 
@@ -950,7 +954,7 @@ Extends the sparse-serialization feature from v54465 to `Nullable(T)` columns. R
 
 ---
 
-### Phase 12: Polish and presentation
+### Phase 12: Polish and presentation ⏳
 
 #### Problem 66: Client-side TCP keepalive
 
@@ -993,29 +997,31 @@ Criterion-style benchmarks for: VarUInt read/write, Block decode, end-to-end que
 
 ---
 
-### Phase 13: Spec completion
+### Phase 13: Spec completion ⚠️
 
-#### Problem 70: Fill §8.3 Composite types
+Now lives in the three split documents (`NATIVE_FORMAT.md`, `NATIVE_PROTOCOL.md`, `IMPLEMENTATION_NOTES.md`) instead of a single `SPEC.md`.
 
-Turn the placeholder sketches in §8.3 into full specifications, byte-level examples included. Dependent on Problems 25–29.
+#### Problem 70: Fill composite types section ✅
 
----
-
-#### Problem 71: Fill §8.4 LowCardinality, Variant, Dynamic, JSON
-
-Same, dependent on Problems 37–41.
+Done as part of Phase 6. `NATIVE_FORMAT.md` §3.3 covers Nullable, Array, Tuple, Map, Nested with byte-level examples each.
 
 ---
 
-#### Problem 72: Replace §9 Compression placeholder
+#### Problem 71: Fill versioned types section ⚠️
 
-Full spec for LZ4/ZSTD framing, CityHash128, the activation setting. Dependent on Problem 42.
+Done in part. `NATIVE_FORMAT.md` §3.4 covers LowCardinality and JSON Tier 1 with byte-level examples; Variant, Dynamic, JSON Tier 2/3 documented as "out of scope for this revision" (§3.4.5) with rationale, pending Problems 38–41.
 
 ---
 
-#### Problem 73: Add chunked-protocol section
+#### Problem 72: Replace compression section placeholder ✅
 
-Post-Problem 53. Major structural addition to §5 or a new §13.
+Done. `NATIVE_FORMAT.md` §4 covers the frame format, method bytes, CityHash102 checksum, per-block boundaries, and negotiation.
+
+---
+
+#### Problem 73: Add chunked-protocol section ⏳
+
+Post-Problem 53. Major structural addition to `NATIVE_PROTOCOL.md` §4 (Packet Envelope) and §5 (Connection Lifecycle).
 
 ---
 
@@ -1035,21 +1041,26 @@ For every problem:
 | What | This project | ClickHouse server |
 |------|--------------|-------------------|
 | Entry point | `src/lib.rs` | — |
-| Connection + Query | `src/client.rs` | `src/Client/Connection.cpp`, `src/Server/TCPHandler.cpp` |
+| Connection + Query + INSERT | `src/client.rs` | `src/Client/Connection.cpp`, `src/Server/TCPHandler.cpp` |
 | Wire primitives | `src/proto/wire.rs` | `src/IO/VarInt.h`, `src/IO/WriteHelpers.h`, `src/IO/ReadHelpers.h` |
 | Feature constants | `src/proto/feature.rs` | `src/Core/ProtocolDefines.h` |
 | Packet enums | `src/proto/packet.rs` | `src/Core/Protocol.h` |
 | Block/Column | `src/proto/block.rs`, `src/proto/column.rs` | `src/Formats/NativeWriter.cpp`, `src/Formats/NativeReader.cpp`, `src/DataTypes/` |
+| Compression | `src/proto/compression.rs` | `src/Compression/CompressionInfo.h`, `src/Compression/CompressedReadBuffer.h/cpp`, `src/Compression/CompressedWriteBuffer.h/cpp` |
 | Query options | `src/options.rs` | `src/Core/Settings.cpp` |
-| Spec | `SPEC.md` | — |
+| Examples | `examples/events.rs`, `examples/catalog.rs` | — |
+| Spec — protocol | `NATIVE_PROTOCOL.md` | — |
+| Spec — format | `NATIVE_FORMAT.md` | — |
+| Implementation notes | `IMPLEMENTATION_NOTES.md` | — |
+| Spec entry point | `SPEC.md` (redirect) | — |
 
 ---
 
 ## Scope boundaries (explicit non-goals)
 
-- **HTTP interface** — out of scope. TCP native only.
+- **HTTP interface** — out of scope. TCP native only. Also no other grpc mechanisms
 - **Server-side implementation** — out of scope. Client only, with server behavior reverse-engineered for spec.
 - **JSON Tier 3 (V3 on-disk format)** — not targeted; see §8.4.2.1 in spec.
 - **Multi-threaded / async I/O** — out of scope. Single-threaded blocking I/O; `tokio` version is a separate future project.
-- **TLS** — not implemented yet but noted in §3.1 as a transport-layer concern. Planned for post-demo work.
+- **TLS** — not implemented yet but noted in §3.1 as a transport-layer concern. Planned for later. 
 - **Inter-server mode** — out of scope. Client-to-server only.
