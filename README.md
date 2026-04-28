@@ -184,3 +184,39 @@ make test-unit          # cargo test
 make test-integration   # against the running container
 cargo run --example events
 ```
+
+---
+
+## TODOs — bringing the spec to v54483 parity
+
+The spec today caps at v54460-era features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). Each item maps back to a numbered problem in [`DESIGN.md`](DESIGN.md)
+
+### Native format — versioned types (`NATIVE_FORMAT.md` §3.4)
+
+- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch *(P38)*
+- [ ] **`Dynamic`** — version prefix, runtime-discovered type list, cross-block growth *(P39, depends on Variant)*
+- [ ] **`JSON` Tier 2** (FLATTENED mode) — path list + per-path Dynamic + shared-data column *(P41, depends on LowCardinality + Variant + Dynamic)*
+
+### Native protocol — chunked framing (the big one)
+
+- [ ] **v54470 chunked protocol** *(P53)* — per-packet chunk framing (`[chunk_size][bytes][zero terminator]`) plus Addendum negotiation (`proto_send_chunked` / `proto_recv_chunked`). Touches `NATIVE_PROTOCOL.md` §4 (Packet Envelope) and §5 (Connection Lifecycle).
+- [ ] Chunked-protocol section in `NATIVE_PROTOCOL.md` *(P73, blocked on P53)*
+
+### Native protocol — message-body field additions
+
+Each adds a row to the `NATIVE_PROTOCOL.md` §3.3 feature table plus fields in the affected message section.
+
+External-client-facing:
+- [ ] v54461 — `ServerHello` password complexity rules
+- [ ] v54463 — `Progress.total_bytes_to_read`
+- [ ] v54464 — `TimezoneUpdate` server packet
+- [ ] v54465 — sparse serialization in `Column`
+- [ ] v54466 — SSH challenge/response auth packets
+- [ ] v54469 — `ProfileInfo.applied_aggregation` + `rows_before_aggregation`
+- [ ] v54473 — V2 Dynamic / JSON serialization-version branches
+- [ ] v54474 — server settings list trailing `ServerHello`
+- [ ] v54475 — `ClientInfo.script_query_number` + `script_line_number`
+- [ ] v54478 — binary type encoding alternative in `Column`
+- [ ] v54481 — optional compression on `Log` / `ProfileEvents` block bodies
+- [ ] v54483 — `Nullable(T)` + sparse serialization composition
+
