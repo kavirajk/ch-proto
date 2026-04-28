@@ -7,6 +7,8 @@ Two parallel deliverables:
 - A spec — `NATIVE_PROTOCOL.md`, `NATIVE_FORMAT.md`, `IMPLEMENTATION_NOTES.md` — that is self-contained and implementation-neutral.
 - A Rust client (`src/`) that exists primarily to validate the spec end-to-end against a real server.
 
+**Methodology** I wrote the specifications in phases (see `DESIGN.md`). Implementing from primitives (like encodings on the wire), Connection state machines, Different clickhouse data types, supporting different feature gates, etc.
+
 **Target:** protocol version `54483` (the current ClickHouse server revision).
 
 **Scope is deliberately narrow.** 
@@ -21,11 +23,23 @@ If you only read one section, read this one. Three ideas — connection lifecycl
 
 ### Connection lifecycle
 
-A connection is `TCP connect → handshake → (Ping | Query)* → close`.
+A connection is `TCP connect → handshake → (Ping | Query)* → close` (see the image below).
 
-- **Handshake.** Client sends `ClientHello` (name, version, protocol_version, db/user/password). Server replies with `ServerHello`. Both sides compute `negotiated_version = min(client, server)` and use it for every subsequent feature gate. If `negotiated_version ≥ 54458`, the client follows up with an **Addendum** (a single `quota_key` string, no packet-type prefix).
-- **Query phase** is a small state machine. Client ships a Query packet (carrying `ClientInfo`, settings, parameters, the SQL body), then zero or more external-table Data packets, then an **empty Data marker**. The empty marker is the "go" signal — the server doesn't begin executing until it sees it, even for SELECTs with no input. Server then streams response packets (`Data`, `Progress`, `ProfileInfo`, `Log`, `ProfileEvents`, `Totals`, `Extremes`, …) until `EndOfStream` or `Exception`. **`num_rows == 0` is *not* a terminator** — only `EndOfStream`/`Exception` ends the stream.
-- **INSERT** mirrors SELECT but adds a schema exchange: server sends a 0-row Data block describing the expected columns, client ships one or more data blocks, then the empty Data marker, then the server replies with `EndOfStream`.
+**Handshake.** 
+
+1. Client sends `ClientHello` (name, version, protocol_version, db/user/password). 
+2. Server replies with `ServerHello`. 
+3. Both sides compute `negotiated_version = min(client, server)` and use it for every subsequent feature gate. 
+4. If `negotiated_version ≥ 54458`, the client follows up with an **Addendum** (a single `quota_key` string, no packet-type prefix).
+
+**Query phase** is a small state machine. 
+
+1. Client ships a Query packet (carrying `ClientInfo`, settings, parameters, the SQL body).
+2. Then zero or more external-table Data packets, then an **empty Data marker**. 
+3. The empty marker is the "go" signal — the server doesn't begin executing until it sees it, even for SELECTs with no input. 
+4. Server then streams response packets (`Data`, `Progress`, `ProfileInfo`, `Log`, `ProfileEvents`, `Totals`, `Extremes`, …) until `EndOfStream` or `Exception`. **`num_rows == 0` is *not* a terminator** — only `EndOfStream`/`Exception` ends the stream.
+
+**INSERT phase** mirrors SELECT but adds a schema exchange: server sends a 0-row Data block describing the expected columns, client ships one or more data blocks, then the empty Data marker, then the server replies with `EndOfStream`.
 
 ```mermaid
 sequenceDiagram
@@ -189,7 +203,7 @@ cargo run --example events
 
 ## TODOs — bringing the spec to v54483 parity
 
-The spec today caps at v54460-era features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). Each item maps back to a numbered problem in [`DESIGN.md`](DESIGN.md)
+The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). Each item maps back to a numbered problem in [`DESIGN.md`](DESIGN.md)
 
 ### Native format — versioned types (`NATIVE_FORMAT.md` §3.4)
 
