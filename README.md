@@ -203,7 +203,7 @@ cargo run --example events
 
 ## TODOs — bringing the spec to v54483 parity
 
-The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). Each item maps back to a numbered problem in [`DESIGN.md`](DESIGN.md)
+The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). 
 
 ### Native format — versioned types (`NATIVE_FORMAT.md` §3.4)
 
@@ -213,11 +213,10 @@ The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 an
 
 ### Native protocol — chunked framing (the big one)
 
-- [ ] **v54470 chunked protocol** *(P53)* — per-packet chunk framing (`[chunk_size][bytes][zero terminator]`) plus Addendum negotiation (`proto_send_chunked` / `proto_recv_chunked`). Touches `NATIVE_PROTOCOL.md` §4 (Packet Envelope) and §5 (Connection Lifecycle).
+- [ ] **v54470 chunked protocol** — per-packet chunk framing (`[chunk_size][bytes][zero terminator]`) plus Addendum negotiation (`proto_send_chunked` / `proto_recv_chunked`).
 
 ### Native protocol — message-body field additions (minor)
 
-External-client-facing:
 - [ ] v54461 — `ServerHello` password complexity rules
 - [ ] v54463 — `Progress.total_bytes_to_read`
 - [ ] v54464 — `TimezoneUpdate` server packet
