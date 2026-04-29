@@ -207,18 +207,15 @@ The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 an
 
 ### Native format — versioned types (`NATIVE_FORMAT.md` §3.4)
 
-- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch *(P38)*
-- [ ] **`Dynamic`** — version prefix, runtime-discovered type list, cross-block growth *(P39, depends on Variant)*
-- [ ] **`JSON` Tier 2** (FLATTENED mode) — path list + per-path Dynamic + shared-data column *(P41, depends on LowCardinality + Variant + Dynamic)*
+- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch 
+- [ ] **`Dynamic`** — version prefix, runtime-discovered type list, cross-block growth (depends on Variant)
+- [ ] **`JSON` Tier 2** (FLATTENED mode) — path list + per-path Dynamic + shared-data column (depends on LowCardinality + Variant + Dynamic)
 
 ### Native protocol — chunked framing (the big one)
 
 - [ ] **v54470 chunked protocol** *(P53)* — per-packet chunk framing (`[chunk_size][bytes][zero terminator]`) plus Addendum negotiation (`proto_send_chunked` / `proto_recv_chunked`). Touches `NATIVE_PROTOCOL.md` §4 (Packet Envelope) and §5 (Connection Lifecycle).
-- [ ] Chunked-protocol section in `NATIVE_PROTOCOL.md` *(P73, blocked on P53)*
 
-### Native protocol — message-body field additions
-
-Each adds a row to the `NATIVE_PROTOCOL.md` §3.3 feature table plus fields in the affected message section.
+### Native protocol — message-body field additions (minor)
 
 External-client-facing:
 - [ ] v54461 — `ServerHello` password complexity rules
