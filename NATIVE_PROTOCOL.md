@@ -95,6 +95,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | ADDENDUM                        | 54458   | Handshake              | Client sends an addendum (`quota_key`) after the handshake exchange. |
 | PARAMETERS                      | 54459   | Query                  | Adds the parameters list to the Query body. |
 | SERVER_QUERY_TIME_IN_PROGRESS   | 54460   | Progress               | Adds the `elapsed_ns` field to Progress. |
+| PASSWORD_COMPLEXITY_RULES       | 54461   | ServerHello            | Adds a list of password-policy regex patterns and human-readable messages to ServerHello. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
 
 ---
@@ -344,6 +345,18 @@ Message tables document only the body of each packet (after the packet type code
 | 5 | timezone         | String  | universal | TIMEZONE (v54058)      | Server timezone (e.g., `"UTC"`) |
 | 6 | display_name     | String  | universal | DISPLAY_NAME (v54372)  | Human-readable server name |
 | 7 | version_patch    | VarUInt | universal | VERSION_PATCH (v54401) | Server patch version |
+| 8 | password_complexity_rules | Rule[] | universal | PASSWORD_COMPLEXITY_RULES (v54461) | Server's password policy. `VarUInt count` followed by `count × Rule`. See below. |
+
+**Rule** — element of `password_complexity_rules`:
+
+| # | Field   | Type   | Description |
+|---|---------|--------|-------------|
+| 1 | pattern | String | Regular-expression pattern that a compliant password must match. |
+| 2 | message | String | Human-readable explanation shown when a password fails this rule. |
+
+The list reflects the server operator's password-policy configuration and is purely advisory — the server does not enforce these rules during this handshake. Clients that expose password change/set functionality may use the rules to surface errors before round-tripping a non-compliant password to the server.
+
+To bound resource use against a hostile or misconfigured server, the decoded `count` SHOULD be capped at 256 entries, and each `pattern` and `message` String SHOULD be capped at 4096 bytes. A `count` of `0` (and therefore no following pairs) is the common case for servers with no password policy configured.
 
 ### 6.3 Addendum (no packet type)
 

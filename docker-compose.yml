@@ -1,6 +1,6 @@
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION-25.3-alpine}
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION-26.5-alpine}
     ports:
       - "9000:9000"
       - "8123:8123"

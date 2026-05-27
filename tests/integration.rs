@@ -106,6 +106,24 @@ fn test_ping_multiple_connections() {
 }
 
 #[test]
+fn test_handshake_at_v54461_aligns_stream_for_query() {
+    // At negotiated protocol >= 54461 the ServerHello carries a trailing
+    // `password_complexity_rules` block (VarUInt count + N × (String, String)).
+    // If the decoder consumed too few or too many bytes for this field, the
+    // very next packet read — the response to any query — would misalign and
+    // fail.  Use SELECT 1 as the cheapest probe.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn.query("SELECT 1").unwrap();
+    assert!(
+        result.header.is_some(),
+        "expected a header block after SELECT 1 — missing header strongly suggests \
+         the v54461 ServerHello decode misaligned the stream"
+    );
+    assert_eq!(result.row_count(), 1, "SELECT 1 must return exactly one row");
+}
+
+#[test]
 fn test_simple_query() {
     require_server();
     let mut conn = Connection::connect(ADDR, None, None, None).unwrap();

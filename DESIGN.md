@@ -34,11 +34,11 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 done; Variant / Dynamic / JSON Tier 2 deferred) |
 | 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
-| 11    | Bring spec up to server v54483               | 46–65  | ⏳ |
+| 11    | Bring spec up to server v54483               | 46–65  | ⚠️ (46 done; 47–65 pending) |
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
 | 13    | Spec completion                              | 70–73  | ⚠️ (composite + versioned + compression sections done; chunked-protocol pending) |
 
-**Test coverage at the time of writing:** 253 unit tests + 88 integration tests, all passing.
+**Test coverage at the time of writing:** 259 unit tests + 89 integration tests, all passing.
 
 **Spec deliverables:**
 
@@ -721,19 +721,21 @@ Extension of Problem 44. Let the caller push blocks incrementally.
 
 ---
 
-### Phase 11: Bring spec up to server v54483 — new feature sections ⏳
+### Phase 11: Bring spec up to server v54483 — new feature sections ⚠️
 
 Document the features added between v54460 (current spec's cap) and v54483. Each feature goes into `NATIVE_PROTOCOL.md` §3.3 (feature table); most also add fields to existing message types.
 
-#### Problem 46: v54461 — password complexity rules
+#### Problem 46: v54461 — password complexity rules ✅
 
 ServerHello gets: `VarUInt rules_count` + `count × (String pattern, String message)` if client ≥ 54461.
 
-**Spec work:** update §7.2 ServerHello table + §4.3 feature table.
+**Implementation:** new `Feature::PASSWORD_COMPLEXITY_RULES` constant; `ServerHello.password_complexity_rules: Option<Vec<(String, String)>>` field with feature-gated encode/decode; decoder enforces a 256-rule cap (matching `DBMS_MAX_PASSWORD_COMPLEXITY_RULES`) before any allocation; client's declared max protocol bumped from `54459` (PARAMETERS) to `54461`. Per-string 4096-byte cap (`DBMS_MAX_HELLO_STRING_SIZE`) deferred — it requires a capped `read_string` variant in `wire.rs` and the same cap should apply consistently to every handshake-time string, not just these two.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 (feature table row) + §6.2 (ServerHello field 8 plus a Rule sub-table and a paragraph specifying the SHOULD caps and the advisory semantics). `IMPLEMENTATION_NOTES.md` §1.11 covers the bounded-decode hazard and the per-string cap rationale.
 
 **References:**
-- ClickHouse: `src/Server/TCPHandler.cpp` (~line 2205, `sendHello`); feature flag `DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES = 54461` in `src/Core/ProtocolDefines.h`
-- ch-go: not implemented (v54460 cap)
+- ClickHouse: `src/Server/TCPHandler.cpp:2131-2160` (`sendHello`); `src/Client/Connection.cpp:610-633` (receive). Feature flag `DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES = 54461` in `src/Core/ProtocolDefines.h:85`. Cap constants in the same file at lines 92 and 100.
+- ch-go: not implemented (v54460 cap).
 
 ---
 

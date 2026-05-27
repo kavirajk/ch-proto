@@ -1,4 +1,4 @@
-CLICKHOUSE_VERSION ?= 25.3-alpine
+CLICKHOUSE_VERSION ?= 26.5-alpine
 
 .PHONY: up down test test-integration test-unit
 

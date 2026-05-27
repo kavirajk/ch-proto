@@ -52,6 +52,11 @@ pub struct ServerHello {
     pub timezone: Option<String>,     // feature-gated: TIMEZONE
     pub display_name: Option<String>, // feature-gated: DISPLAY_NAME
     pub version_patch: Option<u64>,   // feature-gated: VERSION_PATCH
+    // talks about what each password complexity rules are. Individual rule are basically
+    // a pair of tuple of (Regex-Pattern, Explanation).
+    // 1. Regex-Pattern - express the password rule (e.g: no special symbols)
+    // 2. Explanation - A string that explains the password rule if not met.
+    pub password_complexity_rules: Option<Vec<(String, String)>>, // feature-gated: PASSWORD_COMPLEXITY_RULES
 }
 
 impl ServerHello {
@@ -89,6 +94,20 @@ impl ServerHello {
             })?)?;
         }
 
+        if Feature::PASSWORD_COMPLEXITY_RULES.in_version(protocol) {
+            let rules = self.password_complexity_rules.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("password_complexity_rules required for this protocol version ({protocol})"),
+                )
+            })?;
+            w.write_varuint(rules.len() as u64)?;
+            for (pattern, message) in rules {
+                w.write_string(pattern)?;
+                w.write_string(message)?;
+            }
+        }
+
         Ok(())
     }
     pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> io::Result<ServerHello> {
@@ -112,9 +131,36 @@ impl ServerHello {
             } else {
                 None
             },
+            password_complexity_rules: if Feature::PASSWORD_COMPLEXITY_RULES.in_version(protocol) {
+                let count = r.read_varuint()?;
+                if count > MAX_PASSWORD_COMPLEXITY_RULES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "password_complexity_rules count {count} exceeds maximum of {MAX_PASSWORD_COMPLEXITY_RULES}"
+                        ),
+                    ));
+                }
+                let mut rules = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let pattern = r.read_string()?;
+                    let message = r.read_string()?;
+                    rules.push((pattern, message));
+                }
+                Some(rules)
+            } else {
+                None
+            },
         })
     }
 }
+
+// Defensive cap on `ServerHello.password_complexity_rules` count. Matches the
+// canonical server- and client-side limit `DBMS_MAX_PASSWORD_COMPLEXITY_RULES`
+// in `ClickHouse/src/Core/ProtocolDefines.h`. Prevents a hostile or
+// misconfigured server from forcing an unbounded allocation via the
+// `Vec::with_capacity(count)` call above. See IMPLEMENTATION_NOTES §1.11.
+const MAX_PASSWORD_COMPLEXITY_RULES: u64 = 256;
 
 #[cfg(test)]
 mod tests {
@@ -142,6 +188,7 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("production-1".to_string()),
             version_patch: Some(3),
+            password_complexity_rules: None,
         }
     }
 
@@ -255,6 +302,7 @@ mod tests {
             timezone: None,
             display_name: None,
             version_patch: None,
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -279,6 +327,7 @@ mod tests {
             timezone: Some("Europe/Moscow".to_string()),
             display_name: None,
             version_patch: None,
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -302,6 +351,7 @@ mod tests {
             timezone: Some("Asia/Kolkata".to_string()),
             display_name: Some("replica-2".to_string()),
             version_patch: None,
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -336,6 +386,7 @@ mod tests {
             timezone: None, // missing but required
             display_name: Some("test".to_string()),
             version_patch: Some(1),
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -353,6 +404,7 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: None, // missing but required
             version_patch: Some(1),
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -370,6 +422,7 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: None, // missing but required
+            password_complexity_rules: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -392,6 +445,7 @@ mod tests {
             timezone: None,
             display_name: None,
             version_patch: None,
+            password_complexity_rules: None,
         };
         base_hello.encode(&mut buf_old, 50000).unwrap();
 
@@ -429,5 +483,144 @@ mod tests {
         let decoded_server = ServerHello::decode(&mut cursor, protocol).unwrap();
         assert_eq!(decoded_server.name, "ClickHouse");
         assert_eq!(decoded_server.timezone, Some("UTC".to_string()));
+    }
+
+    // -- Password complexity rules (v54461) --
+
+    fn make_server_hello_v54461(rules: Option<Vec<(String, String)>>) -> ServerHello {
+        ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 23,
+            version_minor: 1,
+            protocol_version: Feature::PASSWORD_COMPLEXITY_RULES.version() as u64,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("test".to_string()),
+            version_patch: Some(0),
+            password_complexity_rules: rules,
+        }
+    }
+
+    #[test]
+    fn test_server_hello_roundtrip_with_password_rules() {
+        let protocol = Feature::PASSWORD_COMPLEXITY_RULES.version();
+        let rules = vec![
+            (
+                ".{12,}".to_string(),
+                "Password must be at least 12 characters".to_string(),
+            ),
+            (
+                "[0-9]".to_string(),
+                "Password must contain a digit".to_string(),
+            ),
+        ];
+        let hello = make_server_hello_v54461(Some(rules.clone()));
+
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(&buf[1..]); // skip packet type
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.password_complexity_rules, Some(rules));
+    }
+
+    #[test]
+    fn test_server_hello_roundtrip_zero_password_rules() {
+        // The common real-world case: server has no password policy configured.
+        // The feature is active so the field is present, but the list is empty.
+        let protocol = Feature::PASSWORD_COMPLEXITY_RULES.version();
+        let hello = make_server_hello_v54461(Some(vec![]));
+
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(&buf[1..]);
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.password_complexity_rules, Some(vec![]));
+    }
+
+    #[test]
+    fn test_server_hello_password_rules_absent_below_v54461() {
+        // At v54460 the field gate is closed — encode emits nothing, decode
+        // returns None, and the stream position is identical to a v54460 hello
+        // without the field. (Regression guard against a future change that
+        // accidentally always emits the field.)
+        let protocol = 54460;
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 22,
+            version_minor: 0,
+            protocol_version: 54460,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("test".to_string()),
+            version_patch: Some(0),
+            password_complexity_rules: None,
+        };
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(&buf[1..]);
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.password_complexity_rules, None);
+        // Stream must be fully consumed — no trailing bytes from a stray field.
+        assert_eq!(cursor.position() as usize, buf.len() - 1);
+    }
+
+    #[test]
+    fn test_server_hello_encode_errors_on_missing_password_rules() {
+        let protocol = Feature::PASSWORD_COMPLEXITY_RULES.version();
+        let hello = make_server_hello_v54461(None);
+
+        let mut buf = Vec::new();
+        let err = hello.encode(&mut buf, protocol).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_server_hello_decode_rejects_oversized_rules_count() {
+        // A hostile server could send a huge VarUInt count, hoping a naive
+        // decoder will pre-allocate a vector of that size. Verify the cap
+        // rejects it with InvalidData before any allocation happens.
+        let protocol = Feature::PASSWORD_COMPLEXITY_RULES.version();
+        let mut buf = Vec::new();
+        // Hand-craft a stream that gets past all gated fields and lands on
+        // an oversized count. The packet-type byte is not part of `decode`
+        // so we skip it.
+        buf.write_string("ClickHouse").unwrap();
+        buf.write_varuint(23).unwrap(); // version_major
+        buf.write_varuint(1).unwrap(); // version_minor
+        buf.write_varuint(protocol as u64).unwrap(); // protocol_version
+        buf.write_string("UTC").unwrap(); // timezone
+        buf.write_string("test").unwrap(); // display_name
+        buf.write_varuint(0).unwrap(); // version_patch
+        buf.write_varuint(1000).unwrap(); // OVERSIZED rules count
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let err = ServerHello::decode(&mut cursor, protocol).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1000") && msg.contains("256"),
+            "expected error to mention both the bad count and the limit; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_server_hello_wire_size_grows_with_password_rules() {
+        // Sanity check: encoding one rule produces strictly more bytes than
+        // encoding zero rules. Guards against a regression where the encoder
+        // accidentally drops the per-rule strings.
+        let protocol = Feature::PASSWORD_COMPLEXITY_RULES.version();
+        let empty = make_server_hello_v54461(Some(vec![]));
+        let populated = make_server_hello_v54461(Some(vec![(
+            ".{8,}".to_string(),
+            "min 8 chars".to_string(),
+        )]));
+
+        let mut buf_empty = Vec::new();
+        empty.encode(&mut buf_empty, protocol).unwrap();
+        let mut buf_pop = Vec::new();
+        populated.encode(&mut buf_pop, protocol).unwrap();
+
+        assert!(buf_pop.len() > buf_empty.len());
     }
 }

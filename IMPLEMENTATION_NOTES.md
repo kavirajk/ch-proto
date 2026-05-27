@@ -21,6 +21,7 @@ The reference implementation is the Rust client in this repository. Where a note
    - 1.8 [Multiple Progress packets are cumulative, not deltas](#18-multiple-progress-packets-are-cumulative-not-deltas)
    - 1.9 [Query parameter values must be single-quoted on the wire](#19-query-parameter-values-must-be-single-quoted-on-the-wire)
    - 1.10 [Client must declare a protocol version at or above each feature it needs](#110-client-must-declare-a-protocol-version-at-or-above-each-feature-it-needs)
+   - 1.11 [ServerHello `password_complexity_rules` needs a bounded decode](#111-serverhello-password_complexity_rules-needs-a-bounded-decode)
 2. [Format-level notes](#format-level-notes)
    - 2.1 [Column must include `has_custom_serialization` byte at v54454+](#21-column-must-include-has_custom_serialization-byte-at-v54454)
    - 2.2 [`Enum8` / `Enum16` are wire-compatible with `Int8` / `Int16`](#22-enum8--enum16-are-wire-compatible-with-int8--int16)
@@ -168,6 +169,27 @@ For example, declaring the client's max version as the `ADDENDUM` feature versio
 **Fix.** The client's declared `protocol_version` in ClientHello must be at least the maximum version of any feature the client wants to use. In practice, declare the highest version supported by the implementation and let version negotiation pick the actual working version.
 
 This is a silent failure mode: no error is emitted during encoding, and the server often accepts the malformed packet and simply executes the query without the expected feature data. Hard to debug without diffing against known-good packet captures.
+
+---
+
+### 1.11 ServerHello `password_complexity_rules` needs a bounded decode
+
+**Symptom.** A connection succeeds against a normally-configured server but a hostile or misconfigured server can force the client into an arbitrarily large allocation during handshake — at worst, an OOM before the first query runs.
+
+**Cause.** At negotiated version ≥ 54461, ServerHello carries `VarUInt count` followed by `count × (String pattern, String message)`. The wire encoding of `count` is one to ten bytes, but the decoded value can reach `2^64 − 1`. A decoder that treats `count` as trusted and pre-allocates `Vec::with_capacity(count)` (or the language equivalent) hands the server a memory-amplification primitive — a single ten-byte VarUInt can request a multi-exabyte allocation.
+
+The same hazard applies, to a smaller degree, to the inner `pattern` and `message` strings: the standard length-prefixed `String` reader allocates up to the declared length before reading any payload bytes.
+
+**Fix.** Treat both the rule count and the per-string length as untrusted. Cap and reject:
+
+- `count > 256` → protocol error, tear down the connection. (The canonical C++ server enforces the same cap at send time; the canonical C++ client enforces it on receive.)
+- `pattern.len() > 4096` or `message.len() > 4096` → protocol error.
+
+Both caps match the C++ constants `DBMS_MAX_PASSWORD_COMPLEXITY_RULES` and `DBMS_MAX_HELLO_STRING_SIZE` in `src/Core/ProtocolDefines.h`.
+
+A useful generalisation: **never `reserve()` based on an untrusted length without an upstream sanity bound**. This applies to every server-supplied count in the handshake, and to most server-supplied counts in the rest of the protocol — though most other counts (row counts, column counts, etc.) sit downstream of large packet bodies that the client must already have buffered, which puts an implicit bound on the value the server can choose.
+
+**Display-layer note.** The strings originate from operator config (`<password_complexity>` blocks). If the client surfaces them to users, run them through control-character sanitization at the display boundary — operators can paste in newlines or terminal escape sequences that would otherwise garble a terminal. This is a UI concern, not a protocol concern, and lives outside the wire decoder.
 
 ---
 

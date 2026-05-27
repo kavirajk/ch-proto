@@ -17,6 +17,7 @@ impl Feature {
     pub const ADDENDUM: Feature = Feature(54458);
     pub const PARAMETERS: Feature = Feature(54459);
     pub const SERVER_QUERY_TIME_IN_PROGRESS: Feature = Feature(54460);
+    pub const PASSWORD_COMPLEXITY_RULES: Feature = Feature(54461);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
 }
 
