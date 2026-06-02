@@ -1,0 +1,16 @@
+# Stage 0 allowlist — ClickHouse stateless query tests that pass through
+# our wrapper byte-for-byte against `.reference`, using only the formatters
+# implemented in src/tsv.rs (integers, Float32/64, String, Bool, Nullable).
+#
+# Path is relative to $CLICKHOUSE_QUERIES (see Makefile). Curated from the
+# initial 1,147-test exploratory run; first 10 passing simple tests.
+00001_select_1.sql
+00003_reinterpret_as_string.sql
+00008_array_join.sql
+00018_distinct_in_subquery.sql
+00022_func_higher_order_and_constants.sql
+00041_aggregation_remap.sql
+00042_set.sql
+00064_negate_bug.sql
+00078_string_concat.sql
+00081_int_div_or_zero.sql

@@ -25,6 +25,12 @@ harness = false
 name = "column"
 harness = false
 
+# Differential-testing wrapper: reads a .sql file, prints TSV result rows.
+# See tests/differential/ and DESIGN.md.
+[[bin]]
+name = "ch-tsv"
+path = "src/bin/ch-tsv.rs"
+
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4"] }
 hostname = "0.4"
