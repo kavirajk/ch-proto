@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Stage 0 differential harness.
+# Differential harness — parallel execution.
 #
 # Usage: tests/differential/run.sh <CORPUS_DIR> <ALLOWLIST_FILE> [--verbose]
 #
 # For each .sql file named in ALLOWLIST_FILE:
-#   1. Runs `ch-tsv <CORPUS_DIR>/<file>.sql` capturing stdout + exit code.
-#   2. Diffs the captured stdout against `<CORPUS_DIR>/<file>.reference`.
-#   3. Buckets the result into pass / mismatch / unsupported_type /
-#      server_error / io_error / crash.
+#   1. Wraps the SQL in a per-test CREATE/USE/DROP DATABASE envelope so DDL
+#      tests don't collide.
+#   2. Runs `ch-tsv <wrapped.sql>` capturing stdout, stderr, exit code.
+#   3. Diffs stdout against `<CORPUS_DIR>/<base>.reference`.
+#   4. Classifies into pass / mismatch / unsupported_type / server_error /
+#      io_error / crash and writes the classification to <OUTDIR>/<base>.bucket.
+# After all tests finish, aggregates the .bucket files into a summary.
 #
-# Outputs a summary table and, for the first few failures, a one-line root
-# cause hint. With --verbose, also dumps the full unified diff for each
-# mismatch.
+# JOBS env var controls parallelism (default 8). Tests run in parallel since
+# each has its own ephemeral database — no cross-test state.
+#
+# TIMEOUT_S caps each test's wall-clock (default 30s). A timed-out test
+# lands in the CRASH bucket so a single hung query can't block the run.
 
 set -u -o pipefail
 
@@ -27,15 +32,77 @@ if [[ $# -ge 3 && "$3" == "--verbose" ]]; then
     VERBOSE=1
 fi
 
-BIN="$(dirname "$0")/../../target/release/ch-tsv"
+BIN="$(cd "$(dirname "$0")/../.." && pwd)/target/release/ch-tsv"
 if [[ ! -x "$BIN" ]]; then
     echo "ch-tsv binary missing at $BIN — run cargo build --release --bin ch-tsv" >&2
     exit 1
 fi
 
-OUTDIR="$(dirname "$0")/out"
+OUTDIR="$(cd "$(dirname "$0")" && pwd)/out"
 mkdir -p "$OUTDIR"
 
+JOBS="${JOBS:-8}"
+TIMEOUT_S="${TIMEOUT_S:-30}"
+DB_PREFIX="test_$$"
+
+# Per-test worker. Args: relpath, db_suffix.
+run_one() {
+    local relpath="$1"
+    local db_suffix="$2"
+    local base="${relpath%.sql}"
+    local sql_path="$CORPUS/$relpath"
+    local ref_path="$CORPUS/${base}.reference"
+    local out_path="$OUTDIR/${base}.actual"
+    local err_path="$OUTDIR/${base}.stderr"
+    local bucket_path="$OUTDIR/${base}.bucket"
+    local db="${DB_PREFIX}_${db_suffix}"
+
+    if [[ ! -f "$ref_path" ]]; then
+        echo "MISSING_REF" > "$bucket_path"
+        return
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    {
+        echo "CREATE DATABASE IF NOT EXISTS $db;"
+        echo "USE $db;"
+        cat "$sql_path"
+        echo ";"
+        echo "DROP DATABASE IF EXISTS $db;"
+    } > "$tmpfile"
+
+    timeout "$TIMEOUT_S" "$BIN" "$tmpfile" > "$out_path" 2> "$err_path"
+    local rc=$?
+    rm -f "$tmpfile"
+
+    local bucket
+    case $rc in
+        0)
+            if diff -q "$ref_path" "$out_path" > /dev/null 2>&1; then
+                bucket=PASS
+            else
+                bucket=MISMATCH
+            fi
+            ;;
+        1)   bucket=IO_ERROR ;;
+        2)   bucket=SERVER_ERROR ;;
+        3)   bucket=UNSUPPORTED_TYPE ;;
+        124) bucket=CRASH; echo "ch-tsv: timed out after ${TIMEOUT_S}s" >> "$err_path" ;;
+        *)   bucket=CRASH ;;
+    esac
+    echo "$bucket" > "$bucket_path"
+}
+
+export -f run_one
+export CORPUS OUTDIR BIN TIMEOUT_S DB_PREFIX
+
+# Hand each (relpath, sequence-number) pair to a parallel worker. The seq
+# number gives each test a unique DB name even within the same PID.
+grep -v '^#' "$LIST" | grep -v '^$' | nl -ba | \
+    xargs -P "$JOBS" -n 2 bash -c 'run_one "$2" "$1"' _
+
+# Aggregate.
 declare -i pass=0 mismatch=0 unsupported=0 server_err=0 io_err=0 crash=0 missing_ref=0
 declare -a mismatch_files=()
 declare -a unsupported_files=()
@@ -47,56 +114,25 @@ declare -A first_err_msg
 while IFS= read -r relpath || [[ -n "$relpath" ]]; do
     [[ -z "$relpath" || "$relpath" =~ ^# ]] && continue
     base="${relpath%.sql}"
-    sql_path="$CORPUS/$relpath"
-    ref_path="$CORPUS/${base}.reference"
-    out_path="$OUTDIR/${base}.actual"
+    bucket_path="$OUTDIR/${base}.bucket"
     err_path="$OUTDIR/${base}.stderr"
-
-    if [[ ! -f "$ref_path" ]]; then
-        missing_ref+=1
-        continue
-    fi
-
-    "$BIN" "$sql_path" > "$out_path" 2> "$err_path"
-    rc=$?
-
-    case $rc in
-        0)
-            if diff -q "$ref_path" "$out_path" > /dev/null 2>&1; then
-                pass+=1
-            else
-                mismatch+=1
-                mismatch_files+=("$relpath")
-                first_err_msg["$relpath"]="output diff"
-            fi
-            ;;
-        1)
-            io_err+=1
-            io_err_files+=("$relpath")
-            first_err_msg["$relpath"]="$(head -n1 "$err_path")"
-            ;;
-        2)
-            server_err+=1
-            server_err_files+=("$relpath")
-            first_err_msg["$relpath"]="$(head -n1 "$err_path")"
-            ;;
-        3)
-            unsupported+=1
-            unsupported_files+=("$relpath")
-            first_err_msg["$relpath"]="$(head -n1 "$err_path")"
-            ;;
-        *)
-            crash+=1
-            crash_files+=("$relpath")
-            first_err_msg["$relpath"]="exit $rc; $(head -n1 "$err_path" 2>/dev/null)"
-            ;;
+    [[ ! -f "$bucket_path" ]] && continue
+    bucket=$(<"$bucket_path")
+    case $bucket in
+        PASS)              pass+=1 ;;
+        MISMATCH)          mismatch+=1; mismatch_files+=("$relpath"); first_err_msg["$relpath"]="output diff" ;;
+        UNSUPPORTED_TYPE)  unsupported+=1; unsupported_files+=("$relpath"); first_err_msg["$relpath"]="$(head -n1 "$err_path" 2>/dev/null)" ;;
+        SERVER_ERROR)      server_err+=1; server_err_files+=("$relpath"); first_err_msg["$relpath"]="$(head -n1 "$err_path" 2>/dev/null)" ;;
+        IO_ERROR)          io_err+=1; io_err_files+=("$relpath"); first_err_msg["$relpath"]="$(head -n1 "$err_path" 2>/dev/null)" ;;
+        CRASH)             crash+=1; crash_files+=("$relpath"); first_err_msg["$relpath"]="$(head -n1 "$err_path" 2>/dev/null)" ;;
+        MISSING_REF)       missing_ref+=1 ;;
     esac
 done < "$LIST"
 
 total=$((pass + mismatch + unsupported + server_err + io_err + crash))
 
 echo "============================================================"
-echo "  Stage 0 differential summary"
+echo "  Differential harness summary (parallel, JOBS=$JOBS)"
 echo "============================================================"
 printf "  PASS              %d\n" "$pass"
 printf "  MISMATCH          %d\n" "$mismatch"
@@ -140,7 +176,7 @@ if [[ $VERBOSE -eq 1 && $mismatch -gt 0 ]]; then
     done
 fi
 
-# Exit status: 0 only if every test in the list passed.
+# Exit 0 only if every test passed.
 if [[ $pass -eq $total ]]; then
     exit 0
 else

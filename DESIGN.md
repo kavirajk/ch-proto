@@ -38,7 +38,17 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
 | 13    | Spec completion                              | 70–73  | ⚠️ (composite + versioned + compression sections done; chunked-protocol pending) |
 
-**Test coverage at the time of writing:** 275 unit tests + 89 integration tests, all passing. Plus a differential harness running against ClickHouse's `tests/queries/0_stateless` corpus: **969 / 1141 SQL tests pass byte-for-byte** against `.reference` (84.9%) using a TabSeparated formatter (`src/tsv.rs`) and the `ch-tsv` wrapper binary. See `tests/differential/` and `make test-differential-stage0`.
+**Test coverage at the time of writing:** 275 unit tests + 89 integration tests, all passing.
+
+Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
+
+| Run | Tests addressable | PASS | Pass rate |
+|-----|------------------:|------:|----------:|
+| Stage 0 (TSV primitives, allowlist) | 10 | 10 | 100% |
+| Stage 1 (broader TSV, SELECT-only filter) | 1,141 | 969 | 84.9% |
+| Stage 2 (CREATE/INSERT/SET unlocked via per-test DB) | 3,753 | **3,050** | **81.3%** |
+
+The Stage 2 expansion unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREATE DATABASE test_<pid>_<n>; USE ...; DROP DATABASE` envelope inside the harness — the same pattern the canonical `clickhouse-test` runner uses. SET/SETTINGS pass through transparently because they're regular SQL statements on the wire.
 
 **Spec deliverables:**
 
