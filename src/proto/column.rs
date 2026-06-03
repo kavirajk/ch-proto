@@ -183,6 +183,17 @@ pub enum ColumnData {
         fields: Vec<(String, ColumnData)>,
         offsets: Vec<u64>,
     },
+    /// `Nothing` — a column type with no possible values. In practice it
+    /// appears wrapped as `Nullable(Nothing)` for queries like `SELECT NULL`,
+    /// where every value is NULL and the inner type carries no information.
+    ///
+    /// Wire format (matches `SerializationNothing::serializeBinaryBulk` in
+    /// `ClickHouse/src/DataTypes/Serializations/SerializationNothing.cpp`):
+    /// exactly **one placeholder byte per row** — the C++ side writes the
+    /// ASCII character `'0'` (0x30); the deserializer discards the bytes
+    /// without inspecting them. We follow the deserializer: read `rows` bytes
+    /// and ignore them, store only the row count.
+    Nothing(usize),
 }
 
 impl Column {
@@ -295,6 +306,7 @@ impl ColumnData {
             ColumnData::Uint256(v) => v.len(),
             ColumnData::Json(v) => v.len(),
             ColumnData::LowCardinality { keys, .. } => keys.len(),
+            ColumnData::Nothing(rows) => *rows,
         }
     }
 
@@ -740,6 +752,15 @@ impl ColumnData {
                     }
                 }
             }
+            ColumnData::Nothing(rows) => {
+                // Match SerializationNothing::serializeBinaryBulk: write the
+                // ASCII character '0' (0x30) per row. Content is ignored on
+                // decode; we keep the value the canonical server uses so the
+                // bytes round-trip identically.
+                for _ in 0..*rows {
+                    w.write_u8(b'0')?;
+                }
+            }
         }
         Ok(())
     }
@@ -1098,6 +1119,17 @@ impl ColumnData {
 
                 Ok(ColumnData::Nullable { inner, nulls })
             }
+            "Nothing" => {
+                // SerializationNothing writes one placeholder byte per row
+                // (the ASCII character '0'). We follow the deserializer and
+                // simply skip them — the only valid "value" of Nothing is the
+                // absence of a value, which Nullable's null map already
+                // signals. Common occurrence: `SELECT NULL` returns a
+                // `Nullable(Nothing)` column where every entry is NULL.
+                let mut placeholder = vec![0u8; rows];
+                r.read_exact(&mut placeholder)?;
+                Ok(ColumnData::Nothing(rows))
+            }
             "Tuple" => {
                 let inner_dts = parse_tuple_inner_types(data_type)?;
                 let mut dts: Vec<ColumnData> = Vec::with_capacity(inner_dts.len());
@@ -1317,7 +1349,30 @@ fn parse_tuple_inner_types(data_type: &str) -> Result<Vec<String>> {
 
     let inner = data_type[begin + 1..end].trim().to_string();
     let dts: Vec<String> = split_with_composite(&inner)?;
-    Ok(dts)
+    // Named-tuple support: `Tuple(name1 UInt64, name2 String)`. After the
+    // depth-aware split each piece may carry a leading identifier; strip it
+    // so the recursive decoder sees only the type. The wire format is the
+    // same as for unnamed tuples — only the type string changes.
+    Ok(dts.into_iter().map(|s| strip_field_name(&s).to_string()).collect())
+}
+
+// Drop a leading field name from a tuple element. Conservative rule: if
+// the element has whitespace before its first `(` (or anywhere, when no
+// parens), take everything from the last such whitespace forward. Handles:
+//   "Int32"                  -> "Int32"
+//   "name UInt64"            -> "UInt64"
+//   "Tuple(Int8)"            -> "Tuple(Int8)"
+//   "k Tuple(Int8, String)"  -> "Tuple(Int8, String)"
+//   "n Nullable(UInt32)"     -> "Nullable(UInt32)"
+fn strip_field_name(s: &str) -> &str {
+    let s = s.trim();
+    let cutoff = s.find('(').unwrap_or(s.len());
+    let prefix = &s[..cutoff];
+    if let Some(ws) = prefix.rfind(char::is_whitespace) {
+        s[ws..].trim_start()
+    } else {
+        s
+    }
 }
 
 // split the data type considering the composite nested depth.
@@ -1485,6 +1540,65 @@ mod tests {
         match decoded.data {
             ColumnData::Uint8(v) => assert_eq!(v, vec![1, 2, 3, 255, 0]),
             _ => panic!("expected UInt8"),
+        }
+    }
+
+    #[test]
+    fn test_column_nothing_roundtrip() {
+        // `Nothing` columns appear in practice as the inner type of
+        // `Nullable(Nothing)` — what `SELECT NULL` returns. The wire encoding
+        // is exactly `rows` placeholder bytes (the canonical server writes
+        // the ASCII character '0', 0x30); the deserializer ignores them.
+        let col = Column {
+            name: "n".to_string(),
+            data_type: "Nothing".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nothing(4),
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        // The four placeholder bytes must appear at the tail (header bytes
+        // come first: name, type string, has_custom_serialization byte).
+        assert_eq!(&buf[buf.len() - 4..], b"0000");
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, PROTOCOL).unwrap();
+        assert_eq!(decoded.data_type, "Nothing");
+        match decoded.data {
+            ColumnData::Nothing(rows) => assert_eq!(rows, 4),
+            _ => panic!("expected Nothing"),
+        }
+    }
+
+    #[test]
+    fn test_column_nullable_nothing_select_null() {
+        // The shape `Nullable(Nothing)` is what `SELECT NULL` returns. The
+        // null map is all 1s; the inner Nothing column is decoded but its
+        // values are never read because Nullable's null bit short-circuits.
+        let col = Column {
+            name: "x".to_string(),
+            data_type: "Nullable(Nothing)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Nullable {
+                inner: Box::new(ColumnData::Nothing(3)),
+                nulls: vec![1, 1, 1],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, PROTOCOL).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
+        match decoded.data {
+            ColumnData::Nullable { inner, nulls } => {
+                assert_eq!(nulls, vec![1, 1, 1]);
+                match *inner {
+                    ColumnData::Nothing(rows) => assert_eq!(rows, 3),
+                    _ => panic!("expected Nothing inner"),
+                }
+            }
+            _ => panic!("expected Nullable"),
         }
     }
 

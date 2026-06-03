@@ -38,7 +38,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
 | 13    | Spec completion                              | 70–73  | ⚠️ (composite + versioned + compression sections done; chunked-protocol pending) |
 
-**Test coverage at the time of writing:** 259 unit tests + 89 integration tests, all passing.
+**Test coverage at the time of writing:** 275 unit tests + 89 integration tests, all passing. Plus a differential harness running against ClickHouse's `tests/queries/0_stateless` corpus: **969 / 1141 SQL tests pass byte-for-byte** against `.reference` (84.9%) using a TabSeparated formatter (`src/tsv.rs`) and the `ch-tsv` wrapper binary. See `tests/differential/` and `make test-differential-stage0`.
 
 **Spec deliverables:**
 

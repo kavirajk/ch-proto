@@ -475,6 +475,23 @@ F1 FF FF FF FF FF FF FF  Int64 LE = -15
 87 D6 12 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
+#### 3.1.8 Nothing
+
+The `Nothing` type carries no values. It appears in practice only as the inner type of `Nullable(Nothing)` — what the server returns for expressions like `SELECT NULL` whose only valid value is the absence of a value. Conceptually a unit type.
+
+**Wire format.** Exactly **one placeholder byte per row**. The canonical server emits the ASCII character `'0'` (`0x30`); the deserializer ignores the bytes. The byte content is undefined and decoders MUST NOT rely on any specific value. The number of bytes written is `num_rows × 1`, so the column header's `num_rows` field fully determines how much to consume.
+
+**Why a byte per row at all?** The Block structure requires every column to span `bytes_per_value × num_rows` (or its equivalent for variable types) so that decoders can scan forward without per-cell length prefixes. `Nothing` keeps that invariant intact while carrying no information; the surrounding `Nullable` always reports every position as NULL, so the placeholders are never inspected.
+
+**Byte-level example — `Nullable(Nothing)` column with 3 rows (all NULL):**
+
+```
+01 01 01                 null map: 1, 1, 1 (three NULLs)
+30 30 30                 Nothing placeholder bytes (one per row)
+```
+
+The null-map prefix is the standard `Nullable` framing (§3.3); the inner three bytes are the `Nothing` payload and would be skipped by the decoder.
+
 ### 3.2 Variable-length Types
 
 Each value carries its own length on the wire.

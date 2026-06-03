@@ -113,15 +113,39 @@ fn main() -> ExitCode {
         }
         match conn.query(trimmed) {
             Ok(result) => {
+                // Data rows.
                 for block in &result.rows {
                     for row in 0..block.rows_count {
                         if let Err(e) = tsv::write_row(&mut out, &block.columns, row) {
-                            if e.kind() == io::ErrorKind::Unsupported {
-                                eprintln!("ch-tsv: {e}");
-                                return ExitCode::from(3);
-                            }
-                            eprintln!("ch-tsv: write failed: {e}");
+                            return formatter_or_io_exit(e);
+                        }
+                    }
+                }
+                // WITH TOTALS — single row preceded by a blank line.
+                // Matches TabSeparatedRowOutputFormat::writeBeforeTotals().
+                if let Some(t) = &result.totals {
+                    if t.rows_count > 0 {
+                        if out.write_all(b"\n").is_err() {
                             return ExitCode::from(1);
+                        }
+                        for row in 0..t.rows_count {
+                            if let Err(e) = tsv::write_row(&mut out, &t.columns, row) {
+                                return formatter_or_io_exit(e);
+                            }
+                        }
+                    }
+                }
+                // WITH EXTREMES — min row + max row preceded by a blank line.
+                // Matches TabSeparatedRowOutputFormat::writeBeforeExtremes().
+                if let Some(e) = &result.extremes {
+                    if e.rows_count > 0 {
+                        if out.write_all(b"\n").is_err() {
+                            return ExitCode::from(1);
+                        }
+                        for row in 0..e.rows_count {
+                            if let Err(err) = tsv::write_row(&mut out, &e.columns, row) {
+                                return formatter_or_io_exit(err);
+                            }
                         }
                     }
                 }
@@ -138,6 +162,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::from(0)
+}
+
+fn formatter_or_io_exit(e: io::Error) -> ExitCode {
+    if e.kind() == io::ErrorKind::Unsupported {
+        eprintln!("ch-tsv: {e}");
+        ExitCode::from(3)
+    } else {
+        eprintln!("ch-tsv: write failed: {e}");
+        ExitCode::from(1)
+    }
 }
 
 fn arg_error(msg: &str) -> ExitCode {
