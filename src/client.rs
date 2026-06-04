@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::PARALLEL_BLOCK_MARSHALLING.version() as u64,
+            protocol: Feature::VERSIONED_CLUSTER_FUNCTION_PROTOCOL.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };
@@ -545,6 +545,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         sh.encode(&mut buf, protocol).unwrap();

@@ -113,6 +113,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | JWT_IN_INTERSERVER              | 54476   | ClientInfo             | Adds a JWT-presence UInt8 + optional `String jwt` at the tail of ClientInfo. External clients (no JWT) send byte `0x00`. (Spelled `DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER` in C++ — note the typo in the constant name.) |
 | QUERY_PLAN_SERIALIZATION        | 54477   | ServerHello, QueryPlan packet | ServerHello appends `VarUInt query_plan_serialization_version` after server settings. Also introduces `ClientPacket::QueryPlan` (code `13`) for inter-server delivery of pre-built query plans — external clients never send. |
 | PARALLEL_BLOCK_MARSHALLING      | 54478   | Block (Column)         | Server may wrap columns in `ColumnBLOB` (compressed inline) for parallel processing. Gated on the query having compression enabled AND `rows > 1`; otherwise the regular column wire format applies. Clients that never enable compression on outgoing Query packets see no wire change. |
+| VERSIONED_CLUSTER_FUNCTION_PROTOCOL | 54479 | ServerHello           | Adds `VarUInt cluster_function_protocol_version` at the tail of ServerHello. Used for `*Cluster` table functions (`s3Cluster`, etc.). External clients decode and ignore. |
 
 ---
 
@@ -407,6 +408,7 @@ Message tables document only the body of each packet (after the packet type code
 | 11 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
 | 12 | server_settings  | Setting[] | universal | SERVER_SETTINGS (v54474)        | Server's non-default settings broadcast. Format: zero or more `(String key, VarUInt flags, String value)` triples, terminated by an empty key. Same as the Query packet's settings list (§6.9). |
 | 13 | query_plan_serialization_version | VarUInt | universal | QUERY_PLAN_SERIALIZATION (v54477) | Server's supported query-plan serialization version. External clients decode and ignore. |
+| 14 | cluster_function_protocol_version | VarUInt | universal | VERSIONED_CLUSTER_FUNCTION_PROTOCOL (v54479) | Server's `*Cluster` table-function protocol version. External clients decode and ignore. |
 
 **Rule** — element of `password_complexity_rules`:
 

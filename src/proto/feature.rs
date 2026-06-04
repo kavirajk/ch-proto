@@ -62,6 +62,7 @@ impl Feature {
     /// emits the regular dense form — no wire impact on us. Will need
     /// proper handling if/when compression integration lands (Problem 42/43).
     pub const PARALLEL_BLOCK_MARSHALLING: Feature = Feature(54478);
+    pub const VERSIONED_CLUSTER_FUNCTION_PROTOCOL: Feature = Feature(54479);
 }
 
 impl Feature {

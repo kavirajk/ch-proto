@@ -991,12 +991,18 @@ Server may wrap columns in `ColumnBLOB` (compressed inline) for parallel marshal
 
 ---
 
-#### Problem 61: v54479 — versioned cluster function protocol
+#### Problem 61: v54479 — versioned cluster function protocol ✅
 
-ServerHello gets another VarUInt version number. Mostly inter-server.
+ServerHello appends a `VarUInt cluster_function_protocol_version` after `query_plan_serialization_version`. Inter-server-related; external clients decode and ignore.
+
+**Implementation:** `Feature::VERSIONED_CLUSTER_FUNCTION_PROTOCOL = 54479`; `ServerHello.cluster_function_protocol_version: Option<u64>`; declared protocol bumped 54478 → 54479.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.2 ServerHello row 14.
+
+**Tests:** 302 unit + 89 integration pass at v54479.
 
 **References:**
-- ClickHouse: `DBMS_MIN_REVISION_WITH_VERSIONED_CLUSTER_FUNCTION_PROTOCOL = 54479`; `src/Server/TCPHandler.cpp::sendHello` (appended VarUInt)
+- ClickHouse: feature flag at `Core/ProtocolDefines.h:137`; `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION = 6` at `:42`; emit at `Server/TCPHandler.cpp:2183-2186`.
 
 ---
 

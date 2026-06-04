@@ -85,6 +85,10 @@ pub struct ServerHello {
     /// for inter-server flows that ship pre-built query plans; external
     /// clients decode and ignore.
     pub query_plan_serialization_version: Option<u64>,
+    /// Server's `*Cluster` function protocol version (v54479+). Used for
+    /// `s3Cluster`-style table functions in distributed mode. External
+    /// clients decode and ignore.
+    pub cluster_function_protocol_version: Option<u64>,
 }
 
 impl ServerHello {
@@ -201,6 +205,16 @@ impl ServerHello {
             w.write_varuint(v)?;
         }
 
+        if Feature::VERSIONED_CLUSTER_FUNCTION_PROTOCOL.in_version(protocol) {
+            let v = self.cluster_function_protocol_version.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cluster_function_protocol_version required at v{protocol}"),
+                )
+            })?;
+            w.write_varuint(v)?;
+        }
+
         Ok(())
     }
     pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> io::Result<ServerHello> {
@@ -285,6 +299,13 @@ impl ServerHello {
             } else {
                 None
             },
+            cluster_function_protocol_version: if Feature::VERSIONED_CLUSTER_FUNCTION_PROTOCOL
+                .in_version(protocol)
+            {
+                Some(r.read_varuint()?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -329,6 +350,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         }
     }
 
@@ -449,6 +471,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -480,6 +503,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -510,6 +534,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -551,6 +576,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -575,6 +601,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -599,6 +626,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -628,6 +656,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         base_hello.encode(&mut buf_old, 50000).unwrap();
 
@@ -685,6 +714,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         }
     }
 
@@ -748,6 +778,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -841,6 +872,7 @@ mod tests {
             nonce: Some(0xDEAD_BEEF_CAFE_BABE),
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
 
         let mut buf = Vec::new();
@@ -877,6 +909,7 @@ mod tests {
             nonce: None,
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -905,6 +938,7 @@ mod tests {
             nonce: None, // missing but required at v54462
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -934,6 +968,7 @@ mod tests {
             nonce: Some(0),
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
 
         let mut buf = Vec::new();
@@ -964,6 +999,7 @@ mod tests {
             nonce: Some(0),
             server_settings: None,
             query_plan_serialization_version: None,
+            cluster_function_protocol_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
