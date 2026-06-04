@@ -81,6 +81,10 @@ pub struct ServerHello {
     /// mode. Format on the wire matches the Query packet's settings list
     /// (key, flags, value triples terminated by an empty key).
     pub server_settings: Option<Vec<Setting>>,
+    /// Server's query-plan serialization version (v54477+). Only meaningful
+    /// for inter-server flows that ship pre-built query plans; external
+    /// clients decode and ignore.
+    pub query_plan_serialization_version: Option<u64>,
 }
 
 impl ServerHello {
@@ -187,6 +191,16 @@ impl ServerHello {
             w.write_string("")?;
         }
 
+        if Feature::QUERY_PLAN_SERIALIZATION.in_version(protocol) {
+            let v = self.query_plan_serialization_version.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("query_plan_serialization_version required at v{protocol}"),
+                )
+            })?;
+            w.write_varuint(v)?;
+        }
+
         Ok(())
     }
     pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> io::Result<ServerHello> {
@@ -264,6 +278,13 @@ impl ServerHello {
             } else {
                 None
             },
+            query_plan_serialization_version: if Feature::QUERY_PLAN_SERIALIZATION
+                .in_version(protocol)
+            {
+                Some(r.read_varuint()?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -307,6 +328,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         }
     }
 
@@ -426,6 +448,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -456,6 +479,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -485,6 +509,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -525,6 +550,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -548,6 +574,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -571,6 +598,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -599,6 +627,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         base_hello.encode(&mut buf_old, 50000).unwrap();
 
@@ -655,6 +684,7 @@ mod tests {
             password_complexity_rules: rules,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         }
     }
 
@@ -717,6 +747,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -809,6 +840,7 @@ mod tests {
             password_complexity_rules: Some(vec![]),
             nonce: Some(0xDEAD_BEEF_CAFE_BABE),
             server_settings: None,
+            query_plan_serialization_version: None,
         };
 
         let mut buf = Vec::new();
@@ -844,6 +876,7 @@ mod tests {
             password_complexity_rules: Some(vec![]),
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -871,6 +904,7 @@ mod tests {
             password_complexity_rules: Some(vec![]),
             nonce: None, // missing but required at v54462
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -899,6 +933,7 @@ mod tests {
             password_complexity_rules: Some(vec![]),
             nonce: Some(0),
             server_settings: None,
+            query_plan_serialization_version: None,
         };
 
         let mut buf = Vec::new();
@@ -928,6 +963,7 @@ mod tests {
             password_complexity_rules: Some(vec![]),
             nonce: Some(0),
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();

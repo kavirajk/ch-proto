@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::JWT_IN_INTERSERVER.version() as u64,
+            protocol: Feature::QUERY_PLAN_SERIALIZATION.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };
@@ -544,6 +544,7 @@ mod tests {
             password_complexity_rules: None,
             nonce: None,
             server_settings: None,
+            query_plan_serialization_version: None,
         };
         let mut buf = Vec::new();
         sh.encode(&mut buf, protocol).unwrap();

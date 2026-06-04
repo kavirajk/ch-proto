@@ -961,18 +961,18 @@ ClientInfo gains a trailing `UInt8 jwt_present` + optional `String jwt`. Only in
 
 ---
 
-#### Problem 59: v54477 — query plan serialization
+#### Problem 59: v54477 — query plan serialization version ✅
 
-Adds:
-- ClientPacket::QueryPlan (`13`) — client can ship a pre-built query plan.
-- ServerHello adds `VarUInt query_plan_serialization_version`.
+ServerHello appends `VarUInt query_plan_serialization_version` after the server settings. The companion `ClientPacket::QueryPlan` (code `13`) is interserver-only and we don't implement the send path.
 
-Rare for external clients; primarily for inter-server distributed execution.
+**Implementation:** `Feature::QUERY_PLAN_SERIALIZATION = 54477`; `ServerHello.query_plan_serialization_version: Option<u64>` with feature-gated encode/decode; declared protocol bumped 54476 → 54477.
 
-**Spec work:** §7.2 ServerHello + §10.1 packet type table.
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.2 ServerHello row 13.
+
+**Tests:** 302 unit + 89 integration pass at v54477.
 
 **References:**
-- ClickHouse: `src/Processors/QueryPlan/QueryPlan.cpp::serialize`, `::deserialize`; feature flag `DBMS_MIN_REVISION_WITH_QUERY_PLAN_SERIALIZATION = 54477`; usage in `src/Client/Connection.cpp::sendQueryPlan`
+- ClickHouse: feature flag `DBMS_MIN_REVISION_WITH_QUERY_PLAN_SERIALIZATION = 54477` at `Core/ProtocolDefines.h:133`; emit at `Server/TCPHandler.cpp:2178-2181`.
 
 ---
 

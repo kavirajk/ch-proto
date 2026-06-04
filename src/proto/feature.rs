@@ -52,6 +52,9 @@ impl Feature {
     /// Adds a JWT-presence byte (+ optional JWT String) at the tail of
     /// ClientInfo. External clients without JWT auth write a single 0 byte.
     pub const JWT_IN_INTERSERVER: Feature = Feature(54476);
+    /// Adds a `VarUInt query_plan_serialization_version` at the tail of
+    /// ServerHello. Inter-server only — external clients decode and ignore.
+    pub const QUERY_PLAN_SERIALIZATION: Feature = Feature(54477);
 }
 
 impl Feature {
