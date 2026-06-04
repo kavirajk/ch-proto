@@ -1,6 +1,7 @@
 use super::{
     feature::Feature,
     packet::{ClientPacket, ServerPacket},
+    query::Setting,
     wire::{ProtoRead, ProtoWrite},
 };
 
@@ -75,6 +76,11 @@ pub struct ServerHello {
     /// Feature-gated by INTERSERVER_SECRET_V2 (v54462). External clients decode
     /// it to keep stream alignment and otherwise ignore the value.
     pub nonce: Option<u64>,
+    /// Server's non-default settings, broadcast at v54474+. Empty list when
+    /// the server has no overrides to share or when running in inter-server
+    /// mode. Format on the wire matches the Query packet's settings list
+    /// (key, flags, value triples terminated by an empty key).
+    pub server_settings: Option<Vec<Setting>>,
 }
 
 impl ServerHello {
@@ -167,6 +173,20 @@ impl ServerHello {
             w.write_u64(nonce)?;
         }
 
+        if Feature::SERVER_SETTINGS.in_version(protocol) {
+            let settings = self.server_settings.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("server_settings required at v{protocol}"),
+                )
+            })?;
+            for s in settings {
+                s.encode(w)?;
+            }
+            // Empty-key terminator matches the wire's "end of settings list".
+            w.write_string("")?;
+        }
+
         Ok(())
     }
     pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> io::Result<ServerHello> {
@@ -231,6 +251,19 @@ impl ServerHello {
             } else {
                 None
             },
+            server_settings: if Feature::SERVER_SETTINGS.in_version(protocol) {
+                let mut out = Vec::new();
+                loop {
+                    let s = Setting::decode(r)?;
+                    if s.key.is_empty() {
+                        break;
+                    }
+                    out.push(s);
+                }
+                Some(out)
+            } else {
+                None
+            },
         })
     }
 }
@@ -273,6 +306,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         }
     }
 
@@ -391,6 +425,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -420,6 +455,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -448,6 +484,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -487,6 +524,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -509,6 +547,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -531,6 +570,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -558,6 +598,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         base_hello.encode(&mut buf_old, 50000).unwrap();
 
@@ -613,6 +654,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: rules,
             nonce: None,
+            server_settings: None,
         }
     }
 
@@ -674,6 +716,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -765,6 +808,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: Some(0xDEAD_BEEF_CAFE_BABE),
+            server_settings: None,
         };
 
         let mut buf = Vec::new();
@@ -799,6 +843,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: None,
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -825,6 +870,7 @@ mod tests {
             proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: None, // missing but required at v54462
+            server_settings: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -852,6 +898,7 @@ mod tests {
             proto_recv_chunked_srv: Some("notchunked_optional".to_string()),
             password_complexity_rules: Some(vec![]),
             nonce: Some(0),
+            server_settings: None,
         };
 
         let mut buf = Vec::new();
@@ -880,6 +927,7 @@ mod tests {
             proto_recv_chunked_srv: Some("notchunked_optional".to_string()),
             password_complexity_rules: Some(vec![]),
             nonce: Some(0),
+            server_settings: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();

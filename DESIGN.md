@@ -916,14 +916,18 @@ Introduces `Dynamic::V2` and `Object::V2` variants for those types' state-prefix
 
 ---
 
-#### Problem 56: v54474 — server settings
+#### Problem 56: v54474 — server settings tail ✅
 
-ServerHello gets a full settings list (same format as Query.settings, terminated by empty-string key) after the handshake metadata. Servers broadcast their non-default settings so the client can log or display them.
+ServerHello appends a settings list at v54474+ (same `(String key, VarUInt flags, String value)` triples, empty-key terminated). The server broadcasts its non-default settings so the client can log them.
 
-**Spec work:** §7.2 ServerHello subsection — new trailing field.
+**Implementation:** `Feature::SERVER_SETTINGS = 54474`; reused `proto::query::Setting`; new `ServerHello.server_settings: Option<Vec<Setting>>` field appended after `nonce`. The decoder reads triples until it sees an empty key.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.2 ServerHello row 12.
+
+**Tests:** 302 unit + 89 integration pass at v54474.
 
 **References:**
-- ClickHouse: `src/Server/TCPHandler.cpp::sendHello` (settings block at the tail); feature flag `DBMS_MIN_REVISION_WITH_SERVER_SETTINGS = 54474`
+- ClickHouse: `Server/TCPHandler.cpp:2169-2176` (emit); `Client/Connection.cpp:643-648` (decode); feature flag `DBMS_MIN_REVISION_WITH_SERVER_SETTINGS = 54474` at `Core/ProtocolDefines.h:129`.
 
 ---
 

@@ -44,6 +44,7 @@ impl Feature {
     /// column-body serialization version is the only place it surfaces and
     /// our decoder rejects unknown versions.
     pub const V2_DYNAMIC_AND_JSON_SERIALIZATION: Feature = Feature(54473);
+    pub const SERVER_SETTINGS: Feature = Feature(54474);
 }
 
 impl Feature {

@@ -108,6 +108,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | VERSIONED_PARALLEL_REPLICAS_PROTOCOL | 54471 | ServerHello, Addendum | Both sides exchange a `VarUInt` parallel-replicas coordination protocol version. ServerHello's field is positioned **immediately after `protocol_version`** (before `timezone`). Addendum's field is appended after the chunked-protocol strings. Current value: `7` (`DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION`). |
 | INTERSERVER_EXTERNALLY_GRANTED_ROLES | 54472 | Query | Adds a `String external_roles` field to the Query body, between the settings terminator and the interserver-secret hash. External clients send an empty role list (a single byte `0x00`, i.e. VarUInt 0 inside a String envelope). |
 | V2_DYNAMIC_AND_JSON_SERIALIZATION | 54473 | Column body | Server may emit V2 serialization for `Dynamic` and `JSON` column types — gates which `state_prefix` version they use. Implementation out of scope (Tier 2/3 Dynamic/JSON not yet supported — see `NATIVE_FORMAT.md` §3.4.5). |
+| SERVER_SETTINGS                 | 54474   | ServerHello            | Server broadcasts its non-default settings as a list at the tail of ServerHello, after `nonce`. Format: `(key, flags, value)` triples terminated by an empty key — same as the Query packet's settings list. |
 
 ---
 
@@ -400,6 +401,7 @@ Message tables document only the body of each packet (after the packet type code
 | 9 | proto_recv_chunked_srv | String | universal | CHUNKED_PROTOCOL (v54470) | Server's preferred inbound chunking. Same value set as field 8. |
 | 10 | password_complexity_rules | Rule[] | universal | PASSWORD_COMPLEXITY_RULES (v54461) | Server's password policy. `VarUInt count` followed by `count × Rule`. See below. |
 | 11 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
+| 12 | server_settings  | Setting[] | universal | SERVER_SETTINGS (v54474)        | Server's non-default settings broadcast. Format: zero or more `(String key, VarUInt flags, String value)` triples, terminated by an empty key. Same as the Query packet's settings list (§6.9). |
 
 **Rule** — element of `password_complexity_rules`:
 
