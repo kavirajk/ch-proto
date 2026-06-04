@@ -74,6 +74,12 @@ impl Feature {
     /// non-null codec). Our client always sets `compression = false`, so
     /// this code path stays inactive.
     pub const COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS: Feature = Feature(54481);
+    /// Server may emit a column with `Kind::REPLICATED` (`kind_stack = 0x04`)
+    /// for repeated-value columns. Below v54482 the writer expands those
+    /// columns before sending; at v54482+ the wire data is the compact
+    /// replicated form. Our decoder currently rejects this kind with a
+    /// clear `Unsupported` error. Decoder implementation deferred.
+    pub const REPLICATED_SERIALIZATION: Feature = Feature(54482);
 }
 
 impl Feature {

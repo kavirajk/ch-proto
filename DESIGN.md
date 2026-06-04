@@ -1038,12 +1038,18 @@ Our client always sets `compression = false` on outgoing Query packets, so this 
 
 ---
 
-#### Problem 64: v54482 — replicated serialization
+#### Problem 64: v54482 — replicated serialization ✅ (docs only)
 
-For `ReplicatedMergeTree` tables, certain columns may carry replication metadata. Mostly inter-server.
+At v54482+ the server can emit columns with `Kind::REPLICATED` (`kind_stack = 0x04`) — a compact form for repeated values. Below this version it expanded such columns before sending. Our decoder rejects REPLICATED with the standard `Unsupported` error; decoder implementation deferred until we see it surface in practice.
+
+**Implementation:** `Feature::REPLICATED_SERIALIZATION = 54482`; no decode path yet. Declared protocol bumped 54481 → 54482.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row; `NATIVE_FORMAT.md` §2.3.1 already lists the kind_stack byte `0x04 = REPLICATED`.
+
+**Tests:** 303 unit + 89 integration pass at v54482.
 
 **References:**
-- ClickHouse: `DBMS_MIN_REVISION_WITH_REPLICATED_SERIALIZATION = 54482`; `src/DataTypes/Serializations/SerializationReplicated.h/cpp`
+- ClickHouse: `Formats/NativeWriter.cpp:103-104` (writer's "expand if below v54482" branch); feature flag at `Core/ProtocolDefines.h:142`.
 
 ---
 
