@@ -931,14 +931,18 @@ ServerHello appends a settings list at v54474+ (same `(String key, VarUInt flags
 
 ---
 
-#### Problem 57: v54475 — script query/line numbers (NOT JSON)
+#### Problem 57: v54475 — script query/line numbers (NOT JSON) ✅
 
-ClientInfo gets `VarUInt script_query_number` + `VarUInt script_line_number` for multi-statement error reporting.
+ClientInfo gets `VarUInt script_query_number` + `VarUInt script_line_number` at the tail, after the PARALLEL_REPLICAS block. Used by clickhouse-client for multi-statement script error attribution; external clients send `0, 0`.
 
-**Spec work:** §7.8 ClientInfo table — add two fields at the end, gated by new Feature `QUERY_AND_LINE_NUMBERS = 54475` (not `JSONStrings`).
+**Implementation:** `Feature::QUERY_AND_LINE_NUMBERS = 54475`; `ClientInfo.script_query_number`/`script_line_number: Option<u64>` fields with feature-gated encode/decode. Connection now sends `Some(0)` for both.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.8 ClientInfo rows 20 and 21.
+
+**Tests:** 302 unit + 89 integration pass at v54475.
 
 **References:**
-- ClickHouse: `src/Interpreters/ClientInfo.cpp:142-146` (encode), `:249-253` (decode); feature flag `DBMS_MIN_REVISION_WITH_QUERY_AND_LINE_NUMBERS = 54475`
+- ClickHouse: `Interpreters/ClientInfo.cpp:142-146` (encode), `:249-253` (decode); feature flag `DBMS_MIN_REVISION_WITH_QUERY_AND_LINE_NUMBERS = 54475` at `Core/ProtocolDefines.h:53`.
 
 ---
 

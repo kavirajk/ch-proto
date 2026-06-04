@@ -278,6 +278,8 @@ mod tests {
             collaborate_with_initiator: Some(false),
             obsolete_count_participating_replicas: Some(0),
             count_current_replicas: Some(0),
+            script_query_number: None,
+            script_line_number: None,
         }
     }
 

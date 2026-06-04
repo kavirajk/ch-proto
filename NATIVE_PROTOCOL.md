@@ -109,6 +109,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | INTERSERVER_EXTERNALLY_GRANTED_ROLES | 54472 | Query | Adds a `String external_roles` field to the Query body, between the settings terminator and the interserver-secret hash. External clients send an empty role list (a single byte `0x00`, i.e. VarUInt 0 inside a String envelope). |
 | V2_DYNAMIC_AND_JSON_SERIALIZATION | 54473 | Column body | Server may emit V2 serialization for `Dynamic` and `JSON` column types — gates which `state_prefix` version they use. Implementation out of scope (Tier 2/3 Dynamic/JSON not yet supported — see `NATIVE_FORMAT.md` §3.4.5). |
 | SERVER_SETTINGS                 | 54474   | ServerHello            | Server broadcasts its non-default settings as a list at the tail of ServerHello, after `nonce`. Format: `(key, flags, value)` triples terminated by an empty key — same as the Query packet's settings list. |
+| QUERY_AND_LINE_NUMBERS          | 54475   | ClientInfo             | Adds `script_query_number` (VarUInt) and `script_line_number` (VarUInt) at the tail of ClientInfo. Used by clickhouse-client for multi-statement script error attribution; external clients send `0, 0`. |
 
 ---
 
@@ -496,6 +497,8 @@ If `has_nested` is true, another Exception structure follows (without a packet t
 | 17 | collaborate_with_initiator   | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)             | Bool as VarUInt. External clients send `0`. |
 | 18 | count_participating_replicas | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)             | External clients send `0`. |
 | 19 | number_of_current_replica    | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)             | External clients send `0`. |
+| 20 | script_query_number          | VarUInt | client       | QUERY_AND_LINE_NUMBERS (v54475)        | 1-indexed statement position in a multi-statement script. External clients send `0`. |
+| 21 | script_line_number           | VarUInt | client       | QUERY_AND_LINE_NUMBERS (v54475)        | 1-indexed line number within the source script. External clients send `0`. |
 
 **OpenTelemetry encoding** (field 16):
 

@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::SERVER_SETTINGS.version() as u64,
+            protocol: Feature::QUERY_AND_LINE_NUMBERS.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };
@@ -224,6 +224,11 @@ impl Connection {
                 collaborate_with_initiator: Some(false),
                 obsolete_count_participating_replicas: Some(0),
                 count_current_replicas: Some(0),
+                // External clients running single-statement queries report
+                // `0, 0`. clickhouse-client uses these for multi-statement
+                // script error attribution.
+                script_query_number: Some(0),
+                script_line_number: Some(0),
             },
             settings: inject_json_string_setting(opts.settings),
             cluster_secret: "".to_string(),

@@ -45,6 +45,10 @@ impl Feature {
     /// our decoder rejects unknown versions.
     pub const V2_DYNAMIC_AND_JSON_SERIALIZATION: Feature = Feature(54473);
     pub const SERVER_SETTINGS: Feature = Feature(54474);
+    /// Adds `script_query_number` and `script_line_number` VarUInts to
+    /// ClientInfo. Used by clickhouse-client for multi-statement script
+    /// error reporting. External clients send `0` for both.
+    pub const QUERY_AND_LINE_NUMBERS: Feature = Feature(54475);
 }
 
 impl Feature {

@@ -38,6 +38,14 @@ pub struct ClientInfo {
     pub collaborate_with_initiator: Option<bool>, // feature-gated: PARALLEL_REPLICAS
     pub obsolete_count_participating_replicas: Option<u64>, // feature-gated: PARALLEL_REPLICAS
     pub count_current_replicas: Option<u64>,      // feature-gated: PARALLEL_REPLICAS
+
+    /// 1-indexed statement position in a multi-statement script. Appears
+    /// after the parallel-replicas block at v54475+. External clients that
+    /// run single-statement queries send `0`.
+    pub script_query_number: Option<u64>,
+    /// 1-indexed line number of the statement within the source script.
+    /// Also new in v54475. External clients send `0`.
+    pub script_line_number: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
@@ -139,6 +147,13 @@ impl ClientInfo {
             (None, None, None)
         };
 
+        let (script_query_number, script_line_number) =
+            if Feature::QUERY_AND_LINE_NUMBERS.in_version(protocol) {
+                (Some(r.read_varuint()?), Some(r.read_varuint()?))
+            } else {
+                (None, None)
+            };
+
         Ok(ClientInfo {
             query_kind,
             initial_user,
@@ -158,6 +173,8 @@ impl ClientInfo {
             collaborate_with_initiator,
             obsolete_count_participating_replicas,
             count_current_replicas,
+            script_query_number,
+            script_line_number,
         })
     }
     pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
@@ -250,7 +267,12 @@ impl ClientInfo {
             })?)?;
         }
 
-        // skip FEATURE::QUERY_AND_LINE_NUMBER and Feature::JWT
+        if Feature::QUERY_AND_LINE_NUMBERS.in_version(self.protocol_version as u32) {
+            w.write_varuint(self.script_query_number.unwrap_or(0))?;
+            w.write_varuint(self.script_line_number.unwrap_or(0))?;
+        }
+
+        // FUTURE: Feature::JWT_IN_INTERSERVER (v54476) — interserver only.
 
         Ok(())
     }
@@ -284,6 +306,8 @@ mod tests {
             collaborate_with_initiator: Some(false),
             obsolete_count_participating_replicas: Some(0),
             count_current_replicas: Some(0),
+            script_query_number: None,
+            script_line_number: None,
         }
     }
 
@@ -307,6 +331,8 @@ mod tests {
             collaborate_with_initiator: None,
             obsolete_count_participating_replicas: None,
             count_current_replicas: None,
+            script_query_number: None,
+            script_line_number: None,
         }
     }
 
@@ -393,6 +419,8 @@ mod tests {
             collaborate_with_initiator: None,
             obsolete_count_participating_replicas: None,
             count_current_replicas: None,
+            script_query_number: None,
+            script_line_number: None,
         };
         let mut buf = Vec::new();
         ci.encode(&mut buf, PROTOCOL_ALL_FEATURES).unwrap();
