@@ -21,6 +21,7 @@ impl Feature {
     pub const INTERSERVER_SECRET_V2: Feature = Feature(54462);
     pub const TOTAL_BYTES_IN_PROGRESS: Feature = Feature(54463);
     pub const TIMEZONE_UPDATES: Feature = Feature(54464);
+    pub const SPARSE_SERIALIZATION: Feature = Feature(54465);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
 }
 

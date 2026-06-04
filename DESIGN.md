@@ -797,15 +797,25 @@ New `ServerPacket::TimezoneUpdate` (code `17`). Body: single `String` carrying t
 
 ---
 
-#### Problem 50: v54465 — sparse serialization
+#### Problem 50: v54465 — sparse serialization ✅
 
-The `has_custom_serialization` byte in Column header (§7.11) can now be `1` for sparse encoding. Clients that declared v ≥ 54465 must handle this or decline.
+The `has_custom_serialization` byte in Column header (§7.11) can now be `1` for sparse encoding. We DECODE sparse columns and materialize them as dense `ColumnData` so the rest of the client (TSV formatter, etc.) is unchanged.
 
-**Spec work:** §7.11 Column subsection — document the sparse variant's kind_stack contents + §11 note.
+**Wire format we implement:**
+- 1-byte kind_stack: `0x01` = SPARSE (other kinds: `0x00` DEFAULT, `0x02` DETACHED, `0x03` DETACHED_OVER_SPARSE, `0x04` REPLICATED, `0x05` COMBINATION). We accept SPARSE; reject others with a clear `Unsupported` error.
+- Offsets stream: VarUInts where each value is `(defaults_before_next_value)`. Trailing VarUInt has `END_OF_GRANULE_FLAG = 1 << 62` and encodes trailing-defaults count. Terminates the offset stream.
+- Values stream: `count` non-default values, where `count` = number of non-EOG VarUInts, densely encoded in the inner type.
+
+**Implementation:** `Feature::SPARSE_SERIALIZATION = 54465`; `Column::decode` reads kind_stack when `has_custom = 1`; `decode_sparse` + `materialize_sparse` handle the wire and dense reconstruction. Supported inner types: Int/UInt 8/16/32/64/128, Float32/64, Bool, String, FixedString, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum16, Decimal32/64/128. Nullable inner is deferred to Problem 65; Array/Tuple/Map/Nested/LowCardinality/Nothing currently unsupported. Declared protocol bumped 54464 → 54465.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + `NATIVE_FORMAT.md` §2.3.1 (kind_stack byte values + sparse wire walkthrough).
+
+**Tests:** 6 unit tests covering offsets parsing, all-defaults, all-explicit, String sparse, oversized-offset rejection, full-column decode-via-header path. 287/287 unit + 89/89 integration.
+
+**Harness delta from Stage 3:** PASS 3941 → 3929 (-12 due to server-side connection drops under JOBS=8 load, not sparse-related). 1 new CRASH (`03925_sparse_values_in_substreams_cache_bug` — uses v54483 nullable-sparse storage settings; expected to fail until Problem 65). Stage 3-era 6 crashes unchanged.
 
 **References:**
-- ClickHouse: `src/DataTypes/Serializations/SerializationSparse.h`, `SerializationSparse.cpp`; feature flag at `src/Core/ProtocolDefines.h:93`; `src/DataTypes/Serializations/SerializationInfo.h` (kind_stack serialization)
-- clickhouse-go: handled transparently via `Column.WriteStatePrefix` / `ReadStatePrefix`
+- ClickHouse: `src/DataTypes/Serializations/SerializationSparse.cpp` (`serializeOffsets`, `deserializeOffsets`); `SerializationInfo.cpp:186-228` (kind_stack enum + serialize/deserialize); feature flag at `src/Core/ProtocolDefines.h:108`; Native (de)serializer uses one shared stream — `src/Formats/NativeReader.cpp:97`.
 
 ---
 

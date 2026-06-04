@@ -224,10 +224,12 @@ impl Column {
             match has_custom {
                 0 => Serialization::Default,
                 1 => {
-                    return Err(Error::new(
-                        ErrorKind::Unsupported,
-                        format!("custom serialization for column '{name}' not yet supported"),
-                    ));
+                    // Per `SerializationInfo::deserializeFromKindsBinary`,
+                    // the byte after `has_custom = 1` encodes the kind stack.
+                    let kind_byte = r.read_u8()?;
+                    Serialization::Custom {
+                        kind_stack: vec![kind_byte],
+                    }
                 }
                 other => {
                     return Err(Error::new(
@@ -240,13 +242,232 @@ impl Column {
             Serialization::Default
         };
 
-        let data = ColumnData::decode(r, &data_type, rows)?;
+        let data = match &serialization {
+            Serialization::Default => ColumnData::decode(r, &data_type, rows)?,
+            Serialization::Custom { kind_stack } => {
+                let kind = kind_stack[0];
+                match kind {
+                    KIND_DEFAULT => ColumnData::decode(r, &data_type, rows)?,
+                    KIND_SPARSE => decode_sparse(r, &data_type, rows, name.as_str())?,
+                    KIND_COMBINATION => {
+                        // Multi-byte kind stack — we don't yet handle the
+                        // composite forms (e.g. detached-over-sparse). For
+                        // the differential harness we only see plain SPARSE
+                        // in practice. Surface a clear error.
+                        return Err(Error::new(
+                            ErrorKind::Unsupported,
+                            format!(
+                                "column '{name}': COMBINATION kind stack not yet supported"
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::Unsupported,
+                            format!(
+                                "column '{name}': kind_stack byte {kind:#04x} not yet supported"
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
         Ok(Column {
             name,
             data_type,
             serialization,
             data,
         })
+    }
+}
+
+/// Byte values for the column-header kind_stack. Mirrors
+/// `KindStackBinarySerializationType` in
+/// `ClickHouse/src/DataTypes/Serializations/SerializationInfo.cpp`.
+const KIND_DEFAULT: u8 = 0;
+const KIND_SPARSE: u8 = 1;
+const KIND_COMBINATION: u8 = 5;
+
+/// Bit set on the trailing offset VarUInt of a sparse offsets stream to
+/// mark "end of granule". Matches `END_OF_GRANULE_FLAG` in
+/// `SerializationSparse.cpp`. The value (= 1 << 62) is the only EOG marker
+/// we expect because the SerializationSparse VarUInt encoding caps values
+/// at 2^63 anyway.
+const END_OF_GRANULE_FLAG: u64 = 1 << 62;
+
+/// Decode a sparse column. The wire format is:
+///   - Offsets stream: VarUInts where each value is the count of default
+///     positions before the next non-default. The trailing VarUInt has the
+///     `END_OF_GRANULE_FLAG` bit set and encodes the count of trailing
+///     defaults after the last non-default.
+///   - Values stream: the non-default values, count = number of positions
+///     decoded above, encoded in the inner type's dense form.
+/// We materialize the result as a dense `ColumnData` of `rows` entries
+/// because the rest of the client (TSV formatter, etc.) works on dense
+/// columns. Default values are filled in at every non-explicit position.
+fn decode_sparse(
+    r: &mut impl ProtoRead,
+    data_type: &str,
+    rows: usize,
+    name: &str,
+) -> Result<ColumnData> {
+    // Step 1: read offsets stream until we see the EOG terminator.
+    let mut positions: Vec<usize> = Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        let raw = r.read_varuint()?;
+        let group_size = (raw & !END_OF_GRANULE_FLAG) as usize;
+        let is_eog = (raw & END_OF_GRANULE_FLAG) != 0;
+        if is_eog {
+            // `group_size` here is the trailing-defaults count.
+            cursor += group_size;
+            break;
+        }
+        let pos = cursor + group_size;
+        if pos >= rows {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column '{name}': sparse offset {pos} >= rows {rows}"
+                ),
+            ));
+        }
+        positions.push(pos);
+        cursor = pos + 1;
+    }
+    if cursor != rows {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "column '{name}': sparse offsets cover {cursor} rows; expected {rows}"
+            ),
+        ));
+    }
+
+    // Step 2: read the non-default values densely.
+    let values = ColumnData::decode(r, data_type, positions.len())?;
+
+    // Step 3: materialize the dense column.
+    materialize_sparse(values, &positions, rows, name)
+}
+
+/// Build a dense `ColumnData` of length `rows` from the sparse representation
+/// (a values column of length `positions.len()` and the position list).
+/// Default values are the type's zero — matches
+/// `ColumnSparse::getDefaultValueAt` in C++ for the non-Nullable types we
+/// currently support; Nullable inner type is rejected because nullable-sparse
+/// composition is a separate v54483 feature (Problem 65).
+fn materialize_sparse(
+    values: ColumnData,
+    positions: &[usize],
+    rows: usize,
+    name: &str,
+) -> Result<ColumnData> {
+    macro_rules! expand_vec {
+        ($variant:ident, $inner:expr, $default:expr) => {{
+            let mut dense = vec![$default; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense[pos] = $inner[i];
+            }
+            Ok(ColumnData::$variant(dense))
+        }};
+    }
+    match values {
+        ColumnData::Uint8(v) => expand_vec!(Uint8, v, 0u8),
+        ColumnData::Uint16(v) => expand_vec!(Uint16, v, 0u16),
+        ColumnData::Uint32(v) => expand_vec!(Uint32, v, 0u32),
+        ColumnData::Uint64(v) => expand_vec!(Uint64, v, 0u64),
+        ColumnData::Int8(v) => expand_vec!(Int8, v, 0i8),
+        ColumnData::Int16(v) => expand_vec!(Int16, v, 0i16),
+        ColumnData::Int32(v) => expand_vec!(Int32, v, 0i32),
+        ColumnData::Int64(v) => expand_vec!(Int64, v, 0i64),
+        ColumnData::Int128(v) => expand_vec!(Int128, v, 0i128),
+        ColumnData::Uint128(v) => expand_vec!(Uint128, v, 0u128),
+        ColumnData::Float32(v) => expand_vec!(Float32, v, 0.0f32),
+        ColumnData::Float64(v) => expand_vec!(Float64, v, 0.0f64),
+        ColumnData::Bool(v) => expand_vec!(Bool, v, false),
+        ColumnData::Date(v) => expand_vec!(Date, v, 0u16),
+        ColumnData::Date32(v) => expand_vec!(Date32, v, 0i32),
+        ColumnData::DateTime(v) => expand_vec!(DateTime, v, 0u32),
+        ColumnData::Enum16(v) => expand_vec!(Enum16, v, 0i16),
+        ColumnData::Ipv4(v) => expand_vec!(Ipv4, v, 0u32),
+        ColumnData::String(v) => {
+            let mut dense = vec![String::new(); rows];
+            for (i, value) in v.into_iter().enumerate() {
+                dense[positions[i]] = value;
+            }
+            Ok(ColumnData::String(dense))
+        }
+        ColumnData::FixedString { n, data } => {
+            // n bytes per row; defaults are n NUL bytes.
+            let mut dense = vec![0u8; n.checked_mul(rows).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{name}': FixedString size overflow n={n} rows={rows}"),
+                )
+            })?];
+            for (i, &pos) in positions.iter().enumerate() {
+                let src_start = i * n;
+                let dst_start = pos * n;
+                dense[dst_start..dst_start + n].copy_from_slice(&data[src_start..src_start + n]);
+            }
+            Ok(ColumnData::FixedString { n, data: dense })
+        }
+        ColumnData::Uuid(v) => {
+            let mut dense = vec![uuid::Uuid::nil(); rows];
+            for (i, val) in v.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::Uuid(dense))
+        }
+        ColumnData::Ipv6(v) => {
+            let mut dense = vec![[0u8; 16]; rows];
+            for (i, val) in v.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::Ipv6(dense))
+        }
+        ColumnData::DateTime64 { scale, values } => {
+            let mut dense = vec![0i64; rows];
+            for (i, val) in values.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::DateTime64 { scale, values: dense })
+        }
+        ColumnData::Decimal32 { scale, values } => {
+            let mut dense = vec![0i32; rows];
+            for (i, val) in values.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::Decimal32 { scale, values: dense })
+        }
+        ColumnData::Decimal64 { scale, values } => {
+            let mut dense = vec![0i64; rows];
+            for (i, val) in values.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::Decimal64 { scale, values: dense })
+        }
+        ColumnData::Decimal128 { scale, values } => {
+            let mut dense = vec![0i128; rows];
+            for (i, val) in values.into_iter().enumerate() {
+                dense[positions[i]] = val;
+            }
+            Ok(ColumnData::Decimal128 { scale, values: dense })
+        }
+        ColumnData::Nullable { .. } => Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "column '{name}': sparse over Nullable not yet supported (v54483 nullable-sparse — Problem 65)"
+            ),
+        )),
+        other => Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "column '{name}': sparse decoder doesn't handle inner type {}",
+                std::any::type_name_of_val(&other)
+            ),
+        )),
     }
 }
 
@@ -1543,6 +1764,135 @@ mod tests {
         }
     }
 
+    // -- Sparse serialization (v54465, Problem 50) --
+
+    fn varuint_bytes(v: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ProtoWrite::write_varuint(&mut buf, v).unwrap();
+        buf
+    }
+
+    /// Hand-craft a sparse-encoded column body matching what the server would
+    /// emit for an integer column of `rows` where `positions[i]` holds
+    /// `values[i]` and all other positions are 0.
+    fn build_sparse_uint32_wire(rows: usize, positions: &[usize], values: &[u32]) -> Vec<u8> {
+        assert_eq!(positions.len(), values.len());
+        let mut buf = Vec::new();
+        // Offset stream: for each position, write (pos - cursor) varuint;
+        // then write trailing-defaults | EOG_FLAG.
+        let mut cursor = 0usize;
+        for &pos in positions {
+            buf.extend(varuint_bytes((pos - cursor) as u64));
+            cursor = pos + 1;
+        }
+        let trailing = if cursor < rows { rows - cursor } else { 0 };
+        buf.extend(varuint_bytes(trailing as u64 | END_OF_GRANULE_FLAG));
+        // Values stream: dense little-endian UInt32 values.
+        for &v in values {
+            buf.extend(v.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_sparse_uint32_decode() {
+        // 8 rows, non-default values at positions 2 and 6.
+        let body = build_sparse_uint32_wire(8, &[2, 6], &[42, 99]);
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_sparse(&mut cursor, "UInt32", 8, "x").unwrap();
+        match data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![0, 0, 42, 0, 0, 0, 99, 0]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sparse_all_defaults() {
+        // EOG-only stream: every row is default (no positions).
+        let mut body = Vec::new();
+        body.extend(varuint_bytes(8 | END_OF_GRANULE_FLAG));
+        // No values follow.
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_sparse(&mut cursor, "UInt32", 8, "x").unwrap();
+        match data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![0; 8]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sparse_all_explicit() {
+        // Three non-defaults, no trailing defaults.
+        let body = build_sparse_uint32_wire(3, &[0, 1, 2], &[10, 20, 30]);
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_sparse(&mut cursor, "UInt32", 3, "x").unwrap();
+        match data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![10, 20, 30]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sparse_string_decode() {
+        // 5 rows, non-default "hi" at position 1, "world" at position 4.
+        let mut body = Vec::new();
+        // Offsets: position 1 (cursor 0 + 1 default), position 4 (cursor 2 + 2 defaults), EOG = 0 trailing.
+        body.extend(varuint_bytes(1));
+        body.extend(varuint_bytes(2));
+        body.extend(varuint_bytes(0 | END_OF_GRANULE_FLAG));
+        // Values: "hi", "world" (length-prefixed).
+        body.extend(varuint_bytes(2));
+        body.extend(b"hi");
+        body.extend(varuint_bytes(5));
+        body.extend(b"world");
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_sparse(&mut cursor, "String", 5, "x").unwrap();
+        match data {
+            ColumnData::String(v) => {
+                assert_eq!(v, vec!["", "hi", "", "", "world"]);
+            }
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sparse_rejects_offset_past_rows() {
+        // Position 10 in a 5-row column — invalid.
+        let mut body = Vec::new();
+        body.extend(varuint_bytes(10));
+        body.extend(varuint_bytes(0 | END_OF_GRANULE_FLAG));
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_sparse(&mut cursor, "UInt32", 5, "x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_column_full_sparse_decode_via_header() {
+        // Full Column::decode path: hand-craft a header (name, type, has_custom=1,
+        // kind=0x01) plus a sparse body, then call Column::decode.
+        let protocol = Feature::SPARSE_SERIALIZATION.version();
+        let mut buf = Vec::new();
+        ProtoWrite::write_string(&mut buf, "x").unwrap();
+        ProtoWrite::write_string(&mut buf, "UInt32").unwrap();
+        buf.push(1); // has_custom = 1
+        buf.push(KIND_SPARSE); // kind = SPARSE (0x01)
+        buf.extend(build_sparse_uint32_wire(8, &[2, 6], &[42, 99]));
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let col = Column::decode(&mut cursor, 8, protocol).unwrap();
+        assert_eq!(col.name, "x");
+        assert_eq!(col.data_type, "UInt32");
+        match col.serialization {
+            Serialization::Custom { kind_stack } => assert_eq!(kind_stack, vec![KIND_SPARSE]),
+            other => panic!("expected Custom kind_stack, got {:?}", other),
+        }
+        match col.data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![0, 0, 42, 0, 0, 0, 99, 0]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_column_nothing_roundtrip() {
         // `Nothing` columns appear in practice as the inner type of
@@ -1717,12 +2067,13 @@ mod tests {
     }
 
     #[test]
-    fn test_column_rejects_custom_serialization_on_decode() {
-        // Server sends has_custom=1, we should reject with Unsupported.
+    fn test_column_rejects_unsupported_kind_stack_on_decode() {
+        // has_custom=1 + REPLICATED kind (0x04). Currently unsupported.
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
         buf.write_string("UInt8").unwrap();
-        buf.write_u8(1).unwrap();
+        buf.write_u8(1).unwrap(); // has_custom
+        buf.write_u8(4).unwrap(); // KIND_REPLICATED — not implemented
 
         let mut cursor = Cursor::new(buf.as_slice());
         let err = Column::decode(&mut cursor, 0, PROTOCOL).unwrap_err();

@@ -155,8 +155,30 @@ A Column appears `num_columns` times within a Block.
 | 1 | name                     | String  | always                   | Column name |
 | 2 | type                     | String  | always                   | ClickHouse type string (e.g., `"UInt64"`, `"Array(String)"`) |
 | 3 | has_custom_serialization | UInt8   | feature `CUSTOM_SERIALIZATION` (v54454) | `0` = default, `1` = custom (kind_stack follows) |
-| 4 | kind_stack               | bytes   | when field 3 = `1`       | Opaque metadata describing the non-default serialization (sparse, etc.). Not specified here. |
-| 5 | data                     | bytes   | always                   | Column values for all `num_rows` rows. Layout per type — see §3. |
+| 4 | kind_stack               | bytes   | when field 3 = `1`       | One UInt8 enum byte (see §2.3.1) describing the non-default serialization (sparse, etc.). For the `COMBINATION` value, followed by a VarUInt count + that many additional kind bytes. |
+| 5 | data                     | bytes   | always                   | Column values for all `num_rows` rows. Layout per type — see §3. For sparse columns, see §2.3.1. |
+
+#### 2.3.1 kind_stack and sparse encoding
+
+The `kind_stack` byte enumerates a non-default per-column serialization. Mirrors `KindStackBinarySerializationType` in `ClickHouse/src/DataTypes/Serializations/SerializationInfo.cpp`:
+
+| Byte | Name | Meaning | Wire impact on `data` |
+|------|------|---------|------------------------|
+| `0x00` | DEFAULT | Default serialization | Identical to `has_custom = 0` |
+| `0x01` | SPARSE | Sparse serialization (v54465+) | Offset stream + non-default values; see below |
+| `0x02` | DETACHED | Internal storage form (not used over the wire) | — |
+| `0x03` | DETACHED_OVER_SPARSE | Detached over sparse (not used over the wire) | — |
+| `0x04` | REPLICATED | Replication-internal form (v54482+) | — |
+| `0x05` | COMBINATION | Multi-kind stack | Followed by VarUInt `count` and `count` further kind bytes |
+
+**Sparse wire format.** When `kind_stack = 0x01`, the column `data` is two streams written back-to-back in the single shared TCP stream:
+
+1. **Offset stream** — a sequence of `VarUInt`s. Each `VarUInt` value `v` is either:
+   - `v` with the high bit at position 62 clear: `(v & 0x3FFFFFFFFFFFFFFF)` = number of default positions before the next explicit non-default. The non-default position is computed as `cursor + group_size` where `cursor` is the running position; afterwards `cursor` advances by `group_size + 1`.
+   - `v` with bit 62 set (`END_OF_GRANULE_FLAG`): the value with the flag cleared = number of trailing default positions after the last non-default. Marks end of the offset stream for this Block.
+2. **Values stream** — `count` non-default values densely encoded in the inner type, where `count` is the number of non-EOG VarUInts read above.
+
+Decoders reconstruct a dense column of `num_rows` entries by filling every non-explicit position with the inner type's zero value (`0` for integers/floats, `""` for `String`, `0` days for `Date`, etc.).
 
 ### 2.4 Block variants
 
