@@ -1708,6 +1708,7 @@ fn test_insert_single_block_uint8() {
                 info: Some(BlockInfo {
                     overflows: false,
                     bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
                 }),
                 columns: vec![Column {
                     name: "id".to_string(),
@@ -1741,6 +1742,7 @@ fn test_insert_two_columns() {
                 info: Some(BlockInfo {
                     overflows: false,
                     bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
                 }),
                 columns: vec![
                     Column {
@@ -1821,6 +1823,7 @@ fn test_insert_multiple_blocks() {
                 info: Some(BlockInfo {
                     overflows: false,
                     bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
                 }),
                 columns: vec![Column {
                     name: "id".to_string(),
@@ -1863,6 +1866,7 @@ fn test_insert_rejects_bad_schema() {
                 info: Some(BlockInfo {
                     overflows: false,
                     bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
                 }),
                 columns: vec![Column {
                     name: "id".to_string(),

@@ -63,6 +63,11 @@ impl Feature {
     /// proper handling if/when compression integration lands (Problem 42/43).
     pub const PARALLEL_BLOCK_MARSHALLING: Feature = Feature(54478);
     pub const VERSIONED_CLUSTER_FUNCTION_PROTOCOL: Feature = Feature(54479);
+    /// Adds field 3 (`out_of_order_buckets: Vec<Int32>`) to BlockInfo.
+    /// Only emitted when the block carries delayed-bucket aggregation
+    /// state from `ConvertingAggregatedToChunksTransform`. External clients
+    /// rarely see non-empty values here.
+    pub const OUT_OF_ORDER_BUCKETS_IN_AGGREGATION: Feature = Feature(54480);
 }
 
 impl Feature {

@@ -45,6 +45,7 @@ impl Block {
             info: Some(BlockInfo {
                 overflows: false,
                 bucket_number: -1,
+                out_of_order_buckets: Vec::new(),
             }),
             columns: vec![],
             rows: 0,
@@ -84,16 +85,23 @@ impl Block {
 }
 
 // BlockInfo is a metadata about the block
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BlockInfo {
     pub overflows: bool,
     pub bucket_number: i32,
+    /// List of bucket IDs delayed by the server's
+    /// `ConvertingAggregatedToChunksTransform`. Appears as field 3 in the
+    /// BlockInfo wire stream at v54480+. External clients don't emit this
+    /// themselves; the decoder reads it if the server sends one. Default
+    /// empty.
+    pub out_of_order_buckets: Vec<i32>,
 }
 
 // BlockInfoField is used in encoding delimeters for actual block info field values
 pub enum BlockInfoField {
     Overflow = 1,
     BucketNumber = 2,
+    OutOfOrderBuckets = 3,
 }
 
 impl BlockInfo {
@@ -111,6 +119,7 @@ impl BlockInfo {
         let mut info = BlockInfo {
             overflows: false,
             bucket_number: -1,
+            out_of_order_buckets: Vec::new(),
         };
 
         loop {
@@ -119,6 +128,17 @@ impl BlockInfo {
                 0 => break, // end marker
                 1 => info.overflows = r.read_u8()? != 0,
                 2 => info.bucket_number = r.read_i32()?,
+                3 => {
+                    // out_of_order_buckets: [VarUInt count][Int32]*count.
+                    // The Vec<Int32> serialization matches the C++
+                    // `writeBinary(std::vector<Int32>)` overload.
+                    let count = r.read_varuint()? as usize;
+                    let mut buckets = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        buckets.push(r.read_i32()?);
+                    }
+                    info.out_of_order_buckets = buckets;
+                }
                 _ => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -147,6 +167,7 @@ mod tests {
         let info = BlockInfo {
             overflows: false,
             bucket_number: -1,
+            out_of_order_buckets: Vec::new(),
         };
         let mut buf = Vec::new();
         info.encode(&mut buf).unwrap();
@@ -161,6 +182,7 @@ mod tests {
         let info = BlockInfo {
             overflows: true,
             bucket_number: 42,
+            out_of_order_buckets: Vec::new(),
         };
         let mut buf = Vec::new();
         info.encode(&mut buf).unwrap();
@@ -176,12 +198,36 @@ mod tests {
         let info = BlockInfo {
             overflows: false,
             bucket_number: -1,
+            out_of_order_buckets: Vec::new(),
         };
         let mut buf = Vec::new();
         info.encode(&mut buf).unwrap();
 
         // field_id=1, UInt8(0), field_id=2, Int32(-1 = 0xFFFFFFFF), field_id=0
         assert_eq!(buf, vec![0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn test_block_info_decode_out_of_order_buckets() {
+        // Hand-craft a wire stream that includes field 3 (v54480+).
+        // [1, overflow=0, 2, bucket=-1, 3, count=2, 5, 7, 0]
+        let mut buf = Vec::new();
+        use crate::proto::wire::ProtoWrite;
+        buf.write_varuint(1).unwrap();
+        buf.write_u8(0).unwrap();
+        buf.write_varuint(2).unwrap();
+        buf.write_i32(-1).unwrap();
+        buf.write_varuint(3).unwrap();
+        buf.write_varuint(2).unwrap(); // count
+        buf.write_i32(5).unwrap();
+        buf.write_i32(7).unwrap();
+        buf.write_varuint(0).unwrap(); // end marker
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = BlockInfo::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.overflows, false);
+        assert_eq!(decoded.bucket_number, -1);
+        assert_eq!(decoded.out_of_order_buckets, vec![5, 7]);
     }
 
     #[test]
@@ -229,6 +275,7 @@ mod tests {
             info: Some(BlockInfo {
                 overflows: false,
                 bucket_number: -1,
+                out_of_order_buckets: Vec::new(),
             }),
             columns: vec![
                 Column {

@@ -1006,14 +1006,18 @@ ServerHello appends a `VarUInt cluster_function_protocol_version` after `query_p
 
 ---
 
-#### Problem 62: v54480 — out-of-order buckets in aggregation
+#### Problem 62: v54480 — out-of-order buckets in BlockInfo ✅
 
-BlockInfo gets extended for aggregation bucketing. Server-internal in most cases, but BlockInfo's field-tagged encoding gracefully handles new fields — the existing decoder skips unknown field IDs.
+BlockInfo gains field 3 `out_of_order_buckets: Vec<Int32>` at v54480+. Field-tagged so technically forward-compatible, BUT our existing decoder used to ERROR on unknown field IDs — so this is a real wire change that needed an explicit decode arm.
 
-**Spec work:** verify §7.11 BlockInfo note about forward compatibility.
+**Implementation:** `Feature::OUT_OF_ORDER_BUCKETS_IN_AGGREGATION = 54480`; new `BlockInfo.out_of_order_buckets: Vec<i32>` field; decoder reads `[VarUInt count][Int32]*count` when field_id is 3. Encoder leaves it off (external clients don't emit this).
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row.
+
+**Tests:** 303 unit (new `test_block_info_decode_out_of_order_buckets`) + 89 integration pass at v54480.
 
 **References:**
-- ClickHouse: `src/Core/BlockInfo.h`, `BlockInfo.cpp` (field 3 / `out_of_order_buckets`); feature flag `DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS_IN_AGGREGATION = 54480`
+- ClickHouse: `Core/BlockInfo.h:30-38` (field declaration + macro); `BlockInfo.cpp:38-63` (read/write); feature flag at `Core/ProtocolDefines.h:139`.
 
 ---
 

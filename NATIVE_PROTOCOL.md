@@ -114,6 +114,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | QUERY_PLAN_SERIALIZATION        | 54477   | ServerHello, QueryPlan packet | ServerHello appends `VarUInt query_plan_serialization_version` after server settings. Also introduces `ClientPacket::QueryPlan` (code `13`) for inter-server delivery of pre-built query plans — external clients never send. |
 | PARALLEL_BLOCK_MARSHALLING      | 54478   | Block (Column)         | Server may wrap columns in `ColumnBLOB` (compressed inline) for parallel processing. Gated on the query having compression enabled AND `rows > 1`; otherwise the regular column wire format applies. Clients that never enable compression on outgoing Query packets see no wire change. |
 | VERSIONED_CLUSTER_FUNCTION_PROTOCOL | 54479 | ServerHello           | Adds `VarUInt cluster_function_protocol_version` at the tail of ServerHello. Used for `*Cluster` table functions (`s3Cluster`, etc.). External clients decode and ignore. |
+| OUT_OF_ORDER_BUCKETS_IN_AGGREGATION | 54480 | BlockInfo              | Adds field 3 (`out_of_order_buckets: Vec<Int32>`) to BlockInfo's field-tagged stream. Decoded as `[VarUInt count][Int32]*count`. External clients don't emit this themselves; the decoder reads any non-empty list the server sends. |
 
 ---
 
