@@ -23,6 +23,12 @@ impl Feature {
     pub const TIMEZONE_UPDATES: Feature = Feature(54464);
     pub const SPARSE_SERIALIZATION: Feature = Feature(54465);
     pub const SSH_AUTHENTICATION: Feature = Feature(54466);
+    /// Adds the `is_readonly` flag to `TablesStatusResponse`. No impact on
+    /// external clients that don't use the `TablesStatusRequest` packet.
+    pub const TABLE_READ_ONLY_CHECK: Feature = Feature(54467);
+    /// Server populates `system.keywords` so clients can autocomplete SQL
+    /// keywords. No wire change — purely a system-table addition.
+    pub const SYSTEM_KEYWORDS_TABLE: Feature = Feature(54468);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
 }
 

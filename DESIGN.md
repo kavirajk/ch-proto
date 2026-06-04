@@ -838,14 +838,18 @@ Our client doesn't implement SSH auth (we use password). Implementation deferred
 
 ---
 
-#### Problem 52: v54469 — rows_before_aggregation in ProfileInfo
+#### Problem 52: v54469 — rows_before_aggregation in ProfileInfo ✅
 
-ProfileInfo gets two new fields: `Bool applied_aggregation` + `VarUInt rows_before_aggregation`. Already in code (`ROWS_BEFORE_AGGREGATION = 54469` feature).
+ProfileInfo gets two new fields at the tail when negotiated ≥ 54469: `Bool applied_aggregation` (1 byte) and `VarUInt rows_before_aggregation`.
 
-**Spec work:** already covered in §7.13 — verify it's accurate.
+**Implementation:** already wired pre-Stage 4 — `Feature::ROWS_BEFORE_AGGREGATION = 54469` and the `ProfileInfo.applied_aggregation`/`rows_before_aggregation` fields with feature-gated encode/decode. This problem just bumps the declared protocol from 54466 to 54469 so the server starts emitting the fields, and adds the two intermediate version constants `TABLE_READ_ONLY_CHECK = 54467` (TablesStatusResponse change — no impact on us, we don't issue `TablesStatusRequest`) and `SYSTEM_KEYWORDS_TABLE = 54468` (server-side system table — no wire change).
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature table extended with the 54467/54468 rows + clarified 54469 row's field-order detail. §6.13 ProfileInfo table already documents the two fields (no change needed).
+
+**Tests:** existing 287 unit + 89 integration cover the field roundtrip via `proto::profile::tests::test_profile_info_roundtrip_with_aggregation`.
 
 **References:**
-- ClickHouse: `src/QueryPipeline/ProfileInfo.cpp`, `ProfileInfo.h`; feature flag at `src/Core/ProtocolDefines.h:102`
+- ClickHouse: `src/QueryPipeline/ProfileInfo.cpp:21-25` (decode) and `:38-42` (encode); feature flags at `src/Core/ProtocolDefines.h:113-117`.
 
 ---
 

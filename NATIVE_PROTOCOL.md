@@ -101,7 +101,9 @@ When a feature is active, its associated fields **must** be present on the wire.
 | TIMEZONE_UPDATES                | 54464   | TimezoneUpdate         | Adds the `TimezoneUpdate` server packet (type 17). Body: single `String` carrying the new session timezone. Sent when `SET session_timezone` mutates the session-default tz mid-query. |
 | SPARSE_SERIALIZATION            | 54465   | Block (Column)         | Server may set `has_custom_serialization = 1` and emit a sparse-encoded column. Wire format: 1-byte kind (0x01 = SPARSE), then VarUInt offset stream terminated by EOG, then the non-default values densely encoded in the inner type. See `NATIVE_FORMAT.md` §2.3.1. |
 | SSH_AUTHENTICATION              | 54466   | Auth flow              | Adds SSH challenge-response authentication. Opt-in: client sends a `user` of the form `" SSH KEY AUTHENTICATION " + <real_user>` with empty password to trigger it. See §6.20. |
-| ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
+| TABLE_READ_ONLY_CHECK           | 54467   | TablesStatusResponse   | Adds an `is_readonly` flag to each table's row in TablesStatusResponse. External clients that don't issue `TablesStatusRequest` see no wire change. |
+| SYSTEM_KEYWORDS_TABLE           | 54468   | system tables          | Server populates `system.keywords` so the canonical `clickhouse-client` can autocomplete keywords. No native-protocol wire change. |
+| ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` (Bool) and `rows_before_aggregation` (VarUInt) to ProfileInfo, in that order at the tail. |
 
 ---
 
