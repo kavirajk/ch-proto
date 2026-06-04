@@ -105,6 +105,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | SYSTEM_KEYWORDS_TABLE           | 54468   | system tables          | Server populates `system.keywords` so the canonical `clickhouse-client` can autocomplete keywords. No native-protocol wire change. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` (Bool) and `rows_before_aggregation` (VarUInt) to ProfileInfo, in that order at the tail. |
 | CHUNKED_PROTOCOL                | 54470   | Connection framing     | Per-packet chunk framing wraps every packet body. Negotiated in Addendum. ServerHello carries the server's preference for each direction; Addendum carries the client's final choice. See §4.1. |
+| VERSIONED_PARALLEL_REPLICAS_PROTOCOL | 54471 | ServerHello, Addendum | Both sides exchange a `VarUInt` parallel-replicas coordination protocol version. ServerHello's field is positioned **immediately after `protocol_version`** (before `timezone`). Addendum's field is appended after the chunked-protocol strings. Current value: `7` (`DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION`). |
 
 ---
 
@@ -389,6 +390,7 @@ Message tables document only the body of each packet (after the packet type code
 | 2 | version_major    | VarUInt | universal | always                 | Server major version |
 | 3 | version_minor    | VarUInt | universal | always                 | Server minor version |
 | 4 | protocol_version | VarUInt | universal | always                 | Server's protocol version |
+| 4a | parallel_replicas_protocol_version | VarUInt | universal | VERSIONED_PARALLEL_REPLICAS_PROTOCOL (v54471) | Server's parallel-replicas coordination protocol version. **Wire position: immediately after `protocol_version`**, before `timezone`. Current: `7`. |
 | 5 | timezone         | String  | universal | TIMEZONE (v54058)      | Server timezone (e.g., `"UTC"`) |
 | 6 | display_name     | String  | universal | DISPLAY_NAME (v54372)  | Human-readable server name |
 | 7 | version_patch    | VarUInt | universal | VERSION_PATCH (v54401) | Server patch version |
@@ -419,6 +421,7 @@ Not a distinct packet type — sent as raw fields with no packet type byte prefi
 | 1 | quota_key         | String | inter-server | always                     | Resource quota identifier. External clients send empty string. |
 | 2 | proto_send_chunked | String | universal   | CHUNKED_PROTOCOL (v54470)  | Client's negotiated outbound chunking: `"chunked"` or `"notchunked"`. Computed against `proto_recv_chunked_srv` from ServerHello. |
 | 3 | proto_recv_chunked | String | universal   | CHUNKED_PROTOCOL (v54470)  | Client's negotiated inbound chunking. Computed against `proto_send_chunked_srv`. |
+| 4 | parallel_replicas_protocol_version | VarUInt | universal | VERSIONED_PARALLEL_REPLICAS_PROTOCOL (v54471) | Client's supported parallel-replicas coordination protocol version. External clients not participating in distributed queries SHOULD still send a valid version (current `7`) so the server's compatibility check succeeds. |
 
 The chunked-framing flip applies AFTER this Addendum is flushed — the Addendum itself is unframed.
 

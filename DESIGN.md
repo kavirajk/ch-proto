@@ -884,14 +884,18 @@ Pairing: client SEND ↔ server RECV preference; client RECV ↔ server SEND.
 
 ---
 
-#### Problem 54: v54471 — versioned parallel replicas protocol
+#### Problem 54: v54471 — versioned parallel replicas protocol ✅
 
-Addendum gets `VarUInt parallel_replicas_protocol_version`. ServerHello mirrors this field. Client-relevant only if participating in distributed queries (most clients set it to the server's current default: 6).
+Both ServerHello and Addendum gain a `VarUInt parallel_replicas_protocol_version`. External clients send/receive but don't coordinate — we just advertise a valid version (current: `7`, matching `DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION`).
 
-**Spec work:** §7.2 + §7.3 + §4.3.
+**Implementation:** `Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL = 54471`; `ServerHello.parallel_replicas_protocol_version: Option<u64>` positioned **immediately after `protocol_version`** on the wire (earlier than every other optional field — per `TCPHandler.cpp::sendHello:2099-2100`); Addendum sends `7` after the chunked-protocol strings. Declared protocol bumped 54470 → 54471.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row, §6.2 ServerHello row 4a (after `protocol_version`, before `timezone`), §6.3 Addendum row 4.
+
+**Tests:** 2 unit tests verifying both wire position and gating. 302 unit + 89 integration pass.
 
 **References:**
-- ClickHouse: `src/Core/ProtocolDefines.h:45-50` (PARALLEL_REPLICAS_*_VERSION constants); flag at line 107; usage in `src/Server/TCPHandler.cpp` (`sendMergeTreeAllRangesAnnouncement`, `sendMergeTreeReadTaskRequest`)
+- ClickHouse: `DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION = 7` at `src/Core/ProtocolDefines.h:51`; flag at `:122`.
 
 ---
 

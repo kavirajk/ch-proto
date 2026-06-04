@@ -31,6 +31,7 @@ impl Feature {
     pub const SYSTEM_KEYWORDS_TABLE: Feature = Feature(54468);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
     pub const CHUNKED_PROTOCOL: Feature = Feature(54470);
+    pub const VERSIONED_PARALLEL_REPLICAS_PROTOCOL: Feature = Feature(54471);
 }
 
 impl Feature {

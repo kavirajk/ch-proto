@@ -49,6 +49,12 @@ pub struct ServerHello {
     pub version_major: u64,
     pub version_minor: u64,
     pub protocol_version: u64,
+    /// Server's parallel-replicas coordination protocol version. Feature-gated
+    /// by `VERSIONED_PARALLEL_REPLICAS_PROTOCOL` (v54471). Wire position is
+    /// **immediately after `protocol_version`** (before `timezone`) — earlier
+    /// on the wire than every other optional field despite the highest version
+    /// gate so far. Mirrors `Server/TCPHandler.cpp::sendHello:2099-2100`.
+    pub parallel_replicas_protocol_version: Option<u64>,
     pub timezone: Option<String>,     // feature-gated: TIMEZONE
     pub display_name: Option<String>, // feature-gated: DISPLAY_NAME
     pub version_patch: Option<u64>,   // feature-gated: VERSION_PATCH
@@ -78,6 +84,16 @@ impl ServerHello {
         w.write_varuint(self.version_major)?;
         w.write_varuint(self.version_minor)?;
         w.write_varuint(self.protocol_version)?;
+
+        if Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL.in_version(protocol) {
+            let v = self.parallel_replicas_protocol_version.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("parallel_replicas_protocol_version required at v{protocol}"),
+                )
+            })?;
+            w.write_varuint(v)?;
+        }
 
         if Feature::TIMEZONE.in_version(protocol) {
             w.write_string(&self.timezone.as_deref().ok_or_else(|| {
@@ -159,6 +175,12 @@ impl ServerHello {
             version_major: r.read_varuint()?,
             version_minor: r.read_varuint()?,
             protocol_version: r.read_varuint()?,
+            parallel_replicas_protocol_version:
+                if Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL.in_version(protocol) {
+                    Some(r.read_varuint()?)
+                } else {
+                    None
+                },
             timezone: if Feature::TIMEZONE.in_version(protocol) {
                 Some(r.read_string()?)
             } else {
@@ -243,6 +265,7 @@ mod tests {
             version_major: 21,
             version_minor: 8,
             protocol_version: 54460,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("production-1".to_string()),
             version_patch: Some(3),
@@ -360,6 +383,7 @@ mod tests {
             version_major: 19,
             version_minor: 1,
             protocol_version: 50000,
+            parallel_replicas_protocol_version: None,
             timezone: None,
             display_name: None,
             version_patch: None,
@@ -388,6 +412,7 @@ mod tests {
             version_major: 20,
             version_minor: 0,
             protocol_version: 54058,
+            parallel_replicas_protocol_version: None,
             timezone: Some("Europe/Moscow".to_string()),
             display_name: None,
             version_patch: None,
@@ -415,6 +440,7 @@ mod tests {
             version_major: 21,
             version_minor: 0,
             protocol_version: 54372,
+            parallel_replicas_protocol_version: None,
             timezone: Some("Asia/Kolkata".to_string()),
             display_name: Some("replica-2".to_string()),
             version_patch: None,
@@ -453,6 +479,7 @@ mod tests {
             version_major: 21,
             version_minor: 8,
             protocol_version: 54460,
+            parallel_replicas_protocol_version: None,
             timezone: None, // missing but required
             display_name: Some("test".to_string()),
             version_patch: Some(1),
@@ -474,6 +501,7 @@ mod tests {
             version_major: 21,
             version_minor: 8,
             protocol_version: 54460,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: None, // missing but required
             version_patch: Some(1),
@@ -495,6 +523,7 @@ mod tests {
             version_major: 21,
             version_minor: 8,
             protocol_version: 54460,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: None, // missing but required
@@ -521,6 +550,7 @@ mod tests {
             version_major: hello.version_major,
             version_minor: hello.version_minor,
             protocol_version: hello.protocol_version,
+            parallel_replicas_protocol_version: None,
             timezone: None,
             display_name: None,
             version_patch: None,
@@ -575,6 +605,7 @@ mod tests {
             version_major: 23,
             version_minor: 1,
             protocol_version: Feature::PASSWORD_COMPLEXITY_RULES.version() as u64,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: Some(0),
@@ -635,6 +666,7 @@ mod tests {
             version_major: 22,
             version_minor: 0,
             protocol_version: 54460,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: Some(0),
@@ -725,6 +757,7 @@ mod tests {
             version_major: 24,
             version_minor: 2,
             protocol_version: protocol as u64,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
@@ -758,6 +791,7 @@ mod tests {
             version_major: 23,
             version_minor: 1,
             protocol_version: 54461,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
@@ -783,6 +817,7 @@ mod tests {
             version_major: 24,
             version_minor: 2,
             protocol_version: protocol as u64,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
@@ -794,5 +829,63 @@ mod tests {
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // -- Parallel-replicas protocol version (v54471) --
+
+    #[test]
+    fn test_server_hello_parallel_replicas_version_roundtrip() {
+        // At v54471+, ServerHello carries a VarUInt parallel-replicas
+        // protocol version IMMEDIATELY AFTER `protocol_version`. Verifies
+        // both the wire ordering and the field roundtrip.
+        let protocol = Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL.version();
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 24,
+            version_minor: 3,
+            protocol_version: protocol as u64,
+            parallel_replicas_protocol_version: Some(7),
+            timezone: Some("UTC".to_string()),
+            display_name: Some("t".to_string()),
+            version_patch: Some(0),
+            proto_send_chunked_srv: Some("notchunked_optional".to_string()),
+            proto_recv_chunked_srv: Some("notchunked_optional".to_string()),
+            password_complexity_rules: Some(vec![]),
+            nonce: Some(0),
+        };
+
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+        let mut cursor = Cursor::new(&buf[1..]);
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.parallel_replicas_protocol_version, Some(7));
+        // And the rest still survives — proves wire position.
+        assert_eq!(decoded.timezone, Some("UTC".to_string()));
+        assert_eq!(decoded.nonce, Some(0));
+    }
+
+    #[test]
+    fn test_server_hello_parallel_replicas_version_absent_below_v54471() {
+        let protocol = 54470;
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 24,
+            version_minor: 3,
+            protocol_version: 54470,
+            parallel_replicas_protocol_version: None,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("t".to_string()),
+            version_patch: Some(0),
+            proto_send_chunked_srv: Some("notchunked_optional".to_string()),
+            proto_recv_chunked_srv: Some("notchunked_optional".to_string()),
+            password_complexity_rules: Some(vec![]),
+            nonce: Some(0),
+        };
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+        let mut cursor = Cursor::new(&buf[1..]);
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.parallel_replicas_protocol_version, None);
+        assert_eq!(cursor.position() as usize, buf.len() - 1);
     }
 }

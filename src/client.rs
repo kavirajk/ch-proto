@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::CHUNKED_PROTOCOL.version() as u64,
+            protocol: Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };
@@ -125,6 +125,16 @@ impl Connection {
                     if Feature::CHUNKED_PROTOCOL.in_version(negotiated) {
                         self.inner.write_string(final_send)?;
                         self.inner.write_string(final_recv)?;
+                    }
+                    if Feature::VERSIONED_PARALLEL_REPLICAS_PROTOCOL.in_version(negotiated) {
+                        // Send our supported parallel-replicas coordination
+                        // version. Matches `DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION
+                        // = 7` in ClickHouse/src/Core/ProtocolDefines.h. We
+                        // don't actually participate in parallel-replica
+                        // coordination from this client, but we must advertise
+                        // a version so the server's protocol-version check
+                        // succeeds.
+                        self.inner.write_varuint(7)?;
                     }
                     self.inner.flush()?;
                 }
@@ -520,6 +530,7 @@ mod tests {
             version_major: 21,
             version_minor: 8,
             protocol_version: 54401,
+            parallel_replicas_protocol_version: None,
             timezone: Some("UTC".to_string()),
             display_name: Some("test-server".to_string()),
             version_patch: Some(3),
