@@ -455,12 +455,23 @@ fn materialize_sparse(
             }
             Ok(ColumnData::Decimal128 { scale, values: dense })
         }
-        ColumnData::Nullable { .. } => Err(Error::new(
-            ErrorKind::Unsupported,
-            format!(
-                "column '{name}': sparse over Nullable not yet supported (v54483 nullable-sparse — Problem 65)"
-            ),
-        )),
+        ColumnData::Nullable { inner, nulls } => {
+            // Sparse-over-Nullable (v54483+). The `values` column carries
+            // both the inner T values AND their explicit null flags for
+            // the non-default positions. At every non-explicit position the
+            // default is "NULL" — i.e., the dense Nullable's null map gets
+            // 1 there, and the dense inner gets whatever the inner type's
+            // default is (irrelevant because nulls=1 hides it).
+            let dense_inner = materialize_sparse(*inner, positions, rows, name)?;
+            let mut dense_nulls = vec![1u8; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense_nulls[pos] = nulls[i];
+            }
+            Ok(ColumnData::Nullable {
+                inner: Box::new(dense_inner),
+                nulls: dense_nulls,
+            })
+        }
         other => Err(Error::new(
             ErrorKind::Unsupported,
             format!(
@@ -1865,6 +1876,46 @@ mod tests {
         let mut cursor = Cursor::new(body.as_slice());
         let err = decode_sparse(&mut cursor, "UInt32", 5, "x").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_sparse_over_nullable_decode() {
+        // v54483 nullable-sparse: the values column is itself a Nullable
+        // (null-map + inner values for the non-default positions); all
+        // non-explicit positions in the dense output default to NULL.
+        // Wire layout: [offsets][values_inner_dense as Nullable].
+        // For 6 rows with non-default values at positions 1 and 4, where
+        // both are non-null Int32 (e.g., 42 and 99):
+        let mut body = Vec::new();
+        // Offsets: pos 1 (cursor 0 + 1 default), pos 4 (cursor 2 + 2 defaults),
+        // trailing 1 default (cursor 5..6).
+        body.extend(varuint_bytes(1));
+        body.extend(varuint_bytes(2));
+        body.extend(varuint_bytes(1 | END_OF_GRANULE_FLAG));
+        // Values stream is a Nullable(Int32) of length 2: null map then ints.
+        body.push(0); // not null at i=0
+        body.push(0); // not null at i=1
+        body.extend(42i32.to_le_bytes());
+        body.extend(99i32.to_le_bytes());
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_sparse(&mut cursor, "Nullable(Int32)", 6, "x").unwrap();
+        match data {
+            ColumnData::Nullable { inner, nulls } => {
+                // Positions 0, 2, 3, 5 are NULL (default for Nullable).
+                assert_eq!(nulls, vec![1, 0, 1, 1, 0, 1]);
+                match *inner {
+                    ColumnData::Int32(v) => {
+                        // Inner at explicit positions holds the values;
+                        // non-explicit positions hold defaults (0 here).
+                        assert_eq!(v[1], 42);
+                        assert_eq!(v[4], 99);
+                    }
+                    other => panic!("expected Int32 inner, got {:?}", other),
+                }
+            }
+            other => panic!("expected Nullable, got {:?}", other),
+        }
     }
 
     #[test]

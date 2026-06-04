@@ -80,6 +80,12 @@ impl Feature {
     /// replicated form. Our decoder currently rejects this kind with a
     /// clear `Unsupported` error. Decoder implementation deferred.
     pub const REPLICATED_SERIALIZATION: Feature = Feature(54482);
+    /// Composes sparse with `Nullable(T)`. Below v54483, the writer expanded
+    /// sparse for Nullable columns before sending (`recursiveRemoveSparse`).
+    /// At v54483+ the wire data is sparse-over-Nullable: the inner values
+    /// stream is a Nullable column with the non-default values; positions
+    /// not in the offset list default to NULL.
+    pub const NULLABLE_SPARSE_SERIALIZATION: Feature = Feature(54483);
 }
 
 impl Feature {

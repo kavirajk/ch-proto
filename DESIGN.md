@@ -34,11 +34,11 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 done; Variant / Dynamic / JSON Tier 2 deferred) |
 | 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
-| 11    | Bring spec up to server v54483               | 46–65  | ⚠️ (46 done; 47–65 pending) |
+| 11    | Bring spec up to server v54483               | 46–65  | ✅ |
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
-| 13    | Spec completion                              | 70–73  | ⚠️ (composite + versioned + compression sections done; chunked-protocol pending) |
+| 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 
-**Test coverage at the time of writing:** 275 unit tests + 89 integration tests, all passing.
+**Test coverage at the time of writing:** 304 unit tests + 89 integration tests, all passing. Declared client protocol is now **54483** (the target).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -47,11 +47,14 @@ Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, vi
 | Stage 0 (TSV primitives, allowlist) | 10 | 10 | 100% |
 | Stage 1 (broader TSV, SELECT-only filter) | 1,141 | 969 | 84.9% |
 | Stage 2 (CREATE/INSERT/SET unlocked via per-test DB) | 3,753 | 3,050 | 81.3% |
-| Stage 3 (`-- { serverError NAME }` markers honored) | 4,909 | **3,941** | **80.3%** |
+| Stage 3 (`-- { serverError NAME }` markers honored) | 4,909 | 3,941 | 80.3% |
+| Stage 4 (declared client protocol bumped to v54483) | 4,909 | **3,891** | **79.3%** |
 
 Stage 2 unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREATE DATABASE test_<pid>_<n>; USE ...; DROP DATABASE` envelope inside the harness — the same pattern the canonical `clickhouse-test` runner uses. SET/SETTINGS pass through transparently because they're regular SQL statements on the wire.
 
 Stage 3 unlocked the ~1,200 negative-path tests by parsing the test-hint markers (`-- { serverError NAME }`, `-- { clientError 42 }`, etc.) — same syntax as `ClickHouse/src/Client/TestHint.cpp`. Numeric and name-based codes both supported; the wrapper looks up the name→code mapping once per run via `errorCodeToName`.
+
+Stage 4 closed the protocol-version gap from v54461 to **v54483** across 19 commits (Problems 47–65), with each ServerHello / Addendum / ClientInfo / Progress / ProfileInfo / BlockInfo extension implemented and gated behind its Feature constant. The 1-point pass-rate dip vs Stage 3 is the cost of declaring a higher protocol: at v54482+ the server starts emitting columns with `kind_stack = 0x04 (REPLICATED)` — a compact form for repeated values that we deliberately deferred (Problem 64 is docs-only). That accounts for all 61 new SERVER_ERRORs. Implementing REPLICATED column decoding would close most of the gap; deferred until a real use case surfaces.
 
 **Spec deliverables:**
 
@@ -1053,12 +1056,25 @@ At v54482+ the server can emit columns with `Kind::REPLICATED` (`kind_stack = 0x
 
 ---
 
-#### Problem 65: v54483 — nullable sparse serialization
+#### Problem 65: v54483 — nullable sparse serialization ✅
 
-Extends the sparse-serialization feature from v54465 to `Nullable(T)` columns. Requires the `Nullable` implementation (Problem 25) to cooperate with sparse decoding.
+Composes sparse with `Nullable(T)`. Below v54483 the writer expanded sparse for Nullable columns (`recursiveRemoveSparse`); at v54483+ the wire data is sparse-over-Nullable. Decoder needs to interleave a default-NULL pattern across the dense Nullable output.
+
+**Implementation:** `Feature::NULLABLE_SPARSE_SERIALIZATION = 54483`; extends `materialize_sparse` in `src/proto/column.rs` with a Nullable arm:
+- Recursively materialize the inner T (gives dense T of length `rows` with type-default at non-explicit positions).
+- Build a dense null map of length `rows`, initially all `1` (default = NULL); copy `values.nulls[i]` to position `positions[i]` for each explicit entry.
+- Wrap as `ColumnData::Nullable { inner, nulls }`.
+
+Declared protocol bumped 54482 → **54483 (the target)**.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row. `NATIVE_FORMAT.md` §2.3.1 already covers sparse encoding; the Nullable composition follows naturally because the values stream IS a Nullable column (null-map + inner values for `count` positions).
+
+**Tests:** 304 unit (added `test_sparse_over_nullable_decode`) + 89 integration pass. Live verification against a MergeTree table with `nullable_serialization_version = 'allow_sparse'` and `ratio_of_defaults_for_sparse_serialization = 0.5` — sparse-over-Nullable decoded correctly.
+
+**Harness delta:** see Phase 11 summary above.
 
 **References:**
-- ClickHouse: `DBMS_MIN_REVISION_WITH_NULLABLE_SPARSE_SERIALIZATION = 54483`; extends `SerializationNullable.cpp` + `SerializationSparse.cpp` composition
+- ClickHouse: feature flag at `Core/ProtocolDefines.h:144`; writer branch `NativeWriter.cpp:107-111` that expands sparse for Nullable below v54483.
 
 ---
 
