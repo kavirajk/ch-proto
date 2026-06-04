@@ -60,7 +60,7 @@ test-differential-cleanup: up
 # - currentDatabase() (resolves to our per-test name, not the canonical one)
 corpus-filter:
 	@cd $(CLICKHOUSE_QUERIES) && for f in *.sql; do \
-	    grep -qiE "FORMAT[[:space:]]+(JSON|CSV|Pretty|Vertical|RowBinary|Values|XML|Markdown|TSV|TabSeparated|Native|LineAsString|Raw)|serverError|clientError|ATTACH|DETACH|GRANT|REVOKE|EXPLAIN|^-- Tags:" "$$f" && continue; \
+	    grep -qiE "FORMAT[[:space:]]+(JSON|CSV|Pretty|Vertical|RowBinary|Values|XML|Markdown|TSV|TabSeparated|Native|LineAsString|Raw)|ATTACH|DETACH|GRANT|REVOKE|EXPLAIN|^-- Tags:" "$$f" && continue; \
 	    grep -qE "test\.(hits|visits)|system\.(parts|columns|tables|processes|metrics|asynchronous_metrics|merges|replicas|clusters|disks|users|grants|privileges|databases|formats|functions|build_options|errors|table_engines|data_skipping|projections|dictionaries|filesystem)" "$$f" && continue; \
 	    grep -qE "now\(\)|rand\(\)|randCanonical|generateUUIDv4|currentDatabase|currentUser|hostName|tcpPort|fqdn|uptime" "$$f" && continue; \
 	    [ -s "$$f" ] && echo "$$f"; \

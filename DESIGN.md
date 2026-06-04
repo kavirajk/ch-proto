@@ -46,9 +46,12 @@ Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, vi
 |-----|------------------:|------:|----------:|
 | Stage 0 (TSV primitives, allowlist) | 10 | 10 | 100% |
 | Stage 1 (broader TSV, SELECT-only filter) | 1,141 | 969 | 84.9% |
-| Stage 2 (CREATE/INSERT/SET unlocked via per-test DB) | 3,753 | **3,050** | **81.3%** |
+| Stage 2 (CREATE/INSERT/SET unlocked via per-test DB) | 3,753 | 3,050 | 81.3% |
+| Stage 3 (`-- { serverError NAME }` markers honored) | 4,909 | **3,941** | **80.3%** |
 
-The Stage 2 expansion unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREATE DATABASE test_<pid>_<n>; USE ...; DROP DATABASE` envelope inside the harness — the same pattern the canonical `clickhouse-test` runner uses. SET/SETTINGS pass through transparently because they're regular SQL statements on the wire.
+Stage 2 unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREATE DATABASE test_<pid>_<n>; USE ...; DROP DATABASE` envelope inside the harness — the same pattern the canonical `clickhouse-test` runner uses. SET/SETTINGS pass through transparently because they're regular SQL statements on the wire.
+
+Stage 3 unlocked the ~1,200 negative-path tests by parsing the test-hint markers (`-- { serverError NAME }`, `-- { clientError 42 }`, etc.) — same syntax as `ClickHouse/src/Client/TestHint.cpp`. Numeric and name-based codes both supported; the wrapper looks up the name→code mapping once per run via `errorCodeToName`.
 
 **Spec deliverables:**
 
