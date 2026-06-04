@@ -65,7 +65,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::PASSWORD_COMPLEXITY_RULES.version() as u64,
+            protocol: Feature::INTERSERVER_SECRET_V2.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)
@@ -464,6 +464,7 @@ mod tests {
             display_name: Some("test-server".to_string()),
             version_patch: Some(3),
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         sh.encode(&mut buf, protocol).unwrap();

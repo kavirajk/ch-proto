@@ -752,14 +752,18 @@ ServerHello gets: `VarUInt rules_count` + `count × (String pattern, String mess
 
 ---
 
-#### Problem 47: v54462 — inter-server secret v2 nonce
+#### Problem 47: v54462 — inter-server secret v2 nonce ✅
 
-ServerHello gets: `Int64 LE nonce` (8 bytes **fixed**, not VarUInt) if client ≥ 54462.
+ServerHello gets: `UInt64 LE nonce` (8 bytes **fixed**, not VarUInt) if client ≥ 54462. (Originally documented as Int64 — corrected to UInt64 to match the C++ side, which writes via `writeIntBinary(uint64_t)`.)
 
-**Spec work:** §7.2 + §4.3 + §11 note about the fixed-width encoding.
+**Implementation:** `Feature::INTERSERVER_SECRET_V2` constant; `ServerHello.nonce: Option<u64>` field with feature-gated encode/decode (`w.write_u64` / `r.read_u64`); declared protocol bumped 54461 → 54462.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.2 ServerHello row 9.
+
+**Tests:** 3 unit tests in `proto::hello::tests` (`roundtrip`, `absent_below_v54462`, `encode_errors_on_missing_nonce`). 89/89 integration tests pass at the bumped version.
 
 **References:**
-- ClickHouse: `DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2 = 54462` in `src/Core/ProtocolDefines.h`; usage in `src/Server/TCPHandler.cpp::sendHello` and `src/Client/Connection.cpp::receiveHello`
+- ClickHouse: `DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2 = 54462` in `src/Core/ProtocolDefines.h:102`; emit at `src/Server/TCPHandler.cpp:2161-2167`, receive at `src/Client/Connection.cpp:634-641`.
 
 ---
 

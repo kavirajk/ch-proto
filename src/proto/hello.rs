@@ -57,6 +57,10 @@ pub struct ServerHello {
     // 1. Regex-Pattern - express the password rule (e.g: no special symbols)
     // 2. Explanation - A string that explains the password rule if not met.
     pub password_complexity_rules: Option<Vec<(String, String)>>, // feature-gated: PASSWORD_COMPLEXITY_RULES
+    /// Inter-server signing nonce — 8 bytes UInt64 LE, fixed-width on the wire.
+    /// Feature-gated by INTERSERVER_SECRET_V2 (v54462). External clients decode
+    /// it to keep stream alignment and otherwise ignore the value.
+    pub nonce: Option<u64>,
 }
 
 impl ServerHello {
@@ -108,6 +112,16 @@ impl ServerHello {
             }
         }
 
+        if Feature::INTERSERVER_SECRET_V2.in_version(protocol) {
+            let nonce = self.nonce.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("nonce required for this protocol version ({protocol})"),
+                )
+            })?;
+            w.write_u64(nonce)?;
+        }
+
         Ok(())
     }
     pub fn decode(r: &mut impl ProtoRead, protocol: u32) -> io::Result<ServerHello> {
@@ -151,6 +165,11 @@ impl ServerHello {
             } else {
                 None
             },
+            nonce: if Feature::INTERSERVER_SECRET_V2.in_version(protocol) {
+                Some(r.read_u64()?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -189,6 +208,7 @@ mod tests {
             display_name: Some("production-1".to_string()),
             version_patch: Some(3),
             password_complexity_rules: None,
+            nonce: None,
         }
     }
 
@@ -303,6 +323,7 @@ mod tests {
             display_name: None,
             version_patch: None,
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -328,6 +349,7 @@ mod tests {
             display_name: None,
             version_patch: None,
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -352,6 +374,7 @@ mod tests {
             display_name: Some("replica-2".to_string()),
             version_patch: None,
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -387,6 +410,7 @@ mod tests {
             display_name: Some("test".to_string()),
             version_patch: Some(1),
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -405,6 +429,7 @@ mod tests {
             display_name: None, // missing but required
             version_patch: Some(1),
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -423,6 +448,7 @@ mod tests {
             display_name: Some("test".to_string()),
             version_patch: None, // missing but required
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         let err = hello.encode(&mut buf, protocol).unwrap_err();
@@ -446,6 +472,7 @@ mod tests {
             display_name: None,
             version_patch: None,
             password_complexity_rules: None,
+            nonce: None,
         };
         base_hello.encode(&mut buf_old, 50000).unwrap();
 
@@ -497,6 +524,7 @@ mod tests {
             display_name: Some("test".to_string()),
             version_patch: Some(0),
             password_complexity_rules: rules,
+            nonce: None,
         }
     }
 
@@ -554,6 +582,7 @@ mod tests {
             display_name: Some("test".to_string()),
             version_patch: Some(0),
             password_complexity_rules: None,
+            nonce: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf, protocol).unwrap();
@@ -622,5 +651,83 @@ mod tests {
         populated.encode(&mut buf_pop, protocol).unwrap();
 
         assert!(buf_pop.len() > buf_empty.len());
+    }
+
+    // -- Interserver secret v2 nonce (v54462) --
+
+    #[test]
+    fn test_server_hello_nonce_roundtrip() {
+        // At v54462+, ServerHello carries an 8-byte UInt64 LE nonce. The
+        // canonical server emits a random value; external clients must
+        // decode it to keep stream alignment.
+        let protocol = Feature::INTERSERVER_SECRET_V2.version();
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 24,
+            version_minor: 2,
+            protocol_version: protocol as u64,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("t".to_string()),
+            version_patch: Some(0),
+            password_complexity_rules: Some(vec![]),
+            nonce: Some(0xDEAD_BEEF_CAFE_BABE),
+        };
+
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+
+        // Confirm the last 8 bytes are the LE-encoded nonce.
+        assert_eq!(
+            &buf[buf.len() - 8..],
+            &0xDEAD_BEEF_CAFE_BABE_u64.to_le_bytes()
+        );
+
+        let mut cursor = Cursor::new(&buf[1..]); // skip packet type
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.nonce, Some(0xDEAD_BEEF_CAFE_BABE));
+    }
+
+    #[test]
+    fn test_server_hello_nonce_absent_below_v54462() {
+        // At v54461 the nonce gate is closed — encode emits nothing, decode
+        // returns None. Stream must be fully consumed after decoding.
+        let protocol = 54461;
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 23,
+            version_minor: 1,
+            protocol_version: 54461,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("t".to_string()),
+            version_patch: Some(0),
+            password_complexity_rules: Some(vec![]),
+            nonce: None,
+        };
+        let mut buf = Vec::new();
+        hello.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(&buf[1..]);
+        let decoded = ServerHello::decode(&mut cursor, protocol).unwrap();
+        assert_eq!(decoded.nonce, None);
+        assert_eq!(cursor.position() as usize, buf.len() - 1);
+    }
+
+    #[test]
+    fn test_server_hello_encode_errors_on_missing_nonce() {
+        let protocol = Feature::INTERSERVER_SECRET_V2.version();
+        let hello = ServerHello {
+            name: "ClickHouse".to_string(),
+            version_major: 24,
+            version_minor: 2,
+            protocol_version: protocol as u64,
+            timezone: Some("UTC".to_string()),
+            display_name: Some("t".to_string()),
+            version_patch: Some(0),
+            password_complexity_rules: Some(vec![]),
+            nonce: None, // missing but required at v54462
+        };
+        let mut buf = Vec::new();
+        let err = hello.encode(&mut buf, protocol).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

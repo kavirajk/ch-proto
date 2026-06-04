@@ -96,6 +96,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | PARAMETERS                      | 54459   | Query                  | Adds the parameters list to the Query body. |
 | SERVER_QUERY_TIME_IN_PROGRESS   | 54460   | Progress               | Adds the `elapsed_ns` field to Progress. |
 | PASSWORD_COMPLEXITY_RULES       | 54461   | ServerHello            | Adds a list of password-policy regex patterns and human-readable messages to ServerHello. |
+| INTERSERVER_SECRET_V2           | 54462   | ServerHello            | Adds an 8-byte `UInt64` nonce to ServerHello. Used by inter-server query signing; external clients decode and ignore. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
 
 ---
@@ -346,6 +347,7 @@ Message tables document only the body of each packet (after the packet type code
 | 6 | display_name     | String  | universal | DISPLAY_NAME (v54372)  | Human-readable server name |
 | 7 | version_patch    | VarUInt | universal | VERSION_PATCH (v54401) | Server patch version |
 | 8 | password_complexity_rules | Rule[] | universal | PASSWORD_COMPLEXITY_RULES (v54461) | Server's password policy. `VarUInt count` followed by `count × Rule`. See below. |
+| 9 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
 
 **Rule** — element of `password_complexity_rules`:
 
