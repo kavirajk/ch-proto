@@ -8,6 +8,7 @@ use crate::{
     options::QueryOptions,
     proto::{
         self,
+        chunked::{self, ChunkedStream},
         client_info::{ClientInfo, QueryKind},
         exception::ServerException,
         external_table::ExternalTable,
@@ -43,12 +44,21 @@ fn inject_json_string_setting(mut settings: Vec<Setting>) -> Vec<Setting> {
 
 #[derive(Debug)]
 pub struct Connection {
-    inner: TcpStream,
+    /// All bytes to/from the server flow through this wrapper. Both
+    /// directions start in passthrough mode; if the v54470+ chunked
+    /// protocol negotiation in the Addendum lands on "chunked" for either
+    /// direction, we flip the corresponding flag on this stream after the
+    /// Addendum has been sent.
+    inner: ChunkedStream<TcpStream>,
     database: Option<String>,
     user: Option<String>,
     password: Option<String>,
 
     protocol: u64,
+    /// Negotiated chunked-mode result. `"chunked"` or `"notchunked"` once
+    /// the handshake completes. Useful for diagnostics.
+    proto_send_chunked: &'static str,
+    proto_recv_chunked: &'static str,
 }
 
 impl Connection {
@@ -60,12 +70,14 @@ impl Connection {
     ) -> io::Result<Connection> {
         let stream = TcpStream::connect(addr)?;
         let mut conn = Connection {
-            inner: stream,
+            inner: ChunkedStream::new(stream),
             database: database.map(String::from),
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::ROWS_BEFORE_AGGREGATION.version() as u64,
+            protocol: Feature::CHUNKED_PROTOCOL.version() as u64,
+            proto_send_chunked: "notchunked",
+            proto_recv_chunked: "notchunked",
         };
         conn.handsake()?;
         Ok(conn)
@@ -86,14 +98,46 @@ impl Connection {
         self.inner.flush()?;
         match self.read_response()? {
             ServerResponse::Hello(sh) => {
-                // negotiate the protocol version. Should be the minimum of server and client.
+                // Negotiate the protocol version — the smaller of what we
+                // declared and what the server supports.
                 self.protocol = u64::min(ch.protocol_version, sh.protocol_version);
+                let negotiated = self.protocol as u32;
 
-                // send final ammendum message. Just an empty string (ClickHouse call it quota_key)
-                if Feature::ADDENDUM.in_version(self.protocol as u32) {
-                    self.inner.write_string("")?;
+                // Chunked-protocol negotiation. We prefer chunked on both
+                // directions but accept the server's wish via the _optional
+                // suffix. The pairing is intentional: client SEND mode
+                // negotiates against server RECV preference and vice versa.
+                let (send_pref, recv_pref) = ("chunked_optional", "chunked_optional");
+                let mut final_send = "notchunked";
+                let mut final_recv = "notchunked";
+                if Feature::CHUNKED_PROTOCOL.in_version(negotiated) {
+                    let srv_recv = sh.proto_recv_chunked_srv.as_deref().unwrap_or("notchunked");
+                    let srv_send = sh.proto_send_chunked_srv.as_deref().unwrap_or("notchunked");
+                    final_send = chunked::negotiate(srv_recv, send_pref, "send")?;
+                    final_recv = chunked::negotiate(srv_send, recv_pref, "recv")?;
+                }
+
+                // Send Addendum: quota_key (always at ADDENDUM+), then the
+                // chunked preferences at v54470+. Still on the plain wire —
+                // chunked framing only activates AFTER this is flushed.
+                if Feature::ADDENDUM.in_version(negotiated) {
+                    self.inner.write_string("")?; // quota_key
+                    if Feature::CHUNKED_PROTOCOL.in_version(negotiated) {
+                        self.inner.write_string(final_send)?;
+                        self.inner.write_string(final_recv)?;
+                    }
                     self.inner.flush()?;
                 }
+
+                // Switch to chunked framing for the rest of the connection.
+                if final_send == "chunked" {
+                    self.inner.enable_write_chunked();
+                }
+                if final_recv == "chunked" {
+                    self.inner.enable_read_chunked();
+                }
+                self.proto_send_chunked = final_send;
+                self.proto_recv_chunked = final_recv;
 
                 Ok(())
             }
@@ -479,6 +523,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("test-server".to_string()),
             version_patch: Some(3),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };

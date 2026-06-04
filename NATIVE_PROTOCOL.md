@@ -104,6 +104,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | TABLE_READ_ONLY_CHECK           | 54467   | TablesStatusResponse   | Adds an `is_readonly` flag to each table's row in TablesStatusResponse. External clients that don't issue `TablesStatusRequest` see no wire change. |
 | SYSTEM_KEYWORDS_TABLE           | 54468   | system tables          | Server populates `system.keywords` so the canonical `clickhouse-client` can autocomplete keywords. No native-protocol wire change. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` (Bool) and `rows_before_aggregation` (VarUInt) to ProfileInfo, in that order at the tail. |
+| CHUNKED_PROTOCOL                | 54470   | Connection framing     | Per-packet chunk framing wraps every packet body. Negotiated in Addendum. ServerHello carries the server's preference for each direction; Addendum carries the client's final choice. See §4.1. |
 
 ---
 
@@ -121,6 +122,45 @@ This applies to both directions (client → server and server → client). Compl
 The packet type is a VarUInt, not a fixed-width byte. For values < 128 a VarUInt produces the same single byte, but implementations must use VarUInt encoding to remain compatible if future packet types reach ≥ 128.
 
 Message tables in §6 document only the **body** of each packet (the bytes after the packet type code). Field numbering starts at 1 for the first body field.
+
+### 4.1 Chunked framing (v54470+)
+
+When the `CHUNKED_PROTOCOL` feature is **negotiated** (see §5.2), every packet on the wire is wrapped in chunked framing. The wrapping is **per-direction**: client→server and server→client are negotiated separately and may end up with different modes (chunked vs unframed).
+
+**Wire layout per packet:**
+
+```
+<chunk>...   one or more chunks comprising the packet's body
+[u32 LE = 0] zero-size terminator marking end of packet
+```
+
+**Wire layout per chunk:**
+
+```
+[u32 LE: chunk_size]   chunk_size in [1, UINT32_MAX]
+[chunk_size bytes]     packet body bytes
+```
+
+A single packet may be split across multiple chunks if the writer's buffer fills mid-packet. The reader treats the trailing 4-byte zero as a transparent packet boundary: it should be consumed but not surfaced to the layer reading packet bodies.
+
+**Negotiation.** Both ServerHello and Addendum carry two `String` fields each, one per direction, with values drawn from `{"chunked", "notchunked", "chunked_optional", "notchunked_optional"}`:
+
+- `chunked` / `notchunked` are strict — that side requires exactly that mode.
+- `_optional` variants are flexible — accept whichever the other side picks.
+
+The agreed value for each direction is computed pairwise (mirroring `Client/Connection.cpp::connect::is_chunked`):
+
+| Server pref | Client pref | Agreed |
+|-------------|-------------|--------|
+| `*_optional` | anything | follow CLIENT (its `starts_with("chunked")`) |
+| anything   | `*_optional` | follow SERVER |
+| `chunked` strict | `chunked` strict | `chunked` |
+| `notchunked` strict | `notchunked` strict | `notchunked` |
+| strict mismatch | strict mismatch | **protocol error** — the connection MUST be torn down |
+
+Client-side pairing: **client SEND preference negotiates against server RECV preference** and vice versa.
+
+**Timing.** Negotiation strings are exchanged on the unframed wire: ClientHello → ServerHello (with server prefs) → Addendum (with client's negotiated values). The framing flip applies to all bytes AFTER the Addendum is flushed. The Addendum itself, the ClientHello, and the ServerHello are always unframed.
 
 ---
 
@@ -352,8 +392,10 @@ Message tables document only the body of each packet (after the packet type code
 | 5 | timezone         | String  | universal | TIMEZONE (v54058)      | Server timezone (e.g., `"UTC"`) |
 | 6 | display_name     | String  | universal | DISPLAY_NAME (v54372)  | Human-readable server name |
 | 7 | version_patch    | VarUInt | universal | VERSION_PATCH (v54401) | Server patch version |
-| 8 | password_complexity_rules | Rule[] | universal | PASSWORD_COMPLEXITY_RULES (v54461) | Server's password policy. `VarUInt count` followed by `count × Rule`. See below. |
-| 9 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
+| 8 | proto_send_chunked_srv | String | universal | CHUNKED_PROTOCOL (v54470) | Server's preferred outbound chunking. One of `"chunked"`, `"notchunked"`, `"chunked_optional"`, `"notchunked_optional"`. See §4.1. **Sits BEFORE `password_complexity_rules` on the wire even though its version gate is higher.** |
+| 9 | proto_recv_chunked_srv | String | universal | CHUNKED_PROTOCOL (v54470) | Server's preferred inbound chunking. Same value set as field 8. |
+| 10 | password_complexity_rules | Rule[] | universal | PASSWORD_COMPLEXITY_RULES (v54461) | Server's password policy. `VarUInt count` followed by `count × Rule`. See below. |
+| 11 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
 
 **Rule** — element of `password_complexity_rules`:
 
@@ -372,9 +414,13 @@ To bound resource use against a hostile or misconfigured server, the decoded `co
 
 Not a distinct packet type — sent as raw fields with no packet type byte prefix.
 
-| # | Field     | Type   | Role         | Description |
-|---|-----------|--------|--------------|-------------|
-| 1 | quota_key | String | inter-server | Resource quota identifier. External clients send empty string. |
+| # | Field             | Type   | Role         | Condition                  | Description |
+|---|-------------------|--------|--------------|----------------------------|-------------|
+| 1 | quota_key         | String | inter-server | always                     | Resource quota identifier. External clients send empty string. |
+| 2 | proto_send_chunked | String | universal   | CHUNKED_PROTOCOL (v54470)  | Client's negotiated outbound chunking: `"chunked"` or `"notchunked"`. Computed against `proto_recv_chunked_srv` from ServerHello. |
+| 3 | proto_recv_chunked | String | universal   | CHUNKED_PROTOCOL (v54470)  | Client's negotiated inbound chunking. Computed against `proto_send_chunked_srv`. |
+
+The chunked-framing flip applies AFTER this Addendum is flushed — the Addendum itself is unframed.
 
 ### 6.4 Ping (packet type 4)
 

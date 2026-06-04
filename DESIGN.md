@@ -853,21 +853,34 @@ ProfileInfo gets two new fields at the tail when negotiated ≥ 54469: `Bool app
 
 ---
 
-#### Problem 53: v54470 — chunked protocol
+#### Problem 53: v54470 — chunked protocol ✅
 
-**The biggest v54460+ change.** Each packet on the wire becomes:
-- `4 bytes LE chunk size` + packet bytes + `4 bytes zero terminator`.
-- Large packets may split across multiple chunks.
+The biggest v54460+ change: every packet on the wire is wrapped in chunk framing when chunked is negotiated.
 
-Negotiated in Addendum: `String proto_send_chunked` + `String proto_recv_chunked`, each one of `"chunked"`, `"notchunked"`, `"chunked_optional"`, `"notchunked_optional"`.
+**Wire format per packet:**
+- `<chunk>+` — one or more `[u32 LE size][size bytes]` chunks
+- `[u32 LE 0]` — terminating zero-size chunk marking end-of-packet
 
-**Implementation:** wrapping layer on top of the TCP stream. Buffer N bytes, prefix chunk header, append zero terminator.
+Per-direction negotiation in Addendum: client sends `proto_send_chunked` + `proto_recv_chunked`, each `"chunked"` or `"notchunked"` (chosen against the server's `_srv` preferences advertised in ServerHello). The server can advertise `*_optional` to defer to the client; if both sides are strict and disagree, the connection is torn down.
 
-**Spec work:** major addition. New §5.x subsection on chunked framing; update §5 Packet Envelope to note chunked mode; update Addendum (§7.3) with the two new fields; §4.3 feature entry.
+**Implementation:** `src/proto/chunked.rs::ChunkedStream<S>` wraps any `Read + Write` byte stream with **independent per-direction toggles** (`enable_read_chunked` / `enable_write_chunked`). Default is passthrough; both flags flip after Addendum is flushed. `Connection.inner` is now `ChunkedStream<TcpStream>` always; the toggles activate based on the negotiated outcome. Client preference defaults to `"chunked_optional"` for both directions so the harness exercises the chunked path against the server's default `notchunked_optional` → final `chunked`.
+
+**Negotiation logic:** `chunked::negotiate(server_pref, client_pref, direction)`:
+- Server `_optional` → follow client preference.
+- Client `_optional` → follow server preference.
+- Strict mismatch → `InvalidInput`.
+- Strict match → use that mode.
+
+Pairing: client SEND ↔ server RECV preference; client RECV ↔ server SEND.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row, new §4.1 chunked framing section (wire layout + negotiation table), §6.2 ServerHello fields 8 & 9 inserted **before** `password_complexity_rules` to match the C++ writer order, §6.3 Addendum fields 2 & 3.
+
+**Tests:** 12 unit tests in `proto::chunked::tests` (single-chunk packet, split across two chunks, two consecutive packets, partial read, passthrough when disabled, write packet layout, empty-flush noop, write passthrough, roundtrip loopback, plus negotiation matrix). 300 unit + 89 integration pass with chunked transport ACTIVE on both directions.
+
+**Harness:** PASS 3941 → 3940 on the 4947-test corpus (within run-to-run flake; net no regression). The chunked path runs against the real server for every test, so the implementation is exercised in anger.
 
 **References:**
-- ClickHouse: `src/IO/ReadBufferFromPocoSocketChunked.h/cpp`, `src/IO/WriteBufferFromPocoSocketChunked.h/cpp`; negotiation in `src/Server/TCPHandler.cpp::runImpl` (lines ~405-445) and `src/Client/Connection.cpp::connect` (lines ~299-334); feature flag at `src/Core/ProtocolDefines.h:105`
-- clickhouse-go: `lib/proto/chunked.go` (proxy stream), `lib/proto/client.go` (negotiation)
+- ClickHouse: `src/IO/ReadBufferFromPocoSocketChunked.cpp` / `WriteBufferFromPocoSocketChunked.cpp`; negotiation in `Client/Connection.cpp:291-336` and `Server/TCPHandler.cpp:397-445`; feature flag at `src/Core/ProtocolDefines.h:120`.
 
 ---
 

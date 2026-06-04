@@ -52,6 +52,14 @@ pub struct ServerHello {
     pub timezone: Option<String>,     // feature-gated: TIMEZONE
     pub display_name: Option<String>, // feature-gated: DISPLAY_NAME
     pub version_patch: Option<u64>,   // feature-gated: VERSION_PATCH
+    /// Server's preferred outbound chunked mode — one of "chunked",
+    /// "notchunked", "chunked_optional", "notchunked_optional". Feature-gated
+    /// by CHUNKED_PROTOCOL (v54470). Sits on the wire BEFORE
+    /// `password_complexity_rules` even though its version gate is higher,
+    /// per `Server/TCPHandler.cpp::sendHello`.
+    pub proto_send_chunked_srv: Option<String>,
+    /// Server's preferred inbound chunked mode.
+    pub proto_recv_chunked_srv: Option<String>,
     // talks about what each password complexity rules are. Individual rule are basically
     // a pair of tuple of (Regex-Pattern, Explanation).
     // 1. Regex-Pattern - express the password rule (e.g: no special symbols)
@@ -98,6 +106,27 @@ impl ServerHello {
             })?)?;
         }
 
+        // Chunked-protocol negotiation strings. On the wire these go BEFORE
+        // `password_complexity_rules` (v54461) and `nonce` (v54462) — the
+        // C++ writer's order in `TCPHandler.cpp::sendHello` is what matters,
+        // not the strictly-ascending feature versions.
+        if Feature::CHUNKED_PROTOCOL.in_version(protocol) {
+            let send_pref = self.proto_send_chunked_srv.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("proto_send_chunked_srv required for this protocol version ({protocol})"),
+                )
+            })?;
+            let recv_pref = self.proto_recv_chunked_srv.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("proto_recv_chunked_srv required for this protocol version ({protocol})"),
+                )
+            })?;
+            w.write_string(send_pref)?;
+            w.write_string(recv_pref)?;
+        }
+
         if Feature::PASSWORD_COMPLEXITY_RULES.in_version(protocol) {
             let rules = self.password_complexity_rules.as_ref().ok_or_else(|| {
                 io::Error::new(
@@ -142,6 +171,16 @@ impl ServerHello {
             },
             version_patch: if Feature::VERSION_PATCH.in_version(protocol) {
                 Some(r.read_varuint()?)
+            } else {
+                None
+            },
+            proto_send_chunked_srv: if Feature::CHUNKED_PROTOCOL.in_version(protocol) {
+                Some(r.read_string()?)
+            } else {
+                None
+            },
+            proto_recv_chunked_srv: if Feature::CHUNKED_PROTOCOL.in_version(protocol) {
+                Some(r.read_string()?)
             } else {
                 None
             },
@@ -207,6 +246,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("production-1".to_string()),
             version_patch: Some(3),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         }
@@ -322,6 +363,8 @@ mod tests {
             timezone: None,
             display_name: None,
             version_patch: None,
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -348,6 +391,8 @@ mod tests {
             timezone: Some("Europe/Moscow".to_string()),
             display_name: None,
             version_patch: None,
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -373,6 +418,8 @@ mod tests {
             timezone: Some("Asia/Kolkata".to_string()),
             display_name: Some("replica-2".to_string()),
             version_patch: None,
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -409,6 +456,8 @@ mod tests {
             timezone: None, // missing but required
             display_name: Some("test".to_string()),
             version_patch: Some(1),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -428,6 +477,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: None, // missing but required
             version_patch: Some(1),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -447,6 +498,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: None, // missing but required
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -471,6 +524,8 @@ mod tests {
             timezone: None,
             display_name: None,
             version_patch: None,
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -523,6 +578,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: Some(0),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: rules,
             nonce: None,
         }
@@ -581,6 +638,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("test".to_string()),
             version_patch: Some(0),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: None,
             nonce: None,
         };
@@ -669,6 +728,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: Some(0xDEAD_BEEF_CAFE_BABE),
         };
@@ -700,6 +761,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: None,
         };
@@ -723,6 +786,8 @@ mod tests {
             timezone: Some("UTC".to_string()),
             display_name: Some("t".to_string()),
             version_patch: Some(0),
+            proto_send_chunked_srv: None,
+            proto_recv_chunked_srv: None,
             password_complexity_rules: Some(vec![]),
             nonce: None, // missing but required at v54462
         };

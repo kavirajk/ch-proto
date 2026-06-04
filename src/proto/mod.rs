@@ -1,4 +1,5 @@
 pub mod block;
+pub mod chunked;
 pub mod client_info;
 pub mod column;
 pub mod compression;

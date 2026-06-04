@@ -30,6 +30,7 @@ impl Feature {
     /// keywords. No wire change — purely a system-table addition.
     pub const SYSTEM_KEYWORDS_TABLE: Feature = Feature(54468);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
+    pub const CHUNKED_PROTOCOL: Feature = Feature(54470);
 }
 
 impl Feature {
