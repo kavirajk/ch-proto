@@ -55,6 +55,13 @@ impl Feature {
     /// Adds a `VarUInt query_plan_serialization_version` at the tail of
     /// ServerHello. Inter-server only — external clients decode and ignore.
     pub const QUERY_PLAN_SERIALIZATION: Feature = Feature(54477);
+    /// Server may emit columns wrapped in `ColumnBLOB` (compressed inline)
+    /// when (a) compression is active on the query and (b) the block has
+    /// > 1 row. Since our client never sets `compression = true` on outgoing
+    /// queries, the server-side `convertColumnsToBLOBs` short-circuits and
+    /// emits the regular dense form — no wire impact on us. Will need
+    /// proper handling if/when compression integration lands (Problem 42/43).
+    pub const PARALLEL_BLOCK_MARSHALLING: Feature = Feature(54478);
 }
 
 impl Feature {

@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::QUERY_PLAN_SERIALIZATION.version() as u64,
+            protocol: Feature::PARALLEL_BLOCK_MARSHALLING.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };

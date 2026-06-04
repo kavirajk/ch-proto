@@ -976,14 +976,18 @@ ServerHello appends `VarUInt query_plan_serialization_version` after the server 
 
 ---
 
-#### Problem 60: v54478 — parallel block marshalling / binary type encoding
+#### Problem 60: v54478 — parallel block marshalling ✅ (gated on compression)
 
-Types may be transmitted in a compact binary form instead of type-name strings. Gated by a block-level flag.
+Server may wrap columns in `ColumnBLOB` (compressed inline) for parallel marshalling at v54478+. The server-side `convertColumnsToBLOBs` short-circuits if the query doesn't have compression enabled OR if `rows <= 1`. Our client never sets `compression = true` on outgoing Query packets, so this code path stays inactive on the wire.
 
-**Spec work:** §7.11 Column — note the binary type encoding alternative.
+**Implementation:** `Feature::PARALLEL_BLOCK_MARSHALLING = 54478`; no encode/decode changes needed (the trigger condition isn't met). Declared protocol bumped 54477 → 54478. Will need proper `ColumnBLOB` handling if/when compression integration lands (Problem 42/43).
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row noting the gating condition.
+
+**Tests:** 302 unit + 89 integration pass at v54478.
 
 **References:**
-- ClickHouse: `src/DataTypes/DataTypesBinaryEncoding.h/cpp` (binary type IDs), `src/Formats/NativeWriter.cpp` (branch on `format_settings.native.encode_types_in_binary_format`); feature flag `DBMS_MIN_REVISON_WITH_PARALLEL_BLOCK_MARSHALLING = 54478`
+- ClickHouse: feature flag `DBMS_MIN_REVISON_WITH_PARALLEL_BLOCK_MARSHALLING = 54478` at `Core/ProtocolDefines.h:135` (typo "REVISON" in C++); use at `Server/TCPHandler.cpp:273` (`convertColumnsToBLOBs`).
 
 ---
 
