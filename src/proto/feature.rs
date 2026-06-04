@@ -68,6 +68,12 @@ impl Feature {
     /// state from `ConvertingAggregatedToChunksTransform`. External clients
     /// rarely see non-empty values here.
     pub const OUT_OF_ORDER_BUCKETS_IN_AGGREGATION: Feature = Feature(54480);
+    /// Server may wrap `Log` and `ProfileEvents` packet bodies in the
+    /// compression frame at v54481+. The wrap activates only when the
+    /// query has `compression = true` (`getCompressionCodec` returns a
+    /// non-null codec). Our client always sets `compression = false`, so
+    /// this code path stays inactive.
+    pub const COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS: Feature = Feature(54481);
 }
 
 impl Feature {

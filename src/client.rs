@@ -75,7 +75,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::OUT_OF_ORDER_BUCKETS_IN_AGGREGATION.version() as u64,
+            protocol: Feature::COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
         };

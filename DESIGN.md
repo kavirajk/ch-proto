@@ -1021,14 +1021,20 @@ BlockInfo gains field 3 `out_of_order_buckets: Vec<Int32>` at v54480+. Field-tag
 
 ---
 
-#### Problem 63: v54481 — compressed logs/profile_events blocks
+#### Problem 63: v54481 — compressed Log/ProfileEvents ✅ (gated on compression)
 
-Log (§7.16) and ProfileEvents (§7.17) packets may now wrap their block body in the compression frame (§9). Previously only Data/Totals/Extremes compressed.
+At v54481+, the server may wrap `Log` and `ProfileEvents` block bodies in the compression frame. The wrap activates only when the query has `compression = true` (the wrapper passes through `initMaybeCompressedOut` which returns the uncompressed stream when no codec is requested).
 
-**Spec work:** §7.16 and §7.17 — note the potential compression framing.
+Our client always sets `compression = false` on outgoing Query packets, so this code path stays inactive. Will need proper decompression handling for these packet types if/when compression integration lands (Problem 42/43).
+
+**Implementation:** `Feature::COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS = 54481`; no encode/decode changes (gating condition not met). Declared protocol bumped 54480 → 54481.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row noting the gating condition.
+
+**Tests:** 303 unit + 89 integration pass at v54481.
 
 **References:**
-- ClickHouse: `src/Server/TCPHandler.cpp::sendLogs` / `::sendProfileEvents` (compression branch); feature flag `DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS = 54481`
+- ClickHouse: `Server/TCPHandler.cpp:2770-2774` (Log compression branch), `:2793-2797` (ProfileEvents branch); `initMaybeCompressedOut:2735-2745`; feature flag at `Core/ProtocolDefines.h:140`.
 
 ---
 
