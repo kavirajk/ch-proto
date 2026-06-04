@@ -249,6 +249,7 @@ impl Column {
                 match kind {
                     KIND_DEFAULT => ColumnData::decode(r, &data_type, rows)?,
                     KIND_SPARSE => decode_sparse(r, &data_type, rows, name.as_str())?,
+                    KIND_REPLICATED => decode_replicated(r, &data_type, rows, name.as_str())?,
                     KIND_COMBINATION => {
                         // Multi-byte kind stack — we don't yet handle the
                         // composite forms (e.g. detached-over-sparse). For
@@ -286,6 +287,7 @@ impl Column {
 /// `ClickHouse/src/DataTypes/Serializations/SerializationInfo.cpp`.
 const KIND_DEFAULT: u8 = 0;
 const KIND_SPARSE: u8 = 1;
+const KIND_REPLICATED: u8 = 4;
 const KIND_COMBINATION: u8 = 5;
 
 /// Bit set on the trailing offset VarUInt of a sparse offsets stream to
@@ -349,6 +351,265 @@ fn decode_sparse(
 
     // Step 3: materialize the dense column.
     materialize_sparse(values, &positions, rows, name)
+}
+
+/// Decode a REPLICATED column (kind_stack `0x04`, v54482+). Wire format
+/// (per `SerializationReplicated::deserializeBinaryBulkWithMultipleStreams`):
+///
+///   - `VarUInt num_rows` — must equal `rows` (the caller's row count).
+///   - `UInt8 size_of_indexes_type` — 1, 2, 4, or 8 bytes per index.
+///   - `num_rows * size_of_indexes_type` bytes — indexes into the elements.
+///   - `VarUInt num_elements` — number of unique values that follow.
+///   - Inner type's dense encoding of `num_elements` rows.
+///
+/// We materialize to a dense `ColumnData` of length `rows` by selecting
+/// `elements[indexes[i]]` for each output row — dictionary lookup, the same
+/// pattern as LowCardinality.
+fn decode_replicated(
+    r: &mut impl ProtoRead,
+    data_type: &str,
+    rows: usize,
+    name: &str,
+) -> Result<ColumnData> {
+    let declared_rows = r.read_varuint()? as usize;
+    if declared_rows != rows {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "column '{name}': replicated declared {declared_rows} rows but column header said {rows}"
+            ),
+        ));
+    }
+    let size_of_indexes_type = r.read_u8()?;
+    let mut indexes: Vec<u64> = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let idx = match size_of_indexes_type {
+            1 => r.read_u8()? as u64,
+            2 => r.read_u16()? as u64,
+            4 => r.read_u32()? as u64,
+            8 => r.read_u64()?,
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "column '{name}': replicated size_of_indexes_type {other} (expected 1, 2, 4, or 8)"
+                    ),
+                ));
+            }
+        };
+        indexes.push(idx);
+    }
+
+    let num_elements = r.read_varuint()? as usize;
+    let elements = ColumnData::decode(r, data_type, num_elements)?;
+
+    materialize_replicated(elements, &indexes, num_elements, name)
+}
+
+/// Expand a REPLICATED column into a dense `ColumnData` of `indexes.len()`
+/// rows by picking `elements[indexes[i]]` for each output row. Bounds-checks
+/// each index against `num_elements` so a corrupt stream can't read past the
+/// elements vec.
+fn materialize_replicated(
+    elements: ColumnData,
+    indexes: &[u64],
+    num_elements: usize,
+    name: &str,
+) -> Result<ColumnData> {
+    let check_bounds = |idx: u64| -> Result<usize> {
+        let i = idx as usize;
+        if i >= num_elements {
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("column '{name}': replicated index {i} >= num_elements {num_elements}"),
+            ))
+        } else {
+            Ok(i)
+        }
+    };
+    macro_rules! lookup {
+        ($variant:ident, $inner:expr) => {{
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push($inner[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::$variant(out))
+        }};
+    }
+    match elements {
+        ColumnData::Uint8(v) => lookup!(Uint8, v),
+        ColumnData::Uint16(v) => lookup!(Uint16, v),
+        ColumnData::Uint32(v) => lookup!(Uint32, v),
+        ColumnData::Uint64(v) => lookup!(Uint64, v),
+        ColumnData::Int8(v) => lookup!(Int8, v),
+        ColumnData::Int16(v) => lookup!(Int16, v),
+        ColumnData::Int32(v) => lookup!(Int32, v),
+        ColumnData::Int64(v) => lookup!(Int64, v),
+        ColumnData::Int128(v) => lookup!(Int128, v),
+        ColumnData::Uint128(v) => lookup!(Uint128, v),
+        ColumnData::Float32(v) => lookup!(Float32, v),
+        ColumnData::Float64(v) => lookup!(Float64, v),
+        ColumnData::Bool(v) => lookup!(Bool, v),
+        ColumnData::Date(v) => lookup!(Date, v),
+        ColumnData::Date32(v) => lookup!(Date32, v),
+        ColumnData::DateTime(v) => lookup!(DateTime, v),
+        ColumnData::Enum16(v) => lookup!(Enum16, v),
+        ColumnData::Ipv4(v) => lookup!(Ipv4, v),
+        ColumnData::String(v) => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(v[check_bounds(idx)?].clone());
+            }
+            Ok(ColumnData::String(out))
+        }
+        ColumnData::Uuid(v) => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(v[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Uuid(out))
+        }
+        ColumnData::Ipv6(v) => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(v[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Ipv6(out))
+        }
+        ColumnData::FixedString { n, data } => {
+            let mut dense = vec![0u8; n.checked_mul(indexes.len()).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{name}': FixedString size overflow"),
+                )
+            })?];
+            for (out_i, &idx) in indexes.iter().enumerate() {
+                let src_start = check_bounds(idx)? * n;
+                let dst_start = out_i * n;
+                dense[dst_start..dst_start + n].copy_from_slice(&data[src_start..src_start + n]);
+            }
+            Ok(ColumnData::FixedString { n, data: dense })
+        }
+        ColumnData::DateTime64 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::DateTime64 { scale, values: out })
+        }
+        ColumnData::Decimal32 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Decimal32 { scale, values: out })
+        }
+        ColumnData::Decimal64 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Decimal64 { scale, values: out })
+        }
+        ColumnData::Decimal128 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Decimal128 { scale, values: out })
+        }
+        ColumnData::Nullable { inner, nulls } => {
+            // Replicated-over-Nullable: nested values column is already a
+            // Nullable. Expand both the null map and the inner via the
+            // dictionary indexes.
+            let dense_inner = materialize_replicated(*inner, indexes, num_elements, name)?;
+            let mut dense_nulls = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                dense_nulls.push(nulls[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Nullable {
+                inner: Box::new(dense_inner),
+                nulls: dense_nulls,
+            })
+        }
+        ColumnData::Array {
+            inner,
+            offsets: el_offsets,
+        } => {
+            // Replicated-over-Array: each "element" of the dictionary is
+            // itself an array. To materialize, for every output row pick
+            // the source element's [start..end] range of inner values and
+            // concatenate them — emitting new cumulative offsets along
+            // the way. The flat-index trick recurses cleanly into the
+            // inner type's own materializer.
+            let mut flat_indexes: Vec<u64> = Vec::new();
+            let mut new_offsets: Vec<u64> = Vec::with_capacity(indexes.len());
+            let mut total: u64 = 0;
+            for &idx in indexes {
+                let i = check_bounds(idx)?;
+                let start = if i == 0 { 0 } else { el_offsets[i - 1] };
+                let end = el_offsets[i];
+                for j in start..end {
+                    flat_indexes.push(j);
+                }
+                total += end - start;
+                new_offsets.push(total);
+            }
+            let inner_num = el_offsets.last().copied().unwrap_or(0) as usize;
+            let new_inner = materialize_replicated(*inner, &flat_indexes, inner_num, name)?;
+            Ok(ColumnData::Array {
+                inner: Box::new(new_inner),
+                offsets: new_offsets,
+            })
+        }
+        ColumnData::Tuple(elems) => {
+            // Replicated-over-Tuple: each tuple element is a parallel
+            // column with `num_elements` rows. Recursively expand each
+            // element column with the same dictionary indexes.
+            let mut new_elems = Vec::with_capacity(elems.len());
+            for elem in elems {
+                new_elems.push(materialize_replicated(elem, indexes, num_elements, name)?);
+            }
+            Ok(ColumnData::Tuple(new_elems))
+        }
+        ColumnData::Map {
+            keys,
+            values,
+            offsets: el_offsets,
+        } => {
+            // Same flat-index trick as Array, but two parallel inner
+            // streams (keys + values) need expansion against the same
+            // flat indexes.
+            let mut flat_indexes: Vec<u64> = Vec::new();
+            let mut new_offsets: Vec<u64> = Vec::with_capacity(indexes.len());
+            let mut total: u64 = 0;
+            for &idx in indexes {
+                let i = check_bounds(idx)?;
+                let start = if i == 0 { 0 } else { el_offsets[i - 1] };
+                let end = el_offsets[i];
+                for j in start..end {
+                    flat_indexes.push(j);
+                }
+                total += end - start;
+                new_offsets.push(total);
+            }
+            let inner_num = el_offsets.last().copied().unwrap_or(0) as usize;
+            let new_keys = materialize_replicated(*keys, &flat_indexes, inner_num, name)?;
+            let new_values = materialize_replicated(*values, &flat_indexes, inner_num, name)?;
+            Ok(ColumnData::Map {
+                keys: Box::new(new_keys),
+                values: Box::new(new_values),
+                offsets: new_offsets,
+            })
+        }
+        other => Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "column '{name}': replicated decoder doesn't handle nested type {}",
+                std::any::type_name_of_val(&other)
+            ),
+        )),
+    }
 }
 
 /// Build a dense `ColumnData` of length `rows` from the sparse representation
@@ -1918,6 +2179,111 @@ mod tests {
         }
     }
 
+    // -- REPLICATED serialization (v54482, Problem 64 follow-up) --
+
+    /// Hand-craft a REPLICATED-encoded UInt32 column body for a row count
+    /// `rows` where `indexes[i]` selects from `elements[]`.
+    fn build_replicated_uint32_wire(
+        rows: usize,
+        size: u8,
+        indexes: &[u64],
+        elements: &[u32],
+    ) -> Vec<u8> {
+        assert_eq!(indexes.len(), rows);
+        let mut buf = Vec::new();
+        buf.extend(varuint_bytes(rows as u64));
+        buf.push(size);
+        for &idx in indexes {
+            match size {
+                1 => buf.push(idx as u8),
+                2 => buf.extend((idx as u16).to_le_bytes()),
+                4 => buf.extend((idx as u32).to_le_bytes()),
+                8 => buf.extend(idx.to_le_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        buf.extend(varuint_bytes(elements.len() as u64));
+        for &v in elements {
+            buf.extend(v.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn test_replicated_uint32_decode() {
+        // 5 rows, indexes [0, 1, 0, 2, 1] into elements [42, 99, 7]
+        // Expected dense: [42, 99, 42, 7, 99]
+        let body = build_replicated_uint32_wire(5, 1, &[0, 1, 0, 2, 1], &[42, 99, 7]);
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_replicated(&mut cursor, "UInt32", 5, "x").unwrap();
+        match data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![42, 99, 42, 7, 99]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_replicated_rejects_index_out_of_bounds() {
+        // index 5 references a non-existent element (elements has only 3)
+        let body = build_replicated_uint32_wire(3, 1, &[0, 5, 1], &[1, 2, 3]);
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_replicated(&mut cursor, "UInt32", 3, "x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_replicated_rejects_row_count_mismatch() {
+        // Body declares 5 rows but column header passed 3.
+        let body = build_replicated_uint32_wire(5, 1, &[0, 1, 0, 2, 1], &[42, 99, 7]);
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_replicated(&mut cursor, "UInt32", 3, "x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_replicated_string_decode() {
+        // 3 rows with indexes [0, 1, 0] selecting from ["foo", "bar"]
+        let mut body = Vec::new();
+        body.extend(varuint_bytes(3));
+        body.push(1); // 1-byte indexes
+        body.extend([0u8, 1, 0]);
+        body.extend(varuint_bytes(2)); // num_elements
+        body.extend(varuint_bytes(3));
+        body.extend(b"foo");
+        body.extend(varuint_bytes(3));
+        body.extend(b"bar");
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_replicated(&mut cursor, "String", 3, "x").unwrap();
+        match data {
+            ColumnData::String(v) => assert_eq!(v, vec!["foo", "bar", "foo"]),
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_column_full_replicated_decode_via_header() {
+        // Drive Column::decode end-to-end with has_custom=1, kind=0x04.
+        let protocol = Feature::REPLICATED_SERIALIZATION.version();
+        let mut buf = Vec::new();
+        ProtoWrite::write_string(&mut buf, "x").unwrap();
+        ProtoWrite::write_string(&mut buf, "UInt32").unwrap();
+        buf.push(1); // has_custom
+        buf.push(KIND_REPLICATED); // 0x04
+        buf.extend(build_replicated_uint32_wire(5, 1, &[0, 1, 0, 2, 1], &[42, 99, 7]));
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let col = Column::decode(&mut cursor, 5, protocol).unwrap();
+        match col.serialization {
+            Serialization::Custom { kind_stack } => assert_eq!(kind_stack, vec![KIND_REPLICATED]),
+            other => panic!("expected Custom kind_stack, got {:?}", other),
+        }
+        match col.data {
+            ColumnData::Uint32(v) => assert_eq!(v, vec![42, 99, 42, 7, 99]),
+            other => panic!("expected Uint32, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_column_full_sparse_decode_via_header() {
         // Full Column::decode path: hand-craft a header (name, type, has_custom=1,
@@ -2119,12 +2485,14 @@ mod tests {
 
     #[test]
     fn test_column_rejects_unsupported_kind_stack_on_decode() {
-        // has_custom=1 + REPLICATED kind (0x04). Currently unsupported.
+        // has_custom=1 + DETACHED kind (0x02). DEFAULT/SPARSE/REPLICATED are
+        // implemented; DETACHED and DETACHED_OVER_SPARSE are storage-internal
+        // forms that don't appear on the native protocol wire.
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
         buf.write_string("UInt8").unwrap();
         buf.write_u8(1).unwrap(); // has_custom
-        buf.write_u8(4).unwrap(); // KIND_REPLICATED — not implemented
+        buf.write_u8(2).unwrap(); // KIND_DETACHED — not implemented
 
         let mut cursor = Cursor::new(buf.as_slice());
         let err = Column::decode(&mut cursor, 0, PROTOCOL).unwrap_err();

@@ -48,7 +48,8 @@ Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, vi
 | Stage 1 (broader TSV, SELECT-only filter) | 1,141 | 969 | 84.9% |
 | Stage 2 (CREATE/INSERT/SET unlocked via per-test DB) | 3,753 | 3,050 | 81.3% |
 | Stage 3 (`-- { serverError NAME }` markers honored) | 4,909 | 3,941 | 80.3% |
-| Stage 4 (declared client protocol bumped to v54483) | 4,909 | **3,891** | **79.3%** |
+| Stage 4 (declared client protocol bumped to v54483) | 4,909 | 3,891 | 79.3% |
+| Stage 4 + REPLICATED decoder | 4,909 | **3,935** | **80.2%** |
 
 Stage 2 unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREATE DATABASE test_<pid>_<n>; USE ...; DROP DATABASE` envelope inside the harness — the same pattern the canonical `clickhouse-test` runner uses. SET/SETTINGS pass through transparently because they're regular SQL statements on the wire.
 
@@ -1041,18 +1042,29 @@ Our client always sets `compression = false` on outgoing Query packets, so this 
 
 ---
 
-#### Problem 64: v54482 — replicated serialization ✅ (docs only)
+#### Problem 64: v54482 — replicated serialization ✅ (decoder added post-Stage 4)
 
-At v54482+ the server can emit columns with `Kind::REPLICATED` (`kind_stack = 0x04`) — a compact form for repeated values. Below this version it expanded such columns before sending. Our decoder rejects REPLICATED with the standard `Unsupported` error; decoder implementation deferred until we see it surface in practice.
+At v54482+ the server can emit columns with `Kind::REPLICATED` (`kind_stack = 0x04`) — a dictionary-style encoding for repeated values. Below this version the writer expanded such columns before sending; at v54482+ the wire data is compact and the client materializes via index lookup.
 
-**Implementation:** `Feature::REPLICATED_SERIALIZATION = 54482`; no decode path yet. Declared protocol bumped 54481 → 54482.
+**Wire format** (per `SerializationReplicated::deserializeBinaryBulkWithMultipleStreams`):
+```
+[VarUInt num_rows]       must equal column header's row count
+[UInt8 size_of_indexes]  1, 2, 4, or 8 — bytes per index
+[indexes]                num_rows × size_of_indexes
+[VarUInt num_elements]   distinct values that follow
+[elements]               num_elements rows in the inner type's dense form
+```
 
-**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row; `NATIVE_FORMAT.md` §2.3.1 already lists the kind_stack byte `0x04 = REPLICATED`.
+**Implementation:** `Feature::REPLICATED_SERIALIZATION = 54482`. New `decode_replicated` + `materialize_replicated` in `src/proto/column.rs`. The materializer expands the dictionary into a dense column by selecting `elements[indexes[i]]` per output row — the same lookup pattern as LowCardinality. Supports all leaf types (Int/UInt 8-128, Float32/64, Bool, String, FixedString, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum16, Decimal32/64/128), plus **composites recursively**: `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)` — composites use a flat-index trick that recurses into the inner materializer.
 
-**Tests:** 303 unit + 89 integration pass at v54482.
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row; `NATIVE_FORMAT.md` §2.3.1 lists the kind_stack byte `0x04 = REPLICATED`.
+
+**Tests:** 5 unit tests for `decode_replicated` (UInt32 roundtrip, index-out-of-bounds rejection, row-count-mismatch rejection, String roundtrip, full Column::decode path). 309 unit + 89 integration. Live verification: `SELECT arrayJoin(['Hello', 'Goodbye']), [1, 2, 3]` — the constant array is REPLICATED across two rows and decodes correctly.
+
+**Harness improvement:** PASS 3891 → 3935 (+44 tests recovered). The first pass (primitives + Nullable) recovered 31; adding Array/Tuple/Map recovered another 13.
 
 **References:**
-- ClickHouse: `Formats/NativeWriter.cpp:103-104` (writer's "expand if below v54482" branch); feature flag at `Core/ProtocolDefines.h:142`.
+- ClickHouse: `DataTypes/Serializations/SerializationReplicated.cpp:178-256` (`deserializeBinaryBulkWithMultipleStreams`); `Formats/NativeWriter.cpp:103-104` (writer's "expand if below v54482" branch); feature flag at `Core/ProtocolDefines.h:142`.
 
 ---
 
