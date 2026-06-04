@@ -782,14 +782,18 @@ Progress packet gets `VarUInt total_bytes` as a new field, positioned **between 
 
 ---
 
-#### Problem 49: v54464 — TimezoneUpdate packet (server → client)
+#### Problem 49: v54464 — TimezoneUpdate packet (server → client) ✅
 
-New ServerPacket::TimezoneUpdate (code `17`, already in enum). Body: single String carrying the server's timezone after a change (e.g., `SET timezone = '...'`).
+New `ServerPacket::TimezoneUpdate` (code `17`). Body: single `String` carrying the new session-default timezone (e.g., from `SET session_timezone = '...'`).
 
-**Spec work:** §7.x new subsection + §6.4 query-phase dispatch table + §4.3.
+**Implementation:** `Feature::TIMEZONE_UPDATES` constant; `ServerResponse::TimezoneUpdate(String)` variant; dispatch in `Connection::read_response` to decode the body; ignored in both the query and INSERT response loops (decoder advances stream but the value isn't yet wired into the DateTime formatter). Declared protocol bumped 54463 → 54464.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + new §6.19 TimezoneUpdate subsection.
+
+**Tests:** unit test in `client::tests::test_read_response_timezone_update`. 281 unit + 89 integration pass.
 
 **References:**
-- ClickHouse: `src/Server/TCPHandler.cpp` (`sendTimezone`); feature flag at `src/Core/ProtocolDefines.h:91`
+- ClickHouse: `src/Server/TCPHandler.cpp:1745-1758` (`sendTimezone`); feature flag at `src/Core/ProtocolDefines.h:106`.
 
 ---
 

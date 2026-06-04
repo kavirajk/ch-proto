@@ -93,6 +93,10 @@ pub enum ServerResponse {
     Log(Block),
     ProfileEvents(Block),
     TableColumns(TableColumns),
+    /// Server-side session-default timezone change notification (v54464+).
+    /// Body is a single String. Sent when `SET session_timezone = '...'` or
+    /// similar mutates the session-default tz during query execution.
+    TimezoneUpdate(String),
 }
 
 pub enum ClientPacket {

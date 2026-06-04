@@ -98,6 +98,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | PASSWORD_COMPLEXITY_RULES       | 54461   | ServerHello            | Adds a list of password-policy regex patterns and human-readable messages to ServerHello. |
 | INTERSERVER_SECRET_V2           | 54462   | ServerHello            | Adds an 8-byte `UInt64` nonce to ServerHello. Used by inter-server query signing; external clients decode and ignore. |
 | TOTAL_BYTES_IN_PROGRESS         | 54463   | Progress               | Adds the `total_bytes_to_read` (VarUInt) field to Progress, between `total_rows` and `wrote_rows`. |
+| TIMEZONE_UPDATES                | 54464   | TimezoneUpdate         | Adds the `TimezoneUpdate` server packet (type 17). Body: single `String` carrying the new session timezone. Sent when `SET session_timezone` mutates the session-default tz mid-query. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
 
 ---
@@ -601,6 +602,16 @@ The 6 columns:
 |---|---------------------|--------|-----------|-------------|
 | 1 | external_table      | String | universal | External table name. Empty = main table. |
 | 2 | columns_description | String | universal | Textual column definitions, e.g., `"id Int32, name String DEFAULT ''"`. Free-form text — parse as a string. |
+
+### 6.19 TimezoneUpdate (packet type 17)
+
+**Direction.** Server → Client. **Feature gate.** `TIMEZONE_UPDATES` (v54464). **Sent when.** The session-default timezone changes mid-query (e.g., a `SET session_timezone = '...'` runs as part of the query and the server wants the client to know about the new default for formatting subsequent `DateTime` values).
+
+| # | Field    | Type   | Role      | Description |
+|---|----------|--------|-----------|-------------|
+| 1 | timezone | String | universal | The new session-default timezone (e.g., `"UTC"`, `"Europe/Berlin"`). |
+
+The packet may arrive at any point in the query response stream, between Data / Progress / Log packets. A decoder that ignores `TimezoneUpdate` MUST still consume the trailing `String` to keep the wire aligned.
 
 ---
 

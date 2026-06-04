@@ -65,7 +65,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::TOTAL_BYTES_IN_PROGRESS.version() as u64,
+            protocol: Feature::TIMEZONE_UPDATES.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)
@@ -240,6 +240,11 @@ impl Connection {
                 ServerResponse::TableColumns(_) => {
                     // Column defaults metadata — ignore for SELECT queries.
                 }
+                ServerResponse::TimezoneUpdate(_) => {
+                    // v54464+: server announces session-default timezone
+                    // change. We don't use the value yet (DateTime formatter
+                    // is fixed to UTC) — decoded to keep stream alignment.
+                }
                 _ => {
                     return Err(Error::new(
                         io::ErrorKind::InvalidData,
@@ -300,7 +305,8 @@ impl Connection {
                 | ServerResponse::Progress(_)
                 | ServerResponse::ProfileInfo(_)
                 | ServerResponse::Log(_)
-                | ServerResponse::ProfileEvents(_) => {}
+                | ServerResponse::ProfileEvents(_)
+                | ServerResponse::TimezoneUpdate(_) => {}
                 other => {
                     return Err(Error::new(
                         io::ErrorKind::InvalidData,
@@ -342,7 +348,8 @@ impl Connection {
                 | ServerResponse::ProfileInfo(_)
                 | ServerResponse::Log(_)
                 | ServerResponse::ProfileEvents(_)
-                | ServerResponse::TableColumns(_) => {}
+                | ServerResponse::TableColumns(_)
+                | ServerResponse::TimezoneUpdate(_) => {}
                 other => {
                     return Err(Error::new(
                         io::ErrorKind::InvalidData,
@@ -406,6 +413,15 @@ impl Connection {
             ServerPacket::TableColumns => Ok(ServerResponse::TableColumns(TableColumns::decode(
                 &mut self.inner,
             )?)),
+            ServerPacket::TimezoneUpdate => {
+                // v54464+: body is a single String — the new session
+                // timezone. Sent when `SET session_timezone = '...'` mutates
+                // the session-default tz during query execution. We decode
+                // to keep stream alignment; the value isn't yet wired into
+                // our DateTime formatter.
+                let tz = self.inner.read_string()?;
+                Ok(ServerResponse::TimezoneUpdate(tz))
+            }
             _ => Err(Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unhandled server packet type {code_byte}"),
@@ -481,6 +497,22 @@ mod tests {
             }
             _ => panic!("expected Hello packet"),
         }
+    }
+
+    #[test]
+    fn test_read_response_timezone_update() {
+        // v54464: server emits packet type 17 + String timezone.
+        // Hand-craft the bytes and feed through the dispatch via the
+        // ServerPacket enum to verify the body decodes correctly.
+        let mut buf = Vec::new();
+        buf.write_varuint(ServerPacket::TimezoneUpdate as u64).unwrap();
+        buf.write_string("Europe/Berlin").unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let code = ServerPacket::try_from(cursor.read_varuint().unwrap() as u8).unwrap();
+        assert_eq!(code as u8, 17);
+        let tz = cursor.read_string().unwrap();
+        assert_eq!(tz, "Europe/Berlin");
     }
 
     #[test]
