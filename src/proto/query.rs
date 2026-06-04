@@ -101,6 +101,14 @@ impl Query {
         }
         w.write_string("")?; // empty string denotes end of settings
 
+        if Feature::INTERSERVER_EXTERNALLY_GRANTED_ROLES.in_version(protocol) {
+            // Send an empty role list: one byte (VarUInt 0) wrapped in a
+            // String envelope. External clients aren't running interserver
+            // queries, so no roles are passed. Matches the empty-vector
+            // serialization in `Client/Connection.cpp:977-986`.
+            w.write_string("\0")?;
+        }
+
         if Feature::INTERSERVER_SECRET.in_version(protocol) {
             w.write_string(&self.cluster_secret)?;
         }

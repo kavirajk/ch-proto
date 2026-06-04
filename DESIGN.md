@@ -899,12 +899,20 @@ Both ServerHello and Addendum gain a `VarUInt parallel_replicas_protocol_version
 
 ---
 
-#### Problem 55: v54473 — V2 Dynamic and JSON serialization
+#### Problem 55: v54473 — V2 Dynamic and JSON serialization ✅ (docs only)
 
-Introduces `Dynamic::V2` and `Object::V2` variants. Affects the serialization-version table (§8.4.2) — already documented but verify correctness.
+Introduces `Dynamic::V2` and `Object::V2` variants for those types' state-prefix versions. Tier 2/3 Dynamic/JSON is still out of scope for this client (per `NATIVE_FORMAT.md` §3.4.5), so this is a docs-only entry. Adding `Feature::V2_DYNAMIC_AND_JSON_SERIALIZATION = 54473` so the version-bump trajectory stays correct.
+
+**Bonus: v54472 EXTERNAL_ROLES.** Between P54 (v54471) and P55 (v54473) sits `DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES = 54472`. **Wire-level Query change** — at v54472+, the Query body adds a `String external_roles` between the settings terminator and the interserver secret. External clients send the empty-list serialization: one byte `0x00` (VarUInt 0) wrapped in a String envelope. Folded into P55 because it's a one-liner in `Query::encode` and the version bump skipping it would break the next commit.
+
+**Implementation:** `Feature::INTERSERVER_EXTERNALLY_GRANTED_ROLES = 54472` + `Feature::V2_DYNAMIC_AND_JSON_SERIALIZATION = 54473`; Query encoder writes `"\0"` at v54472+; declared protocol bumped 54471 → 54473.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature rows (both) + §6.7 Query row 3a documenting the external_roles wire format.
+
+**Tests:** 302 unit + 89 integration pass at v54473 with chunked transport ACTIVE.
 
 **References:**
-- ClickHouse: `src/DataTypes/Serializations/SerializationDynamic.h/cpp` (V1→V2 branch), `SerializationObject.h/cpp`; feature flag `DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION = 54473` in `src/Core/ProtocolDefines.h`
+- ClickHouse: `src/DataTypes/Serializations/SerializationDynamic.cpp` (V1→V2 branch); feature flag at `src/Core/ProtocolDefines.h:127`. `INTERSERVER_EXTERNALLY_GRANTED_ROLES` flag at `:125`; encode at `Client/Connection.cpp:976-986`, decode at `Server/TCPHandler.cpp:2319-2324`.
 
 ---
 

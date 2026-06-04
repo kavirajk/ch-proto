@@ -32,6 +32,18 @@ impl Feature {
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
     pub const CHUNKED_PROTOCOL: Feature = Feature(54470);
     pub const VERSIONED_PARALLEL_REPLICAS_PROTOCOL: Feature = Feature(54471);
+    /// Adds a `String external_roles` field to the Query packet body,
+    /// positioned between the settings terminator and the interserver
+    /// secret. External clients send an empty role list (one byte: VarUInt 0).
+    pub const INTERSERVER_EXTERNALLY_GRANTED_ROLES: Feature = Feature(54472);
+    /// V2 serialization of Dynamic and JSON column types. Wire impact is
+    /// inside the column body's serialization-version prefix — gated to
+    /// emit V2 instead of V1 for `Dynamic` and `JSON` types. We don't
+    /// implement Dynamic / JSON Tier 2 yet (see NATIVE_FORMAT.md §3.4.5),
+    /// so this is a docs-only entry. Bumping past it is safe because the
+    /// column-body serialization version is the only place it surfaces and
+    /// our decoder rejects unknown versions.
+    pub const V2_DYNAMIC_AND_JSON_SERIALIZATION: Feature = Feature(54473);
 }
 
 impl Feature {

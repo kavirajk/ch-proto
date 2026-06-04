@@ -106,6 +106,8 @@ When a feature is active, its associated fields **must** be present on the wire.
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` (Bool) and `rows_before_aggregation` (VarUInt) to ProfileInfo, in that order at the tail. |
 | CHUNKED_PROTOCOL                | 54470   | Connection framing     | Per-packet chunk framing wraps every packet body. Negotiated in Addendum. ServerHello carries the server's preference for each direction; Addendum carries the client's final choice. See §4.1. |
 | VERSIONED_PARALLEL_REPLICAS_PROTOCOL | 54471 | ServerHello, Addendum | Both sides exchange a `VarUInt` parallel-replicas coordination protocol version. ServerHello's field is positioned **immediately after `protocol_version`** (before `timezone`). Addendum's field is appended after the chunked-protocol strings. Current value: `7` (`DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION`). |
+| INTERSERVER_EXTERNALLY_GRANTED_ROLES | 54472 | Query | Adds a `String external_roles` field to the Query body, between the settings terminator and the interserver-secret hash. External clients send an empty role list (a single byte `0x00`, i.e. VarUInt 0 inside a String envelope). |
+| V2_DYNAMIC_AND_JSON_SERIALIZATION | 54473 | Column body | Server may emit V2 serialization for `Dynamic` and `JSON` column types — gates which `state_prefix` version they use. Implementation out of scope (Tier 2/3 Dynamic/JSON not yet supported — see `NATIVE_FORMAT.md` §3.4.5). |
 
 ---
 
@@ -460,6 +462,7 @@ If `has_nested` is true, another Exception structure follows (without a packet t
 | 1 | query_id       | String      | universal    | always                                   | Unique query identifier (UUID) |
 | 2 | client_info    | ClientInfo  | universal    | WRITE_CLIENT_INFO (v54420)               | See §6.8 |
 | 3 | settings       | Setting[]   | universal    | SETTINGS_SERIALIZED_AS_STRINGS (v54429)  | See §6.9. Terminated by empty key. |
+| 3a | external_roles | String     | universal    | INTERSERVER_EXTERNALLY_GRANTED_ROLES (v54472) | Serialized list of externally-granted role names. Empty list = byte `0x00` (VarUInt 0) wrapped in a String envelope (`[VarUInt 1][0x00]` on the wire). External clients always send empty. |
 | 4 | cluster_secret | String      | inter-server | INTERSERVER_SECRET (v54441)              | Cluster auth. External clients send empty string. |
 | 5 | stage          | VarUInt     | universal    | always                                   | 0 = FetchColumns, 1 = WithMergeableState, 2 = Complete |
 | 6 | compression    | VarUInt     | universal    | always                                   | 0 = disabled, 1 = enabled |
