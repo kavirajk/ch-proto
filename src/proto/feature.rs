@@ -49,6 +49,9 @@ impl Feature {
     /// ClientInfo. Used by clickhouse-client for multi-statement script
     /// error reporting. External clients send `0` for both.
     pub const QUERY_AND_LINE_NUMBERS: Feature = Feature(54475);
+    /// Adds a JWT-presence byte (+ optional JWT String) at the tail of
+    /// ClientInfo. External clients without JWT auth write a single 0 byte.
+    pub const JWT_IN_INTERSERVER: Feature = Feature(54476);
 }
 
 impl Feature {

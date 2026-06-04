@@ -946,14 +946,18 @@ ClientInfo gets `VarUInt script_query_number` + `VarUInt script_line_number` at 
 
 ---
 
-#### Problem 58: v54476 — JWT auth in interserver
+#### Problem 58: v54476 — JWT in interserver ✅
 
-Extends authentication modes; only relevant for server-to-server. Document briefly as inter-server only.
+ClientInfo gains a trailing `UInt8 jwt_present` + optional `String jwt`. Only inter-server clients populate the JWT; external clients send byte `0x00`. Despite the "interserver" label, the wire change is real and required at v54476+.
 
-**Spec work:** §4.3 + a paragraph in §3.2.
+**Implementation:** `Feature::JWT_IN_INTERSERVER = 54476`; encode writes `0` and decode reads the flag + optional String. Declared protocol bumped 54475 → 54476.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.8 ClientInfo rows 22 and 23.
+
+**Tests:** 302 unit + 89 integration pass at v54476.
 
 **References:**
-- ClickHouse: `DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER = 54476` (note the typo in the ClickHouse constant name: "REVISON"); usage in `src/Interpreters/ClientInfo.cpp` JWT field
+- ClickHouse: `Interpreters/ClientInfo.cpp:148-157` (encode), `:255+` (decode); feature flag `DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER = 54476` at `Core/ProtocolDefines.h:131` — note the C++ typo "REVISON".
 
 ---
 

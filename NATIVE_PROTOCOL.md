@@ -110,6 +110,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | V2_DYNAMIC_AND_JSON_SERIALIZATION | 54473 | Column body | Server may emit V2 serialization for `Dynamic` and `JSON` column types — gates which `state_prefix` version they use. Implementation out of scope (Tier 2/3 Dynamic/JSON not yet supported — see `NATIVE_FORMAT.md` §3.4.5). |
 | SERVER_SETTINGS                 | 54474   | ServerHello            | Server broadcasts its non-default settings as a list at the tail of ServerHello, after `nonce`. Format: `(key, flags, value)` triples terminated by an empty key — same as the Query packet's settings list. |
 | QUERY_AND_LINE_NUMBERS          | 54475   | ClientInfo             | Adds `script_query_number` (VarUInt) and `script_line_number` (VarUInt) at the tail of ClientInfo. Used by clickhouse-client for multi-statement script error attribution; external clients send `0, 0`. |
+| JWT_IN_INTERSERVER              | 54476   | ClientInfo             | Adds a JWT-presence UInt8 + optional `String jwt` at the tail of ClientInfo. External clients (no JWT) send byte `0x00`. (Spelled `DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER` in C++ — note the typo in the constant name.) |
 
 ---
 
@@ -499,6 +500,8 @@ If `has_nested` is true, another Exception structure follows (without a packet t
 | 19 | number_of_current_replica    | VarUInt | inter-server | PARALLEL_REPLICAS (v54453)             | External clients send `0`. |
 | 20 | script_query_number          | VarUInt | client       | QUERY_AND_LINE_NUMBERS (v54475)        | 1-indexed statement position in a multi-statement script. External clients send `0`. |
 | 21 | script_line_number           | VarUInt | client       | QUERY_AND_LINE_NUMBERS (v54475)        | 1-indexed line number within the source script. External clients send `0`. |
+| 22 | jwt_present                  | UInt8   | inter-server | JWT_IN_INTERSERVER (v54476)            | `0` = no JWT; `1` = JWT follows. External clients without JWT auth send `0`. |
+| 23 | jwt                          | String  | inter-server | JWT_IN_INTERSERVER (v54476), if jwt_present=1 | JWT bearer token, only present when field 22 = `1`. |
 
 **OpenTelemetry encoding** (field 16):
 

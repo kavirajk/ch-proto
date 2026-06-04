@@ -154,6 +154,13 @@ impl ClientInfo {
                 (None, None)
             };
 
+        if Feature::JWT_IN_INTERSERVER.in_version(protocol) {
+            let jwt_present = r.read_u8()?;
+            if jwt_present != 0 {
+                let _jwt = r.read_string()?;
+            }
+        }
+
         Ok(ClientInfo {
             query_kind,
             initial_user,
@@ -272,7 +279,10 @@ impl ClientInfo {
             w.write_varuint(self.script_line_number.unwrap_or(0))?;
         }
 
-        // FUTURE: Feature::JWT_IN_INTERSERVER (v54476) — interserver only.
+        if Feature::JWT_IN_INTERSERVER.in_version(self.protocol_version as u32) {
+            // JWT-presence byte. External clients don't use JWT auth — send 0.
+            w.write_u8(0)?;
+        }
 
         Ok(())
     }
