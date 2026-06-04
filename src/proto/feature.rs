@@ -19,6 +19,7 @@ impl Feature {
     pub const SERVER_QUERY_TIME_IN_PROGRESS: Feature = Feature(54460);
     pub const PASSWORD_COMPLEXITY_RULES: Feature = Feature(54461);
     pub const INTERSERVER_SECRET_V2: Feature = Feature(54462);
+    pub const TOTAL_BYTES_IN_PROGRESS: Feature = Feature(54463);
     pub const ROWS_BEFORE_AGGREGATION: Feature = Feature(54469);
 }
 

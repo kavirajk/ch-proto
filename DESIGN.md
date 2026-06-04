@@ -767,14 +767,18 @@ ServerHello gets: `UInt64 LE nonce` (8 bytes **fixed**, not VarUInt) if client �
 
 ---
 
-#### Problem 48: v54463 — total_bytes_to_read in Progress
+#### Problem 48: v54463 — total_bytes_to_read in Progress ✅
 
-Progress packet gets `VarUInt total_bytes_to_read` as a new field. Gated by `DBMS_MIN_PROTOCOL_VERSION_WITH_TOTAL_BYTES_IN_PROGRESS = 54463`.
+Progress packet gets `VarUInt total_bytes` as a new field, positioned **between `total_rows` and `wrote_rows`** on the wire (per `IO/Progress.cpp::read`). Gated by `DBMS_MIN_PROTOCOL_VERSION_WITH_TOTAL_BYTES_IN_PROGRESS = 54463`.
 
-**Spec work:** §7.12 Progress table + §4.3.
+**Implementation:** `Feature::TOTAL_BYTES_IN_PROGRESS` constant; `Progress.total_bytes: Option<u64>` field with feature-gated encode/decode; declared protocol bumped 54462 → 54463.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + §6.12 Progress table (field 4 inserted in the right position).
+
+**Tests:** 4 unit tests in `proto::progress::tests` covering roundtrip with/without the field plus a stream-position check at v54462. 89/89 integration.
 
 **References:**
-- ClickHouse: `src/IO/Progress.cpp`, `src/IO/Progress.h`; feature flag at `src/Core/ProtocolDefines.h:89`
+- ClickHouse: `src/IO/Progress.cpp:44-47` (decode), `:60+` (encode); feature flag at `src/Core/ProtocolDefines.h:104`.
 
 ---
 

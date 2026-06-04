@@ -97,6 +97,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | SERVER_QUERY_TIME_IN_PROGRESS   | 54460   | Progress               | Adds the `elapsed_ns` field to Progress. |
 | PASSWORD_COMPLEXITY_RULES       | 54461   | ServerHello            | Adds a list of password-policy regex patterns and human-readable messages to ServerHello. |
 | INTERSERVER_SECRET_V2           | 54462   | ServerHello            | Adds an 8-byte `UInt64` nonce to ServerHello. Used by inter-server query signing; external clients decode and ignore. |
+| TOTAL_BYTES_IN_PROGRESS         | 54463   | Progress               | Adds the `total_bytes_to_read` (VarUInt) field to Progress, between `total_rows` and `wrote_rows`. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
 
 ---
@@ -500,9 +501,10 @@ All fields are VarUInt. Each Progress packet carries cumulative totals (not delt
 | 1 | rows        | VarUInt | universal | always                                 | Rows processed so far |
 | 2 | bytes       | VarUInt | universal | always                                 | Bytes processed so far |
 | 3 | total_rows  | VarUInt | universal | always                                 | Estimated total rows (may be 0) |
-| 4 | wrote_rows  | VarUInt | universal | WRITE_CLIENT_INFO (v54420)             | Rows written (for INSERT) |
-| 5 | wrote_bytes | VarUInt | universal | WRITE_CLIENT_INFO (v54420)             | Bytes written (for INSERT) |
-| 6 | elapsed_ns  | VarUInt | universal | SERVER_QUERY_TIME_IN_PROGRESS (v54460) | Elapsed nanoseconds since query start |
+| 4 | total_bytes | VarUInt | universal | TOTAL_BYTES_IN_PROGRESS (v54463)       | Estimated total bytes (may be 0). Sits BETWEEN `total_rows` and `wrote_rows` on the wire. |
+| 5 | wrote_rows  | VarUInt | universal | WRITE_CLIENT_INFO (v54420)             | Rows written (for INSERT) |
+| 6 | wrote_bytes | VarUInt | universal | WRITE_CLIENT_INFO (v54420)             | Bytes written (for INSERT) |
+| 7 | elapsed_ns  | VarUInt | universal | SERVER_QUERY_TIME_IN_PROGRESS (v54460) | Elapsed nanoseconds since query start |
 
 ### 6.13 ProfileInfo (packet type 6)
 

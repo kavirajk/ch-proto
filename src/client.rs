@@ -65,7 +65,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::INTERSERVER_SECRET_V2.version() as u64,
+            protocol: Feature::TOTAL_BYTES_IN_PROGRESS.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)
