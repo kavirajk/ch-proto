@@ -819,18 +819,22 @@ The `has_custom_serialization` byte in Column header (§7.11) can now be `1` for
 
 ---
 
-#### Problem 51: v54466 — SSH authentication
+#### Problem 51: v54466 — SSH authentication ✅ (docs only)
 
-New challenge-response auth flow:
-- ClientPacket::SSHChallengeRequest (`11`)
+Opt-in challenge-response auth, triggered when ClientHello sends `user = " SSH KEY AUTHENTICATION " + <real_user>` and empty password.
+
+Three packets:
+- ClientPacket::SSHChallengeRequest (`11`) — no body
 - ServerPacket::SSHChallenge (`18`) — single String challenge
 - ClientPacket::SSHChallengeResponse (`12`) — signature String
 
-**Spec work:** new §7 subsections for all three packets + §6 new alternative handshake path + §4.3.
+Our client doesn't implement SSH auth (we use password). Implementation deferred until a real use case appears. `Feature::SSH_AUTHENTICATION = 54466` constant added; declared protocol bumped 54465 → 54466 so the server reports its SSH support without us actually triggering the flow.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row + new §6.20 SSH challenge-response subsection covering the trigger condition and packet bodies.
 
 **References:**
-- ClickHouse: `src/Server/TCPHandler.cpp` (`receiveSSHChallenge`, `sendSSHChallenge`); feature flag at `src/Core/ProtocolDefines.h:95`
-- clickhouse-go: `lib/auth/ssh.go`
+- ClickHouse: `src/Server/TCPHandler.cpp:1961-1963` (SSH marker detection); feature flag at `src/Core/ProtocolDefines.h:110`. Packet codes in `src/Core/Protocol.h:98, 129-130`.
+- clickhouse-go: `lib/auth/ssh.go` (production SSH client implementation, for reference if we ever implement).
 
 ---
 

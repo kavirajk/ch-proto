@@ -65,7 +65,7 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::SPARSE_SERIALIZATION.version() as u64,
+            protocol: Feature::SSH_AUTHENTICATION.version() as u64,
         };
         conn.handsake()?;
         Ok(conn)

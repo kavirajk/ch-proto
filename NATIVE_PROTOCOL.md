@@ -100,6 +100,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | TOTAL_BYTES_IN_PROGRESS         | 54463   | Progress               | Adds the `total_bytes_to_read` (VarUInt) field to Progress, between `total_rows` and `wrote_rows`. |
 | TIMEZONE_UPDATES                | 54464   | TimezoneUpdate         | Adds the `TimezoneUpdate` server packet (type 17). Body: single `String` carrying the new session timezone. Sent when `SET session_timezone` mutates the session-default tz mid-query. |
 | SPARSE_SERIALIZATION            | 54465   | Block (Column)         | Server may set `has_custom_serialization = 1` and emit a sparse-encoded column. Wire format: 1-byte kind (0x01 = SPARSE), then VarUInt offset stream terminated by EOG, then the non-default values densely encoded in the inner type. See `NATIVE_FORMAT.md` §2.3.1. |
+| SSH_AUTHENTICATION              | 54466   | Auth flow              | Adds SSH challenge-response authentication. Opt-in: client sends a `user` of the form `" SSH KEY AUTHENTICATION " + <real_user>` with empty password to trigger it. See §6.20. |
 | ROWS_BEFORE_AGGREGATION         | 54469   | ProfileInfo            | Adds `applied_aggregation` and `rows_before_aggregation` to ProfileInfo. |
 
 ---
@@ -613,6 +614,27 @@ The 6 columns:
 | 1 | timezone | String | universal | The new session-default timezone (e.g., `"UTC"`, `"Europe/Berlin"`). |
 
 The packet may arrive at any point in the query response stream, between Data / Progress / Log packets. A decoder that ignores `TimezoneUpdate` MUST still consume the trailing `String` to keep the wire aligned.
+
+### 6.20 SSH challenge-response authentication (packet types 11, 12, 18)
+
+**Feature gate.** `SSH_AUTHENTICATION` (v54466). **Opt-in only.** A connection enters the SSH flow when ClientHello sends `user = " SSH KEY AUTHENTICATION " + <real_user>` (with the leading and trailing spaces) and `password = ""`. The server reads the prefix, strips it to recover the real user, and switches to challenge-response.
+
+| Packet | Code | Direction | Body |
+|--------|------|-----------|------|
+| SSHChallengeRequest | 11 | Client → Server | (no body) |
+| SSHChallenge       | 18 | Server → Client | `String challenge` — the bytes to sign |
+| SSHChallengeResponse | 12 | Client → Server | `String signature` — the SSH-signed challenge |
+
+The flow runs in place of password authentication, after ClientHello:
+
+1. Client sends ClientHello with the SSH marker prefix.
+2. Server replies with ServerHello as usual.
+3. Client sends `SSHChallengeRequest` (packet 11).
+4. Server replies with `SSHChallenge` carrying random bytes (packet 18).
+5. Client signs the bytes with its SSH private key and sends `SSHChallengeResponse` (packet 12) with the signature.
+6. Server verifies the signature against the user's registered public key, then continues as if password auth had succeeded (or returns an Exception on failure).
+
+External clients that don't use SSH auth never see packets 11, 12, or 18 — they're entirely off the wire unless the user explicitly opts in via the username prefix.
 
 ---
 
