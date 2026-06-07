@@ -168,7 +168,7 @@ The `kind_stack` byte enumerates a non-default per-column serialization. Mirrors
 | `0x01` | SPARSE | Sparse serialization (v54465+) | Offset stream + non-default values; see below |
 | `0x02` | DETACHED | Internal storage form (not used over the wire) | — |
 | `0x03` | DETACHED_OVER_SPARSE | Detached over sparse (not used over the wire) | — |
-| `0x04` | REPLICATED | Replication-internal form (v54482+) | — |
+| `0x04` | REPLICATED | Dictionary form for repeated values (v54482+) | Index stream + dense element values; see below |
 | `0x05` | COMBINATION | Multi-kind stack | Followed by VarUInt `count` and `count` further kind bytes |
 
 **Sparse wire format.** When `kind_stack = 0x01`, the column `data` is two streams written back-to-back in the single shared TCP stream:
@@ -179,6 +179,18 @@ The `kind_stack` byte enumerates a non-default per-column serialization. Mirrors
 2. **Values stream** — `count` non-default values densely encoded in the inner type, where `count` is the number of non-EOG VarUInts read above.
 
 Decoders reconstruct a dense column of `num_rows` entries by filling every non-explicit position with the inner type's zero value (`0` for integers/floats, `""` for `String`, `0` days for `Date`, etc.).
+
+**Replicated wire format.** When `kind_stack = 0x04`, the column `data` is a dictionary: a list of distinct element values plus a per-row index into that list (the same lookup shape as `LowCardinality`). Layout:
+
+```
+[VarUInt num_rows]
+[UInt8  size_of_indexes_type]            width of each index: 1, 2, 4, or 8 bytes
+[indexes: num_rows × size_of_indexes_type bytes]
+[VarUInt num_elements]
+[elements: num_elements dense inner-type values]
+```
+
+Decoders reconstruct a dense column by selecting `elements[indexes[i]]` for each output row `i`. Composite inner types (`Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`) recurse: the element list is materialized in the inner type, then indexed. `Nested` and `LowCardinality` inners are not yet supported.
 
 ### 2.4 Block variants
 

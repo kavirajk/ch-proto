@@ -116,7 +116,7 @@ When a feature is active, its associated fields **must** be present on the wire.
 | VERSIONED_CLUSTER_FUNCTION_PROTOCOL | 54479 | ServerHello           | Adds `VarUInt cluster_function_protocol_version` at the tail of ServerHello. Used for `*Cluster` table functions (`s3Cluster`, etc.). External clients decode and ignore. |
 | OUT_OF_ORDER_BUCKETS_IN_AGGREGATION | 54480 | BlockInfo              | Adds field 3 (`out_of_order_buckets: Vec<Int32>`) to BlockInfo's field-tagged stream. Decoded as `[VarUInt count][Int32]*count`. External clients don't emit this themselves; the decoder reads any non-empty list the server sends. |
 | COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS | 54481 | Log, ProfileEvents | Server may wrap `Log` (§6.16) and `ProfileEvents` (§6.17) packet bodies in the compression frame (NATIVE_FORMAT.md §4). The wrap only activates when the query has `compression = true`. Clients that never enable compression on outgoing Query packets see no wire change. |
-| REPLICATED_SERIALIZATION        | 54482   | Block (Column)         | Server may emit columns with kind_stack `0x04 = REPLICATED` (compact form for repeated values) — see `NATIVE_FORMAT.md` §2.3.1. Below this version the writer expanded such columns before sending. Our decoder rejects this kind for now; implementation deferred. |
+| REPLICATED_SERIALIZATION        | 54482   | Block (Column)         | Server may emit columns with kind_stack `0x04 = REPLICATED` — a dictionary-style compact form for repeated values — see `NATIVE_FORMAT.md` §2.3.1. Below this version the writer expanded such columns before sending. Decoded via index lookup (`elements[indexes[i]]` per row); leaf types plus `Nullable`/`Array`/`Tuple`/`Map` inners supported, `Nested`/`LowCardinality` inners deferred. |
 
 ---
 

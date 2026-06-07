@@ -55,7 +55,7 @@ Stage 2 unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREAT
 
 Stage 3 unlocked the ~1,200 negative-path tests by parsing the test-hint markers (`-- { serverError NAME }`, `-- { clientError 42 }`, etc.) — same syntax as `ClickHouse/src/Client/TestHint.cpp`. Numeric and name-based codes both supported; the wrapper looks up the name→code mapping once per run via `errorCodeToName`.
 
-Stage 4 closed the protocol-version gap from v54461 to **v54483** across 19 commits (Problems 47–65), with each ServerHello / Addendum / ClientInfo / Progress / ProfileInfo / BlockInfo extension implemented and gated behind its Feature constant. The 1-point pass-rate dip vs Stage 3 is the cost of declaring a higher protocol: at v54482+ the server starts emitting columns with `kind_stack = 0x04 (REPLICATED)` — a compact form for repeated values that we deliberately deferred (Problem 64 is docs-only). That accounts for all 61 new SERVER_ERRORs. Implementing REPLICATED column decoding would close most of the gap; deferred until a real use case surfaces.
+Stage 4 closed the protocol-version gap from v54461 to **v54483** across 19 commits (Problems 47–65), with each ServerHello / Addendum / ClientInfo / Progress / ProfileInfo / BlockInfo extension implemented and gated behind its Feature constant. The 1-point pass-rate dip vs Stage 3 is the cost of declaring a higher protocol: at v54482+ the server starts emitting columns with `kind_stack = 0x04 (REPLICATED)` — a compact form for repeated values that we deliberately deferred (Problem 64 is docs-only). That accounts for all 61 new SERVER_ERRORs. A REPLICATED column decoder was subsequently added (post-Stage 4 follow-up, see Problem 64), recovering +44 tests to **80.2%**; only ~13 cases with `Nested`/`LowCardinality` inners remain deferred.
 
 **Spec deliverables:**
 
@@ -806,7 +806,7 @@ New `ServerPacket::TimezoneUpdate` (code `17`). Body: single `String` carrying t
 The `has_custom_serialization` byte in Column header (§7.11) can now be `1` for sparse encoding. We DECODE sparse columns and materialize them as dense `ColumnData` so the rest of the client (TSV formatter, etc.) is unchanged.
 
 **Wire format we implement:**
-- 1-byte kind_stack: `0x01` = SPARSE (other kinds: `0x00` DEFAULT, `0x02` DETACHED, `0x03` DETACHED_OVER_SPARSE, `0x04` REPLICATED, `0x05` COMBINATION). We accept SPARSE; reject others with a clear `Unsupported` error.
+- 1-byte kind_stack: `0x01` = SPARSE (other kinds: `0x00` DEFAULT, `0x02` DETACHED, `0x03` DETACHED_OVER_SPARSE, `0x04` REPLICATED, `0x05` COMBINATION). We accept SPARSE and REPLICATED (the latter added post-Stage 4, see Problem 64 / §2.3.1); reject the remaining kinds with a clear `Unsupported` error.
 - Offsets stream: VarUInts where each value is `(defaults_before_next_value)`. Trailing VarUInt has `END_OF_GRANULE_FLAG = 1 << 62` and encodes trailing-defaults count. Terminates the offset stream.
 - Values stream: `count` non-default values, where `count` = number of non-EOG VarUInts, densely encoded in the inner type.
 

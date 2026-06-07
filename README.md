@@ -171,14 +171,14 @@ The two tracks below are signposts into the existing spec, not a re-explanation.
 | Fixed-width + variable-length + composite types | `NATIVE_FORMAT.md` §3.1–§3.3 | ✅ Complete |
 | Versioned / stateful types | `NATIVE_FORMAT.md` §3.4 | ⚠️ LowCardinality + JSON Tier 1 spec'd; Variant, Dynamic, JSON Tier 2/3 deferred (rationale in §3.4.5) |
 | Compression frame | `NATIVE_FORMAT.md` §4 | ✅ Frame format spec'd; client-side connection integration pending |
-| v54461–v54483 feature additions | `NATIVE_PROTOCOL.md` §3.3 + various | ⏳ Most pending — see [`DESIGN.md`](DESIGN.md) Phase 11 |
-| Chunked protocol (v54470) | `NATIVE_PROTOCOL.md` §4–§5 | ⏳ Not yet documented |
+| v54461–v54483 feature additions | `NATIVE_PROTOCOL.md` §3.3 + various | ✅ Complete — feature table extends to v54482; v54483 (nullable sparse) in `NATIVE_FORMAT.md` §2.3.1. See [`DESIGN.md`](DESIGN.md) Phase 11 (Problems 46–65) |
+| Chunked protocol (v54470) | `NATIVE_PROTOCOL.md` §4.1 | ✅ Spec'd (framing + negotiation) and fully implemented |
 
 **Known gaps to focus review on:**
 
 - `NATIVE_FORMAT.md` §3.4 — the deferred-types rationale. Are the boundaries between Tier 1/2/3 JSON drawn correctly?
-- `NATIVE_PROTOCOL.md` §3.3 — the feature table currently caps at v54460-era features. Anything added v54461 → v54483 likely needs a row.
-- Anything marked ⏳ above.
+- `NATIVE_FORMAT.md` §4 — compression frame is spec'd, but client-side connection-level integration is still pending.
+- Anything marked ⚠️ above (versioned types, compression integration).
 
 **Verifying a spec claim — cross-reference order:**
 
@@ -201,32 +201,28 @@ cargo run --example events
 
 ---
 
-## TODOs — bringing the spec to v54483 parity
+## Status & remaining work
 
-The spec today caps at v54460 protocol features in `NATIVE_PROTOCOL.md` §3.3 and is partial in `NATIVE_FORMAT.md` §3.4. The list below is what's left to reach the current server target (`54483`). 
+The spec and client now declare protocol version **`54483`** — the current server target. The v54461 → v54483 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54482; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place.
 
-### Native format — versioned types (`NATIVE_FORMAT.md` §3.4)
+**Test coverage:** 304 unit + 89 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)** at v54483. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
 
-- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch 
+What's left:
+
+### Native format — versioned types (`NATIVE_FORMAT.md` §3.4), Phase 8 ⚠️
+
+- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch
 - [ ] **`Dynamic`** — version prefix, runtime-discovered type list, cross-block growth (depends on Variant)
 - [ ] **`JSON` Tier 2** (FLATTENED mode) — path list + per-path Dynamic + shared-data column (depends on LowCardinality + Variant + Dynamic)
 
-### Native protocol — chunked framing (the big one)
+### Compression — connection integration (`NATIVE_FORMAT.md` §4), Phase 9 ⚠️
 
-- [ ] **v54470 chunked protocol** — per-packet chunk framing (`[chunk_size][bytes][zero terminator]`) plus Addendum negotiation (`proto_send_chunked` / `proto_recv_chunked`).
+- [ ] Wire the compression frame into the connection so `compression = true` round-trips end-to-end (the frame format itself is implemented and spec'd).
 
-### Native protocol — message-body field additions (minor)
+### Client polish (`DESIGN.md` Phase 12, Problems 66–69) ⏳
 
-- [ ] v54461 — `ServerHello` password complexity rules
-- [ ] v54463 — `Progress.total_bytes_to_read`
-- [ ] v54464 — `TimezoneUpdate` server packet
-- [ ] v54465 — sparse serialization in `Column`
-- [ ] v54466 — SSH challenge/response auth packets
-- [ ] v54469 — `ProfileInfo.applied_aggregation` + `rows_before_aggregation`
-- [ ] v54473 — V2 Dynamic / JSON serialization-version branches
-- [ ] v54474 — server settings list trailing `ServerHello`
-- [ ] v54475 — `ClientInfo.script_query_number` + `script_line_number`
-- [ ] v54478 — binary type encoding alternative in `Column`
-- [ ] v54481 — optional compression on `Log` / `ProfileEvents` block bodies
-- [ ] v54483 — `Nullable(T)` + sparse serialization composition
+- [ ] Problem 66 — client-side TCP keepalive (`SO_KEEPALIVE` / `TCP_KEEPIDLE`)
+- [ ] Problem 67 — `BufReader` / `BufWriter` around the stream
+- [ ] Problem 68 — public API polish
+- [ ] Problem 69 — benchmark vs. ch-go and clickhouse-go
 
