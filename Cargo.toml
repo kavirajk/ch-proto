@@ -47,3 +47,7 @@ clickhouse-rs-cityhash-sys = "0.1"
 # Rust's stdlib Display for f32/f64 produces full decimal expansion for
 # values like `1e308`; ryu picks scientific notation when it's shorter.
 ryu = "1"
+# Socket options not exposed by std::net::TcpStream — used to set TCP
+# keepalive (SO_KEEPALIVE + TCP_KEEPIDLE) on the client socket, matching
+# ClickHouse's client (`Connection.cpp`).
+socket2 = "0.5"

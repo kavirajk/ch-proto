@@ -35,11 +35,11 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 9     | Compression                                  | 42–43  | ⚠️ (frames + read-path integration done; compressed INSERT deferred) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
 | 11    | Bring spec up to server v54483               | 46–65  | ✅ |
-| 12    | Polish and presentation                      | 66–69  | ⏳ |
+| 12    | Polish and presentation                      | 66–69  | ⚠️ (P66 keepalive done; P67–69 pending) |
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 | 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 338 unit tests + 99 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
+**Test coverage at the time of writing:** 339 unit tests + 100 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -1099,14 +1099,16 @@ Declared protocol bumped 54482 → **54483 (the target)**.
 
 ### Phase 12: Polish and presentation ⏳
 
-#### Problem 66: Client-side TCP keepalive
+#### Problem 66: Client-side TCP keepalive ✅
 
-Set `SO_KEEPALIVE` + `TCP_KEEPIDLE=290` on the TCP socket using the `socket2` crate. Currently relies on OS defaults.
+Done. `connect()` calls `configure_socket()`, which sets `TCP_NODELAY` (via `std`) and enables kernel TCP keepalive with a 290s idle time (`SO_KEEPALIVE` + `TCP_KEEPIDLE` on Linux) via the `socket2` crate — matching ClickHouse's client (`tcp_keep_alive_timeout = 290`). `Connection::tcp_nodelay()` exposes the flag for diagnostics/tests.
 
-**Spec work:** already documented in §12.1.1 that this is asymmetric and client-side-only.
+**Spec work:** already documented in §12 (`SO_KEEPALIVE` on for client, `tcp_keep_alive_timeout = 290`, `TCP_NODELAY` on).
+
+**Tests:** 1 unit (`TCP_KEEPALIVE_IDLE == 290s`) + 1 integration (`test_socket_options_set` — NODELAY enabled, ping + query still round-trip with keepalive on).
 
 **References:**
-- ClickHouse: `src/Client/Connection.cpp:263-276` (client-side setKeepAlive + TCP_KEEPIDLE)
+- ClickHouse: `src/Client/Connection.cpp` (client-side `setNoDelay` + `setKeepAlive` + `TCP_KEEPIDLE`)
 
 ---
 

@@ -1,7 +1,25 @@
 use std::{
     io::{self, Error, Result, Write},
     net::TcpStream,
+    time::Duration,
 };
+
+/// TCP keepalive idle time. Matches ClickHouse's client default
+/// `tcp_keep_alive_timeout = 290` seconds (`Client/Connection.cpp`): the
+/// kernel starts sending keepalive probes after this much idle time
+/// (`TCP_KEEPIDLE` on Linux), so a dead peer is detected without relying on
+/// an application-level Ping.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(290);
+
+/// Apply the client socket options ClickHouse's own client sets: disable
+/// Nagle (`TCP_NODELAY`) so small packets go out immediately, and enable
+/// kernel TCP keepalive with the [`TCP_KEEPALIVE_IDLE`] idle timeout.
+fn configure_socket(stream: &TcpStream) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
 
 use crate::{
     block::Block,
@@ -98,6 +116,7 @@ impl Connection {
         password: Option<&str>,
     ) -> io::Result<Connection> {
         let stream = TcpStream::connect(addr)?;
+        configure_socket(&stream)?;
         let mut conn = Connection {
             inner: ChunkedStream::new(stream),
             database: database.map(String::from),
@@ -524,6 +543,13 @@ impl Connection {
         self.protocol
     }
 
+    /// Whether `TCP_NODELAY` is set on the underlying socket. The client
+    /// enables it (along with TCP keepalive) at connect time. Exposed mainly
+    /// for diagnostics and tests.
+    pub fn tcp_nodelay(&self) -> Result<bool> {
+        self.inner.get_ref().nodelay()
+    }
+
     /// Read a Block from the stream, decompressing through a
     /// [`CompressedReader`] when `compressed` is set (the query negotiated
     /// compression). The packet type and `table_name` are read raw by the
@@ -796,6 +822,12 @@ mod tests {
         buf.write_varuint(ServerPacket::Pong as u64).unwrap();
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0], 0x04);
+    }
+
+    #[test]
+    fn test_tcp_keepalive_idle_matches_clickhouse() {
+        // ClickHouse's client default tcp_keep_alive_timeout is 290s.
+        assert_eq!(TCP_KEEPALIVE_IDLE.as_secs(), 290);
     }
 
     #[test]

@@ -1882,6 +1882,24 @@ fn test_insert_rejects_bad_schema() {
     );
 }
 
+// -- P66: client socket options (TCP_NODELAY + keepalive) --
+
+#[test]
+fn test_socket_options_set() {
+    // connect() enables TCP_NODELAY and TCP keepalive. Verify NODELAY is set
+    // and that enabling keepalive didn't disturb the connection (ping + a
+    // query still round-trip).
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    assert!(
+        conn.tcp_nodelay().unwrap(),
+        "TCP_NODELAY should be enabled on the client socket"
+    );
+    conn.ping().unwrap();
+    let r = conn.query("SELECT 1").unwrap();
+    assert_eq!(r.row_count(), 1);
+}
+
 // -- v54484: PROGRESS_IN_ASYNC_INSERT --
 
 #[test]
