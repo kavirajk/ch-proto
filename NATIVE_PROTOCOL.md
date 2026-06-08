@@ -117,6 +117,8 @@ When a feature is active, its associated fields **must** be present on the wire.
 | OUT_OF_ORDER_BUCKETS_IN_AGGREGATION | 54480 | BlockInfo              | Adds field 3 (`out_of_order_buckets: Vec<Int32>`) to BlockInfo's field-tagged stream. Decoded as `[VarUInt count][Int32]*count`. External clients don't emit this themselves; the decoder reads any non-empty list the server sends. |
 | COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS | 54481 | Log, ProfileEvents | Server may wrap `Log` (§6.16) and `ProfileEvents` (§6.17) packet bodies in the compression frame (NATIVE_FORMAT.md §4). The wrap only activates when the query has `compression = true`. Clients that never enable compression on outgoing Query packets see no wire change. |
 | REPLICATED_SERIALIZATION        | 54482   | Block (Column)         | Server may emit columns with kind_stack `0x04 = REPLICATED` — a dictionary-style compact form for repeated values — see `NATIVE_FORMAT.md` §2.3.1. Below this version the writer expanded such columns before sending. Decoded via index lookup (`elements[indexes[i]]` per row); leaf types plus `Nullable`/`Array`/`Tuple`/`Map` inners supported, `Nested`/`LowCardinality` inners deferred. |
+| NULLABLE_SPARSE_SERIALIZATION   | 54483   | Block (Column)         | Composes sparse serialization with `Nullable(T)`. Below this version the writer expanded sparse for Nullable columns before sending; at v54483+ the wire data is sparse-over-Nullable. See `NATIVE_FORMAT.md` §2.3.1. |
+| PROGRESS_IN_ASYNC_INSERT        | 54484   | Progress (INSERT)      | On an **asynchronous** INSERT (`async_insert = 1`), once the insert is flushed the server sends an extra `Progress` packet (§6.12), then the insert's `ProfileEvents`, before `EndOfStream`. Gated on the *negotiated* version ≥ 54484; below it the server omits this trailing Progress. The Progress wire format is unchanged — only the emission is new. In practice the increment carries the elapsed time; the written-row counters are reported via the accompanying ProfileEvents. A client that already drains interleaved Progress needs no format change, only to tolerate one more packet. |
 
 ---
 
@@ -355,6 +357,8 @@ Client                                  Server
    3. Encode the Block. Column types must align with the schema block's columns by position.
 5. Client sends the end-of-input terminator: a Data packet with an empty Block (0 columns, 0 rows).
 6. Client drains the response stream until `EndOfStream` (success) or `Exception` (failure).
+
+**Asynchronous INSERT (v54484+).** When the query carries `async_insert = 1`, the server queues the rows and flushes them as part of a batch. At negotiated version ≥ 54484 (`PROGRESS_IN_ASYNC_INSERT`), after the flush completes the server emits an extra `Progress` packet, immediately followed by the insert's `ProfileEvents`, then `EndOfStream`. Below 54484 the server skips that trailing Progress. The packet is an ordinary `Progress` (§6.12); because the server resets the query pipeline before folding in the write counts, the increment in practice carries only the elapsed time, and the written-row/byte stats reach the client via the accompanying `ProfileEvents`. Clients that already drain interleaved Progress in step 6 require no change beyond accepting one more packet.
 
 **Postcondition.** Connection returns to `READY` on `EndOfStream` or handled `Exception`. Protocol violations or I/O errors terminate the connection.
 

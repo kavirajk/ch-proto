@@ -59,6 +59,14 @@ pub struct Connection {
     /// the handshake completes. Useful for diagnostics.
     proto_send_chunked: &'static str,
     proto_recv_chunked: &'static str,
+    /// Accumulated `Progress` over the last INSERT — the sum of every
+    /// Progress delta drained while running it (packets are increments, not
+    /// totals; see [`Progress::accumulate`]). On an async INSERT at
+    /// negotiated version ≥ 54484 the server emits a trailing Progress
+    /// (`PROGRESS_IN_ASYNC_INSERT`) that this folds in. `None` until the
+    /// first Progress of an INSERT arrives; reset at the start of each
+    /// INSERT.
+    insert_progress: Option<Progress>,
 }
 
 impl Connection {
@@ -75,9 +83,10 @@ impl Connection {
             user: user.map(String::from),
             password: password.map(String::from),
             // Client declares max supported protocol; negotiated down by server during handshake.
-            protocol: Feature::NULLABLE_SPARSE_SERIALIZATION.version() as u64,
+            protocol: Feature::PROGRESS_IN_ASYNC_INSERT.version() as u64,
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
+            insert_progress: None,
         };
         conn.handsake()?;
         Ok(conn)
@@ -341,6 +350,8 @@ impl Connection {
     /// server will accept and acknowledge as a no-op insert.
     pub fn insert_blocks(&mut self, sql: &str, blocks: Vec<proto::block::Block>) -> Result<()> {
         let protocol = self.protocol as u32;
+        // Fresh INSERT — discard any Progress accumulated by a prior call.
+        self.insert_progress = None;
         self.send_query_and_tables(sql, QueryOptions::new())?;
 
         // Step 3: drain metadata packets (TableColumns, Progress, ...) and
@@ -401,10 +412,19 @@ impl Connection {
                         format!("INSERT failed: {e:?}"),
                     ));
                 }
-                // Server may emit Progress / ProfileInfo / Log / etc. between
-                // sending the body and EndOfStream. Drain quietly.
-                ServerResponse::Progress(_)
-                | ServerResponse::ProfileInfo(_)
+                // Accumulate Progress so callers can read written rows/bytes.
+                // Packets are deltas, so sum them. On an async INSERT at
+                // v54484+ the server sends a trailing Progress here
+                // (PROGRESS_IN_ASYNC_INSERT) carrying the flushed write
+                // stats; on a sync INSERT these are the regular execution
+                // progress increments.
+                ServerResponse::Progress(p) => {
+                    self.insert_progress
+                        .get_or_insert_with(Progress::default)
+                        .accumulate(&p);
+                }
+                // Other interleaved metadata between body and EndOfStream.
+                ServerResponse::ProfileInfo(_)
                 | ServerResponse::Log(_)
                 | ServerResponse::ProfileEvents(_)
                 | ServerResponse::TableColumns(_)
@@ -419,6 +439,24 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    /// Accumulated `Progress` over the last INSERT — the sum of every
+    /// Progress delta the server sent while running it. At negotiated version
+    /// ≥ 54484 an async INSERT (`async_insert = 1`) folds in a trailing
+    /// Progress packet (`PROGRESS_IN_ASYNC_INSERT`). Note the written-row
+    /// counters for async inserts are reported via ProfileEvents rather than
+    /// these Progress fields. `None` before the first INSERT, or if the
+    /// server sent no Progress.
+    pub fn insert_progress(&self) -> Option<&Progress> {
+        self.insert_progress.as_ref()
+    }
+
+    /// The negotiated protocol version (`min(client, server)`), valid after
+    /// the handshake completes. The client declares
+    /// `PROGRESS_IN_ASYNC_INSERT` (54484) as its maximum.
+    pub fn protocol(&self) -> u64 {
+        self.protocol
     }
 
     fn read_response(&mut self) -> Result<ServerResponse> {
@@ -659,5 +697,18 @@ mod tests {
         buf.write_varuint(ServerPacket::Pong as u64).unwrap();
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0], 0x04);
+    }
+
+    #[test]
+    fn test_client_declares_v54484() {
+        // The client advertises PROGRESS_IN_ASYNC_INSERT (54484) as its
+        // maximum protocol — the current server target. A bump here is a
+        // deliberate protocol-version change, so pin it.
+        assert_eq!(Feature::PROGRESS_IN_ASYNC_INSERT.version(), 54484);
+        assert_eq!(
+            Feature::PROGRESS_IN_ASYNC_INSERT.version(),
+            Feature::NULLABLE_SPARSE_SERIALIZATION.version() + 1,
+            "PROGRESS_IN_ASYNC_INSERT must be exactly one past the prior feature"
+        );
     }
 }

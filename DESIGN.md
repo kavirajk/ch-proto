@@ -12,7 +12,7 @@
 - `~/src/ch-go/main/proto/` — minimalist Go reference, covers up to protocol `54460`.
 - `~/src/clickhouse-go/main/` — production Go driver, covers up to `~54483` including full JSON/Dynamic/Variant implementations.
 
-**Current server target:** `DBMS_TCP_PROTOCOL_VERSION = 54483`. Defined at `ClickHouse/src/Core/ProtocolDefines.h:139`.
+**Current server target:** `DBMS_TCP_PROTOCOL_VERSION = 54484`. Defined at `ClickHouse/src/Core/ProtocolDefines.h:156`. (Was 54483; upstream added `PROGRESS_IN_ASYNC_INSERT = 54484`.)
 
 **Testing infrastructure:** `make up` starts a ClickHouse container via docker-compose. `make test-unit` for Rust unit tests. `make test-integration` runs the full integration suite against the running server.
 
@@ -37,8 +37,9 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 11    | Bring spec up to server v54483               | 46–65  | ✅ |
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
+| 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 304 unit tests + 89 integration tests, all passing. Declared client protocol is now **54483** (the target).
+**Test coverage at the time of writing:** 312 unit tests + 91 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -1158,6 +1159,25 @@ Done. `NATIVE_FORMAT.md` §4 covers the frame format, method bytes, CityHash102 
 #### Problem 73: Add chunked-protocol section ⏳
 
 Post-Problem 53. Major structural addition to `NATIVE_PROTOCOL.md` §4 (Packet Envelope) and §5 (Connection Lifecycle).
+
+---
+
+### Phase 14: Post-54483 protocol catch-up ⏳
+
+Upstream `~/src/ClickHouse` advanced `DBMS_TCP_PROTOCOL_VERSION` past the original v54483 target. This phase tracks the new server versions.
+
+#### Problem 74: v54484 — progress in async insert ✅
+
+At v54484+ (`PROGRESS_IN_ASYNC_INSERT`), an asynchronous INSERT (`async_insert = 1`) with `wait_for_async_insert = 1` causes the server to emit an extra `Progress` packet (then the insert's `ProfileEvents`) before `EndOfStream`. The Progress wire format is unchanged; only the emission is new. Because the server resets the query pipeline before folding in the write counts, the increment in practice carries only the elapsed time — the written-row/byte stats reach the client via the accompanying ProfileEvents.
+
+**Implementation:** `Feature::PROGRESS_IN_ASYNC_INSERT = 54484`; declared client protocol bumped 54483 → **54484** (`src/client.rs`). The INSERT drain loop already tolerated interleaved Progress; it now *accumulates* them — Progress packets are deltas (server sends `fetchValuesAndResetPiecewiseAtomically`), so `Progress::accumulate` sums them and `Connection::insert_progress()` exposes the running total. Added `Connection::protocol()` accessor. Fixed the stale "cumulative totals (not deltas)" comment in `progress.rs`.
+
+**Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature rows for 54483 + 54484; §5.5 async-INSERT note.
+
+**Tests:** 3 unit (`test_client_declares_v54484`, `test_progress_accumulate_sums_deltas`, `test_progress_accumulate_keeps_none_when_absent`) + 2 integration (`test_v54484_negotiated`, `test_insert_async_reports_progress`). 312 unit + 91 integration pass. Live verification: async INSERT into a MergeTree table yields a trailing Progress packet (non-zero `elapsed_ns`) and the rows land.
+
+**References:**
+- ClickHouse: `Core/ProtocolDefines.h:146,156`; `Server/TCPHandler.cpp:1421` (gate) + `:3021` (`sendProgress` sends the piecewise increment).
 
 ---
 

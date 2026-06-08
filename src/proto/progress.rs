@@ -6,7 +6,12 @@ use super::{
 };
 
 // Progress is sent by the server periodically during query execution.
-// Cumulative totals (not deltas) across multiple Progress packets.
+//
+// Each packet carries an **increment** (delta) since the previous Progress,
+// not a running total — the server sends
+// `state.progress.fetchValuesAndResetPiecewiseAtomically()` (see
+// `TCPHandler::sendProgress`). A client that wants running totals sums the
+// deltas itself; see [`Progress::accumulate`].
 #[derive(Debug, Default, Clone)]
 pub struct Progress {
     pub rows: u64,
@@ -27,6 +32,25 @@ pub struct Progress {
 }
 
 impl Progress {
+    /// Fold a delta `Progress` packet into this running total by summing each
+    /// counter. `Option` fields sum when either side is present (a missing
+    /// field counts as 0), so accumulating a feature-gated field across a
+    /// stream where it's always present yields a `Some` total.
+    pub fn accumulate(&mut self, delta: &Progress) {
+        self.rows += delta.rows;
+        self.bytes += delta.bytes;
+        self.total_rows += delta.total_rows;
+        let add = |acc: &mut Option<u64>, d: Option<u64>| {
+            if let Some(d) = d {
+                *acc = Some(acc.unwrap_or(0) + d);
+            }
+        };
+        add(&mut self.total_bytes, delta.total_bytes);
+        add(&mut self.wrote_rows, delta.wrote_rows);
+        add(&mut self.wrote_bytes, delta.wrote_bytes);
+        add(&mut self.elapsed_ns, delta.elapsed_ns);
+    }
+
     pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
         w.write_varuint(self.rows)?;
         w.write_varuint(self.bytes)?;
@@ -161,6 +185,56 @@ mod tests {
         assert_eq!(decoded.total_bytes, Some(40_960));
         assert_eq!(decoded.wrote_rows, Some(50));
         assert_eq!(decoded.elapsed_ns, Some(1_000_000));
+    }
+
+    #[test]
+    fn test_progress_accumulate_sums_deltas() {
+        // Progress packets are deltas; accumulate sums each counter and
+        // promotes Option fields to Some once any delta carries them.
+        let mut total = Progress::default();
+        total.accumulate(&Progress {
+            rows: 1,
+            bytes: 10,
+            total_rows: 100,
+            total_bytes: Some(0),
+            wrote_rows: Some(2),
+            wrote_bytes: Some(20),
+            elapsed_ns: Some(5),
+        });
+        total.accumulate(&Progress {
+            rows: 3,
+            bytes: 30,
+            total_rows: 0,
+            total_bytes: Some(0),
+            wrote_rows: Some(0),
+            wrote_bytes: Some(40),
+            elapsed_ns: Some(7),
+        });
+        assert_eq!(total.rows, 4);
+        assert_eq!(total.bytes, 40);
+        assert_eq!(total.total_rows, 100);
+        assert_eq!(total.wrote_rows, Some(2));
+        assert_eq!(total.wrote_bytes, Some(60));
+        assert_eq!(total.elapsed_ns, Some(12));
+    }
+
+    #[test]
+    fn test_progress_accumulate_keeps_none_when_absent() {
+        // A delta with all-None Option fields leaves the running total's
+        // Option fields None (nothing observed yet).
+        let mut total = Progress::default();
+        total.accumulate(&Progress {
+            rows: 5,
+            bytes: 50,
+            total_rows: 0,
+            total_bytes: None,
+            wrote_rows: None,
+            wrote_bytes: None,
+            elapsed_ns: None,
+        });
+        assert_eq!(total.rows, 5);
+        assert_eq!(total.wrote_rows, None);
+        assert_eq!(total.elapsed_ns, None);
     }
 
     #[test]

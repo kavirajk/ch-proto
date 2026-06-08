@@ -86,6 +86,15 @@ impl Feature {
     /// stream is a Nullable column with the non-default values; positions
     /// not in the offset list default to NULL.
     pub const NULLABLE_SPARSE_SERIALIZATION: Feature = Feature(54483);
+    /// On an asynchronous INSERT (`async_insert = 1`), once the rows are
+    /// flushed the server sends an extra `Progress` packet (then the insert's
+    /// ProfileEvents) before `EndOfStream`. Gated on the negotiated version:
+    /// below 54484 the server omits this trailing Progress. The Progress wire
+    /// format is unchanged — only the emission is new, so a client that
+    /// already drains interleaved Progress just sees one more packet. (In
+    /// practice the increment carries the elapsed time; the written-row
+    /// counters arrive via the accompanying ProfileEvents.)
+    pub const PROGRESS_IN_ASYNC_INSERT: Feature = Feature(54484);
 }
 
 impl Feature {

@@ -1881,3 +1881,77 @@ fn test_insert_rejects_bad_schema() {
         },
     );
 }
+
+// -- v54484: PROGRESS_IN_ASYNC_INSERT --
+
+#[test]
+fn test_v54484_negotiated() {
+    // The current server target advertises protocol 54484; the client
+    // declares the same as its max, so the negotiated version is 54484.
+    require_server();
+    let conn = Connection::connect(ADDR, None, None, None).unwrap();
+    assert_eq!(
+        conn.protocol(),
+        54484,
+        "expected to negotiate v54484 (PROGRESS_IN_ASYNC_INSERT) with the server"
+    );
+}
+
+#[test]
+fn test_insert_async_reports_progress() {
+    // v54484: on an async INSERT the server flushes the batch and then sends
+    // an extra Progress packet carrying the written rows/bytes before
+    // EndOfStream. The client must tolerate (and here, capture) it.
+    require_server();
+    with_table(
+        "ch_proto_async_insert",
+        "CREATE TABLE ch_proto_async_insert (id UInt32) Engine=MergeTree ORDER BY id",
+        |conn| {
+            // Force the async path and block until the flush completes so the
+            // trailing Progress is emitted synchronously within the INSERT.
+            conn.query("SET async_insert = 1").unwrap();
+            conn.query("SET wait_for_async_insert = 1").unwrap();
+
+            let block = ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
+                }),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "UInt32".to_string(),
+                    serialization: Serialization::Default,
+                    data: ColumnData::Uint32(vec![100, 200]),
+                }],
+                rows: 2,
+            };
+            conn.insert("INSERT INTO ch_proto_async_insert VALUES", block)
+                .unwrap();
+
+            // v54484: the trailing async-insert Progress packet must have
+            // been received and fully parsed (all feature-gated fields at
+            // v54484), proving the stream stayed aligned through it. The
+            // server reports the written-row counters via the accompanying
+            // ProfileEvents, not this Progress (the pipeline is reset before
+            // the write counts are folded in), so the increment carries the
+            // elapsed time — that's what we assert here.
+            let p = conn
+                .insert_progress()
+                .expect("async INSERT at v54484 should yield a trailing Progress packet");
+            assert!(
+                matches!(p.elapsed_ns, Some(n) if n > 0),
+                "async-insert Progress should carry a non-zero elapsed_ns, got {p:?}"
+            );
+
+            // And the rows actually landed.
+            let result = conn
+                .query("SELECT count() FROM ch_proto_async_insert")
+                .unwrap();
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint64(v) => assert_eq!(v[0], 2),
+                other => panic!("expected Uint64 count, got {other:?}"),
+            }
+        },
+    );
+}
