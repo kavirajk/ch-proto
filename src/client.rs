@@ -10,8 +10,8 @@ use crate::{
         self,
         chunked::{self, ChunkedStream},
         client_info::{ClientInfo, QueryKind},
+        compression::{CompressedReader, CompressedWriter, CompressionMethod},
         exception::ServerException,
-        external_table::ExternalTable,
         feature::Feature,
         hello::{ClientHello, ServerHello},
         packet::{ClientPacket, ServerPacket, ServerResponse},
@@ -82,6 +82,12 @@ pub struct Connection {
     /// first Progress of an INSERT arrives; reset at the start of each
     /// INSERT.
     insert_progress: Option<Progress>,
+    /// Whether the in-flight query negotiated compression (the `compression`
+    /// flag in its Query packet). When set, the server compresses the block
+    /// bodies of Data/Totals/Extremes/Log/ProfileEvents packets, and expects
+    /// compressed Data blocks on INSERT. Set when a Query is sent; read by
+    /// the block read/write helpers.
+    query_compression: bool,
 }
 
 impl Connection {
@@ -102,6 +108,7 @@ impl Connection {
             proto_send_chunked: "notchunked",
             proto_recv_chunked: "notchunked",
             insert_progress: None,
+            query_compression: false,
         };
         conn.handsake()?;
         Ok(conn)
@@ -218,7 +225,6 @@ impl Connection {
     /// followed by the empty-data terminator that signals "no more client
     /// input" (used for SELECTs and after INSERT body too).
     fn send_query_and_tables(&mut self, sql: &str, opts: QueryOptions) -> Result<()> {
-        let protocol = self.protocol as u32;
         let query_id = opts
             .query_id
             .clone()
@@ -263,14 +269,28 @@ impl Connection {
             protocol_version: self.protocol,
         };
 
+        // Remember whether this query uses compression so the block
+        // read/write helpers wrap the stream in a compression frame layer.
+        self.query_compression = q.compression;
+
         q.encode(&mut self.inner)?;
 
         // External tables first (if any), then the empty Data marker that
-        // tells the server "no more external tables".
+        // tells the server "no more external tables". When the query uses
+        // compression, the server reads *client* Data blocks compressed too
+        // — so the block bodies here (including the empty marker) must be
+        // framed, or the server blocks mid-frame and never replies.
+        let compress = self.query_compression;
         for table in &opts.external_tables {
-            table.encode(&mut self.inner, protocol)?;
+            self.inner
+                .write_varuint(proto::packet::ClientPacket::Data as u64)?;
+            self.inner.write_string(&table.table_name)?;
+            self.write_block(&table.block, compress)?;
         }
-        ExternalTable::encode_empty(&mut self.inner, protocol)?;
+        self.inner
+            .write_varuint(proto::packet::ClientPacket::Data as u64)?;
+        self.inner.write_string("")?;
+        self.write_block(&proto::block::Block::new(), compress)?;
         self.inner.flush()?;
         Ok(())
     }
@@ -362,12 +382,40 @@ impl Connection {
 
     /// Streaming INSERT: send `blocks` in order, then terminator, then drain
     /// the response. Empty `blocks` is allowed (just sends a terminator) — the
-    /// server will accept and acknowledge as a no-op insert.
+    /// server will accept and acknowledge as a no-op insert. Uses default
+    /// query options (no compression); see [`insert_blocks_with`].
     pub fn insert_blocks(&mut self, sql: &str, blocks: Vec<proto::block::Block>) -> Result<()> {
-        let protocol = self.protocol as u32;
+        self.insert_blocks_with(sql, blocks, QueryOptions::new())
+    }
+
+    /// Like [`insert_blocks`] but with explicit [`QueryOptions`]. With
+    /// `opts.with_compression(true)`, the Query is sent with the compression
+    /// flag and the client compresses every outgoing Data block (and the
+    /// terminator) — required because the server then reads INSERT data
+    /// through a compressed buffer. The schema block the server sends back is
+    /// likewise compressed and read via the same path.
+    pub fn insert_blocks_with(
+        &mut self,
+        sql: &str,
+        blocks: Vec<proto::block::Block>,
+        opts: QueryOptions,
+    ) -> Result<()> {
+        // Compressed INSERT (client→server data) is not yet supported: when
+        // compression is on the server may also wrap the columns it sends
+        // (e.g. the schema block) and read client data through the parallel
+        // block-marshalling / ColumnBLOB path (v54478), which this flat
+        // decoder doesn't handle. The compressed SELECT read path is
+        // supported via `query_with(..., opts.with_compression(true))`.
+        if opts.compression == Some(true) {
+            return Err(Error::new(
+                io::ErrorKind::Unsupported,
+                "compressed INSERT is not yet supported; send the INSERT without compression",
+            ));
+        }
         // Fresh INSERT — discard any Progress accumulated by a prior call.
         self.insert_progress = None;
-        self.send_query_and_tables(sql, QueryOptions::new())?;
+        self.send_query_and_tables(sql, opts)?;
+        let compress = self.query_compression;
 
         // Step 3: drain metadata packets (TableColumns, Progress, ...) and
         // wait for the schema Data packet (rows = 0). The server may emit
@@ -401,20 +449,22 @@ impl Connection {
             }
         }
 
-        // Step 4: send the user's blocks as Data packets.
+        // Step 4: send the user's blocks as Data packets. The packet type and
+        // (empty) table_name go on the raw stream; only the block body is
+        // compressed when `compress` is set.
         for block in &blocks {
             self.inner
                 .write_varuint(proto::packet::ClientPacket::Data as u64)?;
             // Empty table_name — INSERT data isn't tied to an external table.
             self.inner.write_string("")?;
-            block.encode(&mut self.inner, protocol)?;
+            self.write_block(block, compress)?;
         }
 
         // Step 5: empty-block terminator (signals end-of-input).
         self.inner
             .write_varuint(proto::packet::ClientPacket::Data as u64)?;
         self.inner.write_string("")?;
-        proto::block::Block::new().encode(&mut self.inner, protocol)?;
+        self.write_block(&proto::block::Block::new(), compress)?;
         self.inner.flush()?;
 
         // Step 6: drain until EndOfStream / Exception.
@@ -474,10 +524,44 @@ impl Connection {
         self.protocol
     }
 
+    /// Read a Block from the stream, decompressing through a
+    /// [`CompressedReader`] when `compressed` is set (the query negotiated
+    /// compression). The packet type and `table_name` are read raw by the
+    /// caller *before* this — only the block body is compressed.
+    fn read_block(&mut self, compressed: bool) -> Result<proto::block::Block> {
+        let protocol = self.protocol as u32;
+        if compressed {
+            let mut cr = CompressedReader::new(&mut self.inner);
+            proto::block::Block::decode(&mut cr, protocol)
+        } else {
+            proto::block::Block::decode(&mut self.inner, protocol)
+        }
+    }
+
+    /// Write a Block to the stream, compressing through a [`CompressedWriter`]
+    /// (one LZ4 frame, flushed at the block end) when `compressed` is set.
+    /// The caller writes the packet type and `table_name` raw beforehand.
+    fn write_block(&mut self, block: &proto::block::Block, compressed: bool) -> Result<()> {
+        let protocol = self.protocol as u32;
+        if compressed {
+            let mut cw = CompressedWriter::new(&mut self.inner, CompressionMethod::Lz4);
+            block.encode(&mut cw, protocol)?;
+            cw.flush()?;
+            Ok(())
+        } else {
+            block.encode(&mut self.inner, protocol)
+        }
+    }
+
     fn read_response(&mut self) -> Result<ServerResponse> {
         let code_byte = self.inner.read_varuint()? as u8;
         let code = ServerPacket::try_from(code_byte)?;
         let protocol = self.protocol as u32;
+        // Data/Totals/Extremes block bodies are compressed whenever the query
+        // negotiated compression; Log/ProfileEvents only from v54481+.
+        let block_compressed = self.query_compression;
+        let logs_compressed = self.query_compression
+            && Feature::COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS.in_version(protocol);
 
         match code {
             ServerPacket::Hello => Ok(ServerResponse::Hello(ServerHello::decode(
@@ -490,7 +574,7 @@ impl Connection {
             ServerPacket::Pong => Ok(ServerResponse::Pong),
             ServerPacket::Data => {
                 let _table_name = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                let b = self.read_block(block_compressed)?;
                 Ok(ServerResponse::Data(b))
             }
             ServerPacket::EndOfStream => Ok(ServerResponse::EndOfStream),
@@ -504,22 +588,22 @@ impl Connection {
             )?)),
             ServerPacket::Totals => {
                 let _table_name = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                let b = self.read_block(block_compressed)?;
                 Ok(ServerResponse::Totals(b))
             }
             ServerPacket::Extremes => {
                 let _table_name = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                let b = self.read_block(block_compressed)?;
                 Ok(ServerResponse::Extremes(b))
             }
             ServerPacket::Log => {
                 let _table_name = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                let b = self.read_block(logs_compressed)?;
                 Ok(ServerResponse::Log(b))
             }
             ServerPacket::ProfileEvents => {
                 let _table_name = self.inner.read_string()?;
-                let b = proto::block::Block::decode(&mut self.inner, protocol)?;
+                let b = self.read_block(logs_compressed)?;
                 Ok(ServerResponse::ProfileEvents(b))
             }
             ServerPacket::TableColumns => Ok(ServerResponse::TableColumns(TableColumns::decode(

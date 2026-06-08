@@ -170,14 +170,14 @@ The two tracks below are signposts into the existing spec, not a re-explanation.
 | Connection lifecycle (Hello, Ping, Query, INSERT) | `NATIVE_PROTOCOL.md` §5 | ✅ Complete |
 | Fixed-width + variable-length + composite types | `NATIVE_FORMAT.md` §3.1–§3.3 | ✅ Complete |
 | Versioned / stateful types | `NATIVE_FORMAT.md` §3.4 | ✅ LowCardinality, JSON Tier 1, Variant (BASIC), Dynamic (FLATTENED), JSON Tier 2 (FLATTENED Object) — all leaf/single-block; non-flat JSON + Tier 3 deferred (§3.4.8) |
-| Compression frame | `NATIVE_FORMAT.md` §4 | ✅ Frame format spec'd; client-side connection integration pending |
+| Compression frame | `NATIVE_FORMAT.md` §4 | ✅ Frame format + read-path integration (decompress responses, LZ4/ZSTD/NONE); compressed INSERT deferred (§4.6) |
 | v54461–v54483 feature additions | `NATIVE_PROTOCOL.md` §3.3 + various | ✅ Complete — feature table extends to v54482; v54483 (nullable sparse) in `NATIVE_FORMAT.md` §2.3.1. See [`DESIGN.md`](DESIGN.md) Phase 11 (Problems 46–65) |
 | Chunked protocol (v54470) | `NATIVE_PROTOCOL.md` §4.1 | ✅ Spec'd (framing + negotiation) and fully implemented |
 
 **Known gaps to focus review on:**
 
 - `NATIVE_FORMAT.md` §3.4 — the deferred-types rationale. Are the boundaries between Tier 1/2/3 JSON drawn correctly?
-- `NATIVE_FORMAT.md` §4 — compression frame is spec'd, but client-side connection-level integration is still pending.
+- `NATIVE_FORMAT.md` §4 — compression read path is integrated; compressed INSERT (write path) is deferred (§4.6).
 - Anything marked ⚠️ above (versioned types, compression integration).
 
 **Verifying a spec claim — cross-reference order:**
@@ -205,7 +205,7 @@ cargo run --example events
 
 The spec and client now declare protocol version **`54484`** — the current server target (`PROGRESS_IN_ASYNC_INSERT`; upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484). The v54461 → v54484 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54484; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place.
 
-**Test coverage:** 332 unit + 96 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)**. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
+**Test coverage:** 334 unit + 99 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)**. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
 
 What's left:
 
@@ -217,7 +217,8 @@ What's left:
 
 ### Compression — connection integration (`NATIVE_FORMAT.md` §4), Phase 9 ⚠️
 
-- [ ] Wire the compression frame into the connection so `compression = true` round-trips end-to-end (the frame format itself is implemented and spec'd).
+- [x] Read path: `compression = true` decompresses all response block bodies (LZ4/ZSTD/NONE) via a frame-streaming `CompressedReader`; the client-side empty marker is compressed as the server requires.
+- [ ] Compressed INSERT (client→server data) — deferred; blocked on the parallel block-marshalling / `ColumnBLOB` path (v54478). Rejected with a clear error for now.
 
 ### Client polish (`DESIGN.md` Phase 12, Problems 66–69) ⏳
 

@@ -155,6 +155,86 @@ pub fn write_frame<W: Write>(w: &mut W, data: &[u8], method: CompressionMethod) 
     w.write_all(&frame)
 }
 
+/// A `Read` adapter that decompresses a ClickHouse compressed *stream* — a
+/// sequence of frames — on the fly. This is the client-side equivalent of
+/// `CompressedReadBuffer`: when its decompressed buffer runs dry it pulls and
+/// decodes the next frame. A consumer (e.g. `Block::decode`) reads exactly
+/// the bytes it needs; frame boundaries are invisible to it. The server
+/// flushes a frame at the end of each block, so after a block is fully
+/// decoded the buffer is empty again.
+pub struct CompressedReader<'a, R: Read> {
+    inner: &'a mut R,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<'a, R: Read> CompressedReader<'a, R> {
+    pub fn new(inner: &'a mut R) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CompressedReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        if self.pos >= self.buf.len() {
+            // Decompressed buffer drained — pull the next frame.
+            self.buf = decode_frame(self.inner)?;
+            self.pos = 0;
+            if self.buf.is_empty() {
+                // A frame that decompresses to nothing — treat as EOF so a
+                // caller's read_exact surfaces UnexpectedEof rather than
+                // spinning. Real block frames are never empty.
+                return Ok(0);
+            }
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// A `Write` adapter that buffers all writes and, on `flush`, emits them as a
+/// single compression frame — the client-side equivalent of
+/// `CompressedWriteBuffer` used for one block. Call `flush` once per block so
+/// the frame boundary aligns with the block end (matching the server's
+/// reader, which decodes frame-by-frame).
+pub struct CompressedWriter<'a, W: Write> {
+    inner: &'a mut W,
+    buf: Vec<u8>,
+    method: CompressionMethod,
+}
+
+impl<'a, W: Write> CompressedWriter<'a, W> {
+    pub fn new(inner: &'a mut W, method: CompressionMethod) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            method,
+        }
+    }
+}
+
+impl<W: Write> Write for CompressedWriter<'_, W> {
+    fn write(&mut self, data: &[u8]) -> Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // Emit the buffered block as one frame, then clear. An empty buffer
+        // still emits a frame (a 0-byte block body is valid and the server
+        // expects a frame per block write).
+        write_frame(self.inner, &self.buf, self.method)?;
+        self.buf.clear();
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +350,42 @@ mod tests {
         let mut cursor = Cursor::new(buf.as_slice());
         let decoded = decode_frame(&mut cursor).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_compressed_writer_then_reader_roundtrip() {
+        // Write two blocks (each its own frame via flush), then read them
+        // back through CompressedReader as one continuous stream.
+        let mut wire = Vec::new();
+        {
+            let mut cw = CompressedWriter::new(&mut wire, CompressionMethod::Lz4);
+            cw.write_all(b"first-block-").unwrap();
+            cw.write_all(b"data").unwrap();
+            cw.flush().unwrap(); // frame 1 = "first-block-data"
+            cw.write_all(b"second").unwrap();
+            cw.flush().unwrap(); // frame 2 = "second"
+        }
+
+        // Consumers read exactly the bytes they need (never past the last
+        // frame), mirroring Block::decode. Here that's 22 bytes spanning the
+        // two frames.
+        let mut cursor = Cursor::new(wire.as_slice());
+        let mut cr = CompressedReader::new(&mut cursor);
+        let mut got = [0u8; 22];
+        cr.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"first-block-datasecond");
+    }
+
+    #[test]
+    fn test_compressed_reader_spans_frames_on_exact_read() {
+        // read_exact across a frame boundary must stitch frames together.
+        let mut wire = Vec::new();
+        write_frame(&mut wire, b"abcde", CompressionMethod::None).unwrap();
+        write_frame(&mut wire, b"fghij", CompressionMethod::Zstd).unwrap();
+        let mut cursor = Cursor::new(wire.as_slice());
+        let mut cr = CompressedReader::new(&mut cursor);
+        let mut buf = [0u8; 8]; // spans the 5-byte frame 1 into frame 2
+        cr.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcdefgh");
     }
 }

@@ -1245,13 +1245,19 @@ A decoder recomputes the CityHash128 over the received header+body and compares 
 
 ### 4.4 Per-block boundaries
 
-Each Block is its own frame. A query response with multiple Data packets contains one frame per packet. There is no enclosing multi-block frame.
+The compressed payload of a Block is a **stream of one or more frames**, not necessarily a single frame. The sender writes the serialized block through a compressed buffer that emits a frame whenever its internal buffer fills (≈1 MB) and a final frame when the block is flushed. So a small block is one frame; a large block is several consecutive frames; and the sender flushes at the end of each block, so a frame boundary always coincides with a block end.
 
-The frame's `compressed_size` and `uncompressed_size` are independent counters — the sender pre-compresses, then writes the framing prefix, then the compressed bytes. Receivers stream the frame: read 16 + 9 bytes, then read exactly `compressed_size - 9` body bytes, then decompress to exactly `uncompressed_size` bytes.
+A receiver streams the frames: read 16 + 9 bytes, read exactly `compressed_size - 9` body bytes, decompress to exactly `uncompressed_size` bytes, and serve those bytes to the block decoder; when the decoder needs more than the current frame holds, pull the next frame. Because the sender flushes per block, after a block is fully decoded the frame buffer is empty and the next block begins at a fresh frame.
+
+The packet envelope — the packet-type VarUInt and the `table_name` string — is written to the **raw** stream, *outside* the compressed payload. Only the block body (BlockInfo + columns) is framed.
 
 ### 4.5 Negotiation
 
-Compression is per-query, not per-connection. The protocol-level Query packet's `compression: bool` field requests it for that single query. The server honours the request and emits compressed Data/Totals/Extremes/Log/ProfileEvents bodies for the lifetime of the query. Subsequent queries on the same connection may differ.
+Compression is per-query, not per-connection. The protocol-level Query packet's `compression: bool` field requests it for that single query. The server honours the request and emits compressed Data/Totals/Extremes/Log/ProfileEvents bodies for the lifetime of the query (Log/ProfileEvents only at v54481+). It also expects the client's *outgoing* Data blocks — external tables, the empty end-of-data marker, and INSERT rows — to be framed the same way. Subsequent queries on the same connection may differ.
+
+### 4.6 Reference client integration status
+
+The reference Rust client wraps the stream with a `CompressedReader` (refills from frames on demand) and `CompressedWriter` (buffers a block, flushes one frame). The **read path is complete**: with `compression = true` the client decompresses all response block bodies, and compresses the client-side empty marker the server requires. **Compressed INSERT data (client→server) is deferred**: with compression on the server may also route columns through the parallel block-marshalling / `ColumnBLOB` path (v54478), which the flat decoder doesn't handle, so the client rejects compressed INSERT with a clear error rather than risk a desynchronised stream.
 
 ---
 

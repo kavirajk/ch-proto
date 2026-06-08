@@ -2216,3 +2216,102 @@ fn test_json_tier2_flattened_select() {
     assert!(s.contains("\"a\":"), "rendered {s}");
     assert!(s.contains("\"b\":"), "rendered {s}");
 }
+
+// -- Compression connection integration (Problems 42/43) --
+
+#[test]
+fn test_select_compressed() {
+    // With compression on, the server wraps result block bodies in the
+    // compression frame; the client must decompress them. 1000 rows is large
+    // enough that the body actually compresses.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new().with_compression(true);
+    let result = conn
+        .query_with("SELECT number FROM numbers(1000) ORDER BY number", opts)
+        .unwrap();
+    assert_eq!(result.row_count(), 1000);
+    // First block's first value is 0; spot-check a known value.
+    match &result.rows[0].columns[0].data {
+        ColumnData::Uint64(v) => assert_eq!(v[0], 0),
+        other => panic!("expected Uint64, got {other:?}"),
+    }
+    // Sum all values across blocks to confirm none were lost/corrupted.
+    let mut sum: u64 = 0;
+    for block in &result.rows {
+        if let ColumnData::Uint64(v) = &block.columns[0].data {
+            sum += v.iter().sum::<u64>();
+        }
+    }
+    assert_eq!(sum, (0..1000).sum::<u64>());
+}
+
+#[test]
+fn test_select_compressed_matches_uncompressed() {
+    // The same query with and without compression yields identical data.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let sql = "SELECT toString(number) AS s FROM numbers(500) ORDER BY number";
+    let plain = conn.query(sql).unwrap();
+    let compressed = conn
+        .query_with(sql, QueryOptions::new().with_compression(true))
+        .unwrap();
+    assert_eq!(plain.row_count(), compressed.row_count());
+    // Compare the rendered TSV of every row.
+    let render = |r: &ch_proto::query_result::QueryResult| {
+        let mut out = Vec::new();
+        for block in &r.rows {
+            for row in 0..block.columns[0].data.row_count() {
+                ch_proto::tsv::write_value(&mut out, &block.columns[0].data, row).unwrap();
+                out.push(b'\n');
+            }
+        }
+        out
+    };
+    assert_eq!(render(&plain), render(&compressed));
+}
+
+#[test]
+fn test_insert_compressed_is_rejected() {
+    // Compressed INSERT (client→server) is deferred — the server's parallel
+    // block-marshalling / ColumnBLOB path (v54478) isn't handled. Requesting
+    // it must fail cleanly rather than hang or corrupt the stream.
+    require_server();
+    with_table(
+        "ch_proto_insert_compressed",
+        "CREATE TABLE ch_proto_insert_compressed (id UInt32) Engine=Memory",
+        |conn| {
+            let block = ProtoBlock {
+                info: Some(BlockInfo {
+                    overflows: false,
+                    bucket_number: -1,
+                    out_of_order_buckets: Vec::new(),
+                }),
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: "UInt32".to_string(),
+                    serialization: Serialization::Default,
+                    data: ColumnData::Uint32(vec![10]),
+                }],
+                rows: 1,
+            };
+            let err = conn
+                .insert_blocks_with(
+                    "INSERT INTO ch_proto_insert_compressed VALUES",
+                    vec![block],
+                    QueryOptions::new().with_compression(true),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+
+            // The connection is still usable for a normal (uncompressed) query.
+            let result = conn
+                .query("SELECT count() FROM ch_proto_insert_compressed")
+                .unwrap();
+            match &result.rows[0].columns[0].data {
+                ColumnData::Uint64(v) => assert_eq!(v[0], 0),
+                other => panic!("expected Uint64, got {other:?}"),
+            }
+        },
+    );
+}

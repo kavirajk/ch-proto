@@ -32,14 +32,14 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 6     | Composite types (Nullable / Array / Tuple / Map / Nested) | 25–29 | ✅ |
 | 7     | More fixed-width and parameterized types     | 30–36  | ✅ |
 | 8     | Versioned / stateful types                   | 37–41  | ✅ (LowCardinality, JSON Tier 1, Variant BASIC, Dynamic FLATTENED, JSON Tier 2 FLATTENED — all leaf/single-block; COMPACT + nested-stateful + non-flat JSON deferred) |
-| 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
+| 9     | Compression                                  | 42–43  | ⚠️ (frames + read-path integration done; compressed INSERT deferred) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
 | 11    | Bring spec up to server v54483               | 46–65  | ✅ |
 | 12    | Polish and presentation                      | 66–69  | ⏳ |
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 | 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 332 unit tests + 96 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
+**Test coverage at the time of writing:** 334 unit tests + 99 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -665,11 +665,11 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-### Phase 9: Compression — §9 of spec ⚠️
+### Phase 9: Compression — §9 of spec ⚠️ (read path done; INSERT write deferred)
 
-Frame primitives (LZ4, ZSTD, NONE; CityHash102 checksum verification; corruption detection) are implemented. Connection-level integration — wrapping the inner stream's Block reads/writes when `compression = true` is requested — is not yet wired up.
+Frame primitives (LZ4, ZSTD, NONE; CityHash102 checksum verification; corruption detection) are implemented. Connection-level integration: the **read path is wired up** — `CompressedReader`/`CompressedWriter` (`src/proto/compression.rs`) stream frames, and with `compression = true` the client decompresses every response block body and compresses the client-side empty data marker the server requires. **Compressed INSERT (client→server data) is deferred** — with compression on, the server may also route columns through the parallel block-marshalling / `ColumnBLOB` path (v54478) the flat decoder doesn't handle; the client rejects compressed INSERT with a clear `Unsupported` error.
 
-#### Problem 42: LZ4 compression ⚠️ (frame primitives done; connection integration pending)
+#### Problem 42: LZ4 compression ✅ (frame + read-path integration; compressed INSERT deferred)
 
 **Frame format per block:**
 - 16 bytes — CityHash128 checksum (over everything that follows).
@@ -682,23 +682,27 @@ Activated by the `compression` flag in the Query packet.
 
 **Implementation:**
 - Add `cityhash` and `lz4` Rust crate dependencies.
-- Wrap the block reader/writer with a compression framing layer.
 - Verify checksums on read; fail loudly on mismatch.
 
-**Spec work:** replace §9 placeholder with full frame format and checksum algorithm.
+**Integration done:** `CompressedReader` (a `Read` that refills from frames) and `CompressedWriter` (a `Write` that buffers a block and flushes one frame) in `src/proto/compression.rs`. `Connection` tracks a per-query `query_compression` flag (set from the Query's `compression` field) and reads response blocks via `read_block` / writes the client's empty marker via `write_block` accordingly. The packet type + `table_name` stay on the raw stream; only the block body is framed. Decodes whatever method byte the server picks (LZ4 / ZSTD / NONE).
+
+**Deferred:** compressed INSERT data (`insert_blocks_with` rejects `compression = true`) — the server's parallel block-marshalling / `ColumnBLOB` path (v54478) under compression isn't handled by the flat decoder.
+
+**Spec work done:** `NATIVE_FORMAT.md` §4 (frame format, multi-frame stream, raw envelope, negotiation, client integration status §4.6).
+
+**Tests:** unit — frame round-trips (existing) + `test_compressed_writer_then_reader_roundtrip`, `test_compressed_reader_spans_frames_on_exact_read`. Integration — `test_select_compressed` (1000 rows, LZ4, sum check), `test_select_compressed_matches_uncompressed`, `test_insert_compressed_is_rejected`.
 
 **References:**
 - ch-go: `compress/reader.go`, `compress/writer.go`, `compress/compress.go`
-- ClickHouse: `src/Compression/CompressionInfo.h`, `src/Compression/CompressedWriteBuffer.h/cpp`, `src/Compression/CompressedReadBuffer.h/cpp`, `src/Compression/CompressionCodecLZ4.cpp`, `base/pocoext/CityHash.h`
+- ClickHouse: `src/Compression/CompressedWriteBuffer.h/cpp`, `CompressedReadBuffer.h/cpp`; `TCPHandler::sendData` (`:2875`) shows packet type + table_name raw, block via `maybe_compressed_out`.
 
 ---
 
-#### Problem 43: ZSTD compression ⚠️ (same status as Problem 42)
+#### Problem 43: ZSTD compression ✅ (decode; same integration as Problem 42)
 
-Same frame format, method byte `0x90`. Uses `zstd` crate. Spec work already covered by Problem 42.
+Same frame format, method byte `0x90`. The read path decodes ZSTD frames transparently (the server picks the method via `network_compression_method`); our outgoing frames use LZ4. Spec covered by Problem 42 / §4.
 
 **References:**
-- ch-go: `compress/reader.go` (ZSTD branch)
 - ClickHouse: `src/Compression/CompressionCodecZSTD.cpp`
 
 ---
