@@ -744,6 +744,72 @@ fn materialize_replicated(
                 offsets: new_offsets,
             })
         }
+        ColumnData::Nested {
+            fields,
+            offsets: el_offsets,
+        } => {
+            // Same flat-index trick as Array, but N parallel field streams
+            // share one offsets array.
+            let mut flat_indexes: Vec<u64> = Vec::new();
+            let mut new_offsets: Vec<u64> = Vec::with_capacity(indexes.len());
+            let mut total: u64 = 0;
+            for &idx in indexes {
+                let i = check_bounds(idx)?;
+                let start = if i == 0 { 0 } else { el_offsets[i - 1] };
+                let end = el_offsets[i];
+                for j in start..end {
+                    flat_indexes.push(j);
+                }
+                total += end - start;
+                new_offsets.push(total);
+            }
+            let inner_num = el_offsets.last().copied().unwrap_or(0) as usize;
+            let mut new_fields = Vec::with_capacity(fields.len());
+            for (fname, fcol) in fields {
+                new_fields.push((
+                    fname,
+                    materialize_replicated(fcol, &flat_indexes, inner_num, name)?,
+                ));
+            }
+            Ok(ColumnData::Nested {
+                fields: new_fields,
+                offsets: new_offsets,
+            })
+        }
+        ColumnData::LowCardinality {
+            dict,
+            keys,
+            key_width,
+        } => {
+            // The shared dictionary is unchanged; selecting element `idx`
+            // means selecting its key. (keys.len() == num_elements.)
+            let mut new_keys = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                new_keys.push(keys[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::LowCardinality {
+                dict,
+                keys: new_keys,
+                key_width,
+            })
+        }
+        ColumnData::Int256(v) => lookup!(Int256, v),
+        ColumnData::Uint256(v) => lookup!(Uint256, v),
+        ColumnData::Decimal256 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Decimal256 { scale, values: out })
+        }
+        ColumnData::Json(v) => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(v[check_bounds(idx)?].clone());
+            }
+            Ok(ColumnData::Json(out))
+        }
+        ColumnData::Nothing(_) => Ok(ColumnData::Nothing(indexes.len())),
         other => Err(Error::new(
             ErrorKind::Unsupported,
             format!(
@@ -3399,6 +3465,107 @@ mod tests {
         let err =
             decode_json(&mut cursor, "JSON(a LowCardinality(String))", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_replicated_over_low_cardinality() {
+        // elements = LC over dict ["", "a", "b"] with keys [1, 2, 1] (3
+        // elements). indexes [0, 2, 0, 1] select keys [1, 1, 1, 2]; the dict
+        // is shared/unchanged.
+        let elements = ColumnData::LowCardinality {
+            dict: Box::new(ColumnData::String(vec![
+                "".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+            ])),
+            keys: vec![1, 2, 1],
+            key_width: 1,
+        };
+        let out = materialize_replicated(elements, &[0, 2, 0, 1], 3, "x").unwrap();
+        match out {
+            ColumnData::LowCardinality { dict, keys, key_width } => {
+                assert_eq!(keys, vec![1, 1, 1, 2]);
+                assert_eq!(key_width, 1);
+                match *dict {
+                    ColumnData::String(v) => assert_eq!(v, vec!["", "a", "b"]),
+                    other => panic!("expected String dict, got {other:?}"),
+                }
+            }
+            other => panic!("expected LowCardinality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replicated_over_nested() {
+        // elements = Nested with 2 elements: el0 = {a:[10,20], b:["x","y"]},
+        // el1 = {a:[30], b:["z"]}. indexes [1, 0] → row0=el1, row1=el0.
+        let elements = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Uint8(vec![10, 20, 30])),
+                (
+                    "b".to_string(),
+                    ColumnData::String(vec!["x".to_string(), "y".to_string(), "z".to_string()]),
+                ),
+            ],
+            offsets: vec![2, 3],
+        };
+        let out = materialize_replicated(elements, &[1, 0], 2, "x").unwrap();
+        match out {
+            ColumnData::Nested { fields, offsets } => {
+                assert_eq!(offsets, vec![1, 3]);
+                assert_eq!(fields[0].0, "a");
+                match &fields[0].1 {
+                    ColumnData::Uint8(v) => assert_eq!(v, &vec![30u8, 10, 20]),
+                    other => panic!("expected Uint8, got {other:?}"),
+                }
+                match &fields[1].1 {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["z", "x", "y"]),
+                    other => panic!("expected String, got {other:?}"),
+                }
+            }
+            other => panic!("expected Nested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replicated_over_int256() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let out = materialize_replicated(ColumnData::Int256(vec![a, b]), &[1, 0, 1], 2, "x").unwrap();
+        match out {
+            ColumnData::Int256(v) => assert_eq!(v, vec![b, a, b]),
+            other => panic!("expected Int256, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replicated_nested_inner_full_wire() {
+        // Drive decode_replicated end-to-end with a Nested(a UInt8) inner:
+        // 2 elements (el0={a:[10,20]}, el1={a:[30]}), indexes [1, 0, 1].
+        let mut body = Vec::new();
+        body.extend(varuint_bytes(3)); // num_rows
+        body.push(1); // 1-byte indexes
+        body.extend([1u8, 0, 1]); // indexes
+        body.extend(varuint_bytes(2)); // num_elements
+        // Nested(a UInt8) data for 2 elements: offsets [2,3] then a=[10,20,30].
+        body.extend(2u64.to_le_bytes());
+        body.extend(3u64.to_le_bytes());
+        body.extend([10u8, 20, 30]);
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let out = decode_replicated(&mut cursor, "Nested(a UInt8)", 3, "x").unwrap();
+        assert_eq!(cursor.position() as usize, body.len());
+        match out {
+            ColumnData::Nested { fields, offsets } => {
+                assert_eq!(offsets, vec![1, 3, 4]);
+                assert_eq!(fields[0].0, "a");
+                match &fields[0].1 {
+                    ColumnData::Uint8(v) => assert_eq!(v, &vec![30u8, 10, 20, 30]),
+                    other => panic!("expected Uint8, got {other:?}"),
+                }
+            }
+            other => panic!("expected Nested, got {other:?}"),
+        }
     }
 
     #[test]

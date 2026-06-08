@@ -77,8 +77,9 @@ impl Feature {
     /// Server may emit a column with `Kind::REPLICATED` (`kind_stack = 0x04`)
     /// for repeated-value columns. Below v54482 the writer expands those
     /// columns before sending; at v54482+ the wire data is the compact
-    /// replicated form. Our decoder currently rejects this kind with a
-    /// clear `Unsupported` error. Decoder implementation deferred.
+    /// replicated form. Decoded via dictionary index lookup
+    /// (`materialize_replicated`); leaf types plus `Nullable`/`Array`/`Tuple`/
+    /// `Map`/`Nested`/`LowCardinality` inners are supported.
     pub const REPLICATED_SERIALIZATION: Feature = Feature(54482);
     /// Composes sparse with `Nullable(T)`. Below v54483, the writer expanded
     /// sparse for Nullable columns before sending (`recursiveRemoveSparse`).

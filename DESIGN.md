@@ -39,7 +39,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 | 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 334 unit tests + 99 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
+**Test coverage at the time of writing:** 338 unit tests + 99 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -56,7 +56,7 @@ Stage 2 unlocked the ~4,200 tests with DDL/DML by wrapping each test in a `CREAT
 
 Stage 3 unlocked the ~1,200 negative-path tests by parsing the test-hint markers (`-- { serverError NAME }`, `-- { clientError 42 }`, etc.) — same syntax as `ClickHouse/src/Client/TestHint.cpp`. Numeric and name-based codes both supported; the wrapper looks up the name→code mapping once per run via `errorCodeToName`.
 
-Stage 4 closed the protocol-version gap from v54461 to **v54483** across 19 commits (Problems 47–65), with each ServerHello / Addendum / ClientInfo / Progress / ProfileInfo / BlockInfo extension implemented and gated behind its Feature constant. The 1-point pass-rate dip vs Stage 3 is the cost of declaring a higher protocol: at v54482+ the server starts emitting columns with `kind_stack = 0x04 (REPLICATED)` — a compact form for repeated values that we deliberately deferred (Problem 64 is docs-only). That accounts for all 61 new SERVER_ERRORs. A REPLICATED column decoder was subsequently added (post-Stage 4 follow-up, see Problem 64), recovering +44 tests to **80.2%**; only ~13 cases with `Nested`/`LowCardinality` inners remain deferred.
+Stage 4 closed the protocol-version gap from v54461 to **v54483** across 19 commits (Problems 47–65), with each ServerHello / Addendum / ClientInfo / Progress / ProfileInfo / BlockInfo extension implemented and gated behind its Feature constant. The 1-point pass-rate dip vs Stage 3 is the cost of declaring a higher protocol: at v54482+ the server starts emitting columns with `kind_stack = 0x04 (REPLICATED)` — a compact form for repeated values that we deliberately deferred (Problem 64 is docs-only). That accounts for all 61 new SERVER_ERRORs. A REPLICATED column decoder was subsequently added (post-Stage 4 follow-up, see Problem 64), recovering +44 tests to **80.2%**; the `Nested`/`LowCardinality` inner cases were later filled in too, so the materializer now covers all composite inners.
 
 **Spec deliverables:**
 
@@ -1060,7 +1060,9 @@ At v54482+ the server can emit columns with `Kind::REPLICATED` (`kind_stack = 0x
 [elements]               num_elements rows in the inner type's dense form
 ```
 
-**Implementation:** `Feature::REPLICATED_SERIALIZATION = 54482`. New `decode_replicated` + `materialize_replicated` in `src/proto/column.rs`. The materializer expands the dictionary into a dense column by selecting `elements[indexes[i]]` per output row — the same lookup pattern as LowCardinality. Supports all leaf types (Int/UInt 8-128, Float32/64, Bool, String, FixedString, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum16, Decimal32/64/128), plus **composites recursively**: `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)` — composites use a flat-index trick that recurses into the inner materializer.
+**Implementation:** `Feature::REPLICATED_SERIALIZATION = 54482`. New `decode_replicated` + `materialize_replicated` in `src/proto/column.rs`. The materializer expands the dictionary into a dense column by selecting `elements[indexes[i]]` per output row — the same lookup pattern as LowCardinality. Supports all leaf types (Int/UInt 8-256, Float32/64, Bool, String, FixedString, Date, Date32, DateTime, DateTime64, UUID, IPv4, IPv6, Enum16, Decimal32/64/128/256, JSON-Tier1), plus **composites recursively**: `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`, `Nested(...)` (each field expanded like an Array), and `LowCardinality(T)` (shared dictionary kept, only the per-element keys indexed). Composites use a flat-index trick that recurses into the inner materializer.
+
+**Follow-up (this batch):** the originally-deferred `Nested` and `LowCardinality` inners (≈13 corpus SERVER_ERRORs) were filled in, along with the 256-bit / Decimal256 / JSON-Tier1 / Nothing leaf arms, removing the last `Unsupported` cases for plausible inner types. Note the server (26.5) only chooses REPLICATED serialization in narrow scenarios — not reproducible via simple SELECTs here — so these arms are covered by deterministic unit tests (`test_replicated_over_low_cardinality`, `test_replicated_over_nested`, `test_replicated_over_int256`, `test_replicated_nested_inner_full_wire`) rather than an integration test.
 
 **Spec work done:** `NATIVE_PROTOCOL.md` §3.3 feature row; `NATIVE_FORMAT.md` §2.3.1 lists the kind_stack byte `0x04 = REPLICATED`.
 

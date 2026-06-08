@@ -190,7 +190,7 @@ Decoders reconstruct a dense column of `num_rows` entries by filling every non-e
 [elements: num_elements dense inner-type values]
 ```
 
-Decoders reconstruct a dense column by selecting `elements[indexes[i]]` for each output row `i`. Composite inner types (`Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`) recurse: the element list is materialized in the inner type, then indexed. `Nested` and `LowCardinality` inners are not yet supported.
+Decoders reconstruct a dense column by selecting `elements[indexes[i]]` for each output row `i`. Composite inner types recurse: the element list is materialized in the inner type, then indexed. Supported inners include the leaf types, `Nullable(T)`, `Array(T)`, `Tuple(...)`, `Map(K, V)`, `Nested(...)` (each field expanded like an `Array`), and `LowCardinality(T)` (the shared dictionary is kept; only the per-element keys are indexed).
 
 ### 2.4 Block variants
 
