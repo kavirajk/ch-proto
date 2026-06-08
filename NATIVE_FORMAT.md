@@ -1110,14 +1110,57 @@ A discriminated union: each row holds a value of exactly one of the variant type
 
 Reconstructed: row 0 = UInt64 run[0] = `42`; row 1 = String run[0] = `"hi"`; row 2 = NULL.
 
-#### 3.4.6 Dynamic, JSON Tier 2/3 — out of scope for this revision
+#### 3.4.6 Dynamic
 
-Two closely-related types are not specified in detail here:
+A column whose value type is discovered at runtime: each row holds a value of one of a runtime-determined set of types, or NULL. Unlike `Variant`, the type set is **not** in the column's type string — it is carried in the state prefix.
 
-- **`Dynamic`** — runtime-typed column. State prefix carries a serialisation version (`V1=1`, `V2=2`, `V3=4`, `FLATTENED=3`); then a list of variant type names discovered at runtime; then a `Variant` encoding using those types. Type list grows across blocks within a query.
-- **`JSON` Tier 2 (FLATTENED) and Tier 3 (V3)** — `Object`-rooted format: a list of dynamic paths, each path encoded as a `Dynamic` column, plus a shared-data column.
+**Type string syntax:** `Dynamic` or `Dynamic(max_types=N)`. The `max_types` parameter bounds how many distinct types the column tracks but does not affect the wire format below.
 
-These types share the structural pattern of state-prefix + per-block payload but introduce multi-block cross-column state and discriminator dispatch. Comprehensive specifications for them are deferred to a future revision of this document.
+**Serialization version.** `Dynamic` has several encodings (`V1=1`, `V2=2`, `FLATTENED=3`, `V3=4`). Over the native protocol the server emits **V2 by default**, which carries per-variant statistics. This spec (and the reference client) uses the simpler **FLATTENED (version 3)** encoding, which the client selects by sending the query setting `output_format_native_use_flattened_dynamic_and_json_serialization = 1`. Without that setting the server sends V2.
+
+**Wire layout (FLATTENED, version 3):**
+
+```
+[8 bytes:  UInt64 LE version = 3]                  ← state prefix, once per column per query
+                                                     only emitted before the first block with rows > 0
+[VarUInt num_types]                                ← number of runtime types
+[num_types × String]                               ← type names, in wire order
+[per type: its own state prefix]                   ← empty for leaf types; + indexes-type prefix (empty, integer)
+[per block with rows > 0]:
+  [num_rows × discriminator]                       ← width by num_types (UInt8 if ≤ 255, else UInt16/32/64);
+                                                     NULL discriminator = num_types (one past the last type)
+  [for each type i, in wire order]:
+    [values for the rows whose discriminator == i] ← dense encoding in type i
+```
+
+**Discriminator width** is the smallest unsigned integer that can index `num_types` types plus the NULL slot — `UInt8` for `num_types ≤ 255`, then `UInt16`, `UInt32`, `UInt64`. (Matches `getSmallestIndexesType(num_types + 1)`.)
+
+**NULL** is the discriminator value `num_types` itself — note this differs from `Variant`, where NULL is the fixed value `255`.
+
+**Reconstruction** is the same dense walk as `Variant`: keep a per-type counter, row `r` with discriminator `d` (≠ `num_types`) takes value `counter[d]` from type `d`'s run.
+
+**Invariants.**
+
+1. State prefix (version + type list) is read once per column per query, before the first block with rows > 0. Header/empty blocks emit nothing.
+2. Runtime types whose serialization is stateful (`LowCardinality`/`Variant`/`Dynamic`/`JSON`) carry nested state prefixes after the type-name list; that nested case is not yet supported and is rejected.
+
+**Byte-level example — `Dynamic` with runtime types `["UInt64", "String"]` and rows `[42, "hi", NULL]`** (discriminator 0 = UInt64, 1 = String, 2 = NULL):
+
+```
+03 00 00 00 00 00 00 00      state prefix: UInt64 version = 3 (FLATTENED)
+02                           VarUInt num_types = 2
+06 55 49 6E 74 36 34         type[0] = "UInt64"
+06 53 74 72 69 6E 67         type[1] = "String"
+00 01 02                     discriminators (3 rows): 0 (UInt64), 1 (String), 2 (NULL)
+2A 00 00 00 00 00 00 00      UInt64 run (1 value): 42
+02 68 69                     String run (1 value): len=2 "hi"
+```
+
+Reconstructed: row 0 = UInt64 run[0] = `42`; row 1 = String run[0] = `"hi"`; row 2 = NULL.
+
+#### 3.4.7 JSON Tier 2/3 — out of scope for this revision
+
+- **`JSON` Tier 2 (FLATTENED) and Tier 3 (V3)** — `Object`-rooted format: a list of dynamic paths, each path encoded as a `Dynamic` column, plus a shared-data column. The reference client decodes JSON only in Tier 1 (String fallback, §3.4.4). Tier 2/3 introduces multi-path dispatch and (for non-leaf paths) nested stateful serialization; a comprehensive specification is deferred to a future revision.
 
 ---
 

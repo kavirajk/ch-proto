@@ -24,20 +24,35 @@ use crate::{
     query_result::QueryResult,
 };
 
-/// Auto-inject `output_format_native_write_json_as_string=1` so JSON columns
-/// always come back in Tier 1 (String fallback) shape — the only JSON
-/// serialization version this client decodes (see SPEC §8.4.2.1). Skipped if
-/// the user already set this setting explicitly (their value wins).
-fn inject_json_string_setting(mut settings: Vec<Setting>) -> Vec<Setting> {
-    const KEY: &str = "output_format_native_write_json_as_string";
-    if !settings.iter().any(|s| s.key == KEY) {
-        settings.push(Setting {
-            key: KEY.to_string(),
-            value: "1".to_string(),
-            important: false,
-            custom: false,
-            obsolete: false,
-        });
+/// Auto-inject the format settings this client relies on for versioned
+/// types, unless the user set them explicitly (their value wins):
+///
+/// - `output_format_native_write_json_as_string=1` — JSON columns come back
+///   in Tier 1 (String fallback) shape, the only JSON encoding this client
+///   decodes (see NATIVE_FORMAT.md §3.4.4).
+/// - `output_format_native_use_flattened_dynamic_and_json_serialization=1` —
+///   `Dynamic` columns use the FLATTENED (version 3) serialization rather
+///   than the default V2 (which carries per-variant statistics this client
+///   doesn't decode). Mirrors clickhouse-go, which sets the same flag.
+///   See NATIVE_FORMAT.md §3.4.6.
+fn inject_default_settings(mut settings: Vec<Setting>) -> Vec<Setting> {
+    const DEFAULTS: [(&str, &str); 2] = [
+        ("output_format_native_write_json_as_string", "1"),
+        (
+            "output_format_native_use_flattened_dynamic_and_json_serialization",
+            "1",
+        ),
+    ];
+    for (key, value) in DEFAULTS {
+        if !settings.iter().any(|s| s.key == key) {
+            settings.push(Setting {
+                key: key.to_string(),
+                value: value.to_string(),
+                important: false,
+                custom: false,
+                obsolete: false,
+            });
+        }
     }
     settings
 }
@@ -239,7 +254,7 @@ impl Connection {
                 script_query_number: Some(0),
                 script_line_number: Some(0),
             },
-            settings: inject_json_string_setting(opts.settings),
+            settings: inject_default_settings(opts.settings),
             cluster_secret: "".to_string(),
             stage: opts.stage.unwrap_or(Stage::Complete),
             compression: opts.compression.unwrap_or(false),

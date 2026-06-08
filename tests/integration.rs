@@ -2056,3 +2056,104 @@ fn test_variant_with_array_element_and_offsets() {
         other => panic!("expected Variant, got {other:?}"),
     }
 }
+
+// -- Dynamic (Problem 39) --
+
+#[test]
+fn test_dynamic_select() {
+    // arrayJoin over a 3-element array yields one block of 3 rows in array
+    // order: 42 (UInt64), "hi" (String), NULL. The runtime type set is
+    // carried in the Dynamic state prefix; the NULL discriminator is the
+    // type count (one past the last type).
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                42::UInt64::Dynamic, \
+                'hi'::String::Dynamic, \
+                CAST(NULL, 'Dynamic')]) AS d",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    let col = &result.rows[0].columns[0];
+    assert!(
+        col.data_type.starts_with("Dynamic"),
+        "expected a Dynamic column, got type {}",
+        col.data_type
+    );
+    match &col.data {
+        ColumnData::Dynamic {
+            type_names,
+            discriminators,
+            columns,
+            ..
+        } => {
+            let null = type_names.len() as u64;
+            // Map each row to its rendered value via type_names, independent
+            // of the server's type ordering.
+            let uint_idx = type_names.iter().position(|t| t == "UInt64").expect("UInt64 type");
+            let str_idx = type_names.iter().position(|t| t == "String").expect("String type");
+            assert_eq!(discriminators.len(), 3);
+            assert_eq!(discriminators[0], uint_idx as u64);
+            assert_eq!(discriminators[1], str_idx as u64);
+            assert_eq!(discriminators[2], null);
+            match &columns[uint_idx] {
+                ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64]),
+                other => panic!("expected UInt64 run, got {other:?}"),
+            }
+            match &columns[str_idx] {
+                ColumnData::String(v) => assert_eq!(v, &vec!["hi".to_string()]),
+                other => panic!("expected String run, got {other:?}"),
+            }
+        }
+        other => panic!("expected Dynamic, got {other:?}"),
+    }
+
+    // End-to-end TSV rendering.
+    let mut out = Vec::new();
+    for row in 0..col.data.row_count() {
+        ch_proto::tsv::write_value(&mut out, &col.data, row).unwrap();
+        out.push(b'\n');
+    }
+    assert_eq!(String::from_utf8(out).unwrap(), "42\nhi\n\\N\n");
+}
+
+#[test]
+fn test_dynamic_repeated_type_offsets() {
+    // Two UInt64 values plus one String exercise the per-type dense runs and
+    // offsets: the UInt64 run holds [1, 2] at offsets 0 and 1.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                1::UInt64::Dynamic, \
+                2::UInt64::Dynamic, \
+                'x'::String::Dynamic]) AS d",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    match &result.rows[0].columns[0].data {
+        ColumnData::Dynamic {
+            type_names,
+            discriminators,
+            offsets,
+            columns,
+        } => {
+            let uint_idx = type_names.iter().position(|t| t == "UInt64").unwrap() as u64;
+            // Two UInt64 rows then one String row.
+            assert_eq!(discriminators[0], uint_idx);
+            assert_eq!(discriminators[1], uint_idx);
+            assert_eq!(offsets[0], 0);
+            assert_eq!(offsets[1], 1);
+            match &columns[uint_idx as usize] {
+                ColumnData::Uint64(v) => assert_eq!(v, &vec![1u64, 2]),
+                other => panic!("expected UInt64 run, got {other:?}"),
+            }
+        }
+        other => panic!("expected Dynamic, got {other:?}"),
+    }
+}

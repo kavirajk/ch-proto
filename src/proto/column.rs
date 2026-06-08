@@ -228,6 +228,42 @@ pub enum ColumnData {
         /// discriminator is `i`.
         columns: Vec<ColumnData>,
     },
+    /// `Dynamic` — a column whose value type is discovered at runtime. Each
+    /// row holds a value of one of a runtime-determined set of types, or NULL.
+    ///
+    /// Wire format (FLATTENED serialization, version 3 — what the server
+    /// emits over the native protocol to clients on servers newer than 25.6):
+    /// - State prefix (once per column, at the first block with rows > 0):
+    ///   `UInt64 LE` version (`3` = FLATTENED), `VarUInt num_types`, then
+    ///   `num_types` type-name strings, then each type's own state prefix
+    ///   (empty for leaf types) and the indexes type's prefix (empty — it's
+    ///   an integer).
+    /// - Per block: `num_rows ×` discriminator at a width chosen by
+    ///   `num_types` (UInt8 if `num_types ≤ 255`, else wider). The NULL
+    ///   discriminator is `num_types` (one past the last type), *not* 255.
+    ///   Then each type's values densely, in wire order.
+    ///
+    /// Unlike Variant, the type set is not in the column's type string — it's
+    /// carried in the state prefix, so [`type_names`](Self::Dynamic) is
+    /// stored here.
+    ///
+    /// KNOWN LIMITATION: single data block per column, and runtime types that
+    /// are themselves stateful (LowCardinality / Variant / Dynamic / JSON)
+    /// are rejected — they'd carry a nested state prefix this flat decoder
+    /// doesn't route.
+    Dynamic {
+        /// Runtime variant type names, in wire order. Discriminator `i`
+        /// selects `type_names[i]` / `columns[i]`.
+        type_names: Vec<String>,
+        /// Per-row discriminator; index into `columns`, or `type_names.len()`
+        /// (== `columns.len()`) for a NULL row.
+        discriminators: Vec<u64>,
+        /// Per-row index into `columns[discriminators[r]]`. Unused (0) for
+        /// NULL rows.
+        offsets: Vec<u64>,
+        /// One dense sub-column per runtime type, in wire order.
+        columns: Vec<ColumnData>,
+    },
 }
 
 /// `Variant` discriminator marking a NULL row — mirrors
@@ -239,6 +275,28 @@ pub const NULL_DISCRIMINATOR: u8 = 255;
 /// (run-length granule encoding). We only handle BASIC, the native-protocol
 /// default. Mirrors `SerializationVariant::DiscriminatorsSerializationMode`.
 const VARIANT_DISCRIMINATORS_MODE_BASIC: u64 = 0;
+
+/// `Dynamic` FLATTENED serialization version — written as the `UInt64` state
+/// prefix. Mirrors `SerializationDynamic::SerializationVersion::FLATTENED`.
+/// This is the version the server emits over the native protocol (servers
+/// newer than 25.6). The other versions (`V1=1`, `V2=2`, `V3=4`) are the
+/// MergeTree on-disk formats and are not emitted to us.
+const DYNAMIC_VERSION_FLATTENED: u64 = 3;
+
+/// Width (in bytes) of a `Dynamic` discriminator given the runtime type
+/// count. Matches `getSmallestIndexesType(num_types + 1)` — the smallest
+/// unsigned integer that can index `num_types` types plus the NULL slot.
+fn dynamic_discriminator_width(num_types: usize) -> u8 {
+    if num_types <= u8::MAX as usize {
+        1
+    } else if num_types <= u16::MAX as usize {
+        2
+    } else if num_types <= u32::MAX as usize {
+        4
+    } else {
+        8
+    }
+}
 
 impl Column {
     pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
@@ -845,6 +903,7 @@ impl ColumnData {
             ColumnData::LowCardinality { keys, .. } => keys.len(),
             ColumnData::Nothing(rows) => *rows,
             ColumnData::Variant { discriminators, .. } => discriminators.len(),
+            ColumnData::Dynamic { discriminators, .. } => discriminators.len(),
         }
     }
 
@@ -1099,6 +1158,64 @@ impl ColumnData {
                             ErrorKind::InvalidInput,
                             format!(
                                 "Variant invariant broken: column {i} has {} rows but {} discriminators select it",
+                                col.row_count(),
+                                counts[i]
+                            ),
+                        ));
+                    }
+                    col.validate()?;
+                }
+                Ok(())
+            }
+            ColumnData::Dynamic {
+                type_names,
+                discriminators,
+                offsets,
+                columns,
+            } => {
+                if type_names.len() != columns.len() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Dynamic invariant broken: type_names.len()={} != columns.len()={}",
+                            type_names.len(),
+                            columns.len()
+                        ),
+                    ));
+                }
+                if offsets.len() != discriminators.len() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Dynamic invariant broken: offsets.len()={} != discriminators.len()={}",
+                            offsets.len(),
+                            discriminators.len()
+                        ),
+                    ));
+                }
+                // The NULL discriminator is `columns.len()`; any other value
+                // must index a real sub-column.
+                let null_discr = columns.len() as u64;
+                let mut counts = vec![0usize; columns.len()];
+                for &d in discriminators {
+                    if d == null_discr {
+                        continue;
+                    }
+                    if d as usize >= columns.len() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("Dynamic discriminator {d} > NULL slot {null_discr}"),
+                        ));
+                    }
+                    counts[d as usize] += 1;
+                }
+                for (i, col) in columns.iter().enumerate() {
+                    if col.row_count() != counts[i] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Dynamic invariant broken: column {i} ({}) has {} rows but {} discriminators select it",
+                                type_names[i],
                                 col.row_count(),
                                 counts[i]
                             ),
@@ -1365,6 +1482,38 @@ impl ColumnData {
                         w.write_u8(d)?;
                     }
                     // Each variant type's values densely, in declared order.
+                    for col in columns {
+                        col.encode(w)?;
+                    }
+                }
+            }
+            ColumnData::Dynamic {
+                type_names,
+                discriminators,
+                columns,
+                ..
+            } => {
+                // Skip everything for an empty column (header block).
+                if !discriminators.is_empty() {
+                    // State prefix: UInt64 version (FLATTENED) + VarUInt
+                    // num_types + type-name strings. (Leaf types and the
+                    // integer indexes type have empty per-element prefixes.)
+                    w.write_u64(DYNAMIC_VERSION_FLATTENED)?;
+                    w.write_varuint(type_names.len() as u64)?;
+                    for name in type_names {
+                        w.write_string(name)?;
+                    }
+                    // Discriminators at the width chosen by the type count.
+                    let width = dynamic_discriminator_width(type_names.len());
+                    for &d in discriminators {
+                        match width {
+                            1 => w.write_u8(d as u8)?,
+                            2 => w.write_u16(d as u16)?,
+                            4 => w.write_u32(d as u32)?,
+                            _ => w.write_u64(d)?,
+                        }
+                    }
+                    // Each runtime type's values densely, in wire order.
                     for col in columns {
                         col.encode(w)?;
                     }
@@ -1681,6 +1830,7 @@ impl ColumnData {
                 Ok(ColumnData::Json(v))
             }
             "Variant" => decode_variant(r, data_type, rows),
+            "Dynamic" => decode_dynamic(r, rows),
             "Int32" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
@@ -1954,6 +2104,98 @@ fn decode_variant(r: &mut impl ProtoRead, data_type: &str, rows: usize) -> Resul
 fn parse_variant_inner_types(data_type: &str) -> Result<Vec<String>> {
     let inner = parse_composite_inner_type(data_type)?;
     split_with_composite(&inner)
+}
+
+/// Decode a `Dynamic` column in FLATTENED serialization (version 3) — the
+/// format the server emits over the native protocol. See
+/// [`ColumnData::Dynamic`] and NATIVE_FORMAT.md §3.4.6. The single-data-block
+/// convention matches LowCardinality / JSON / Variant: the state prefix is
+/// read only when `rows > 0`.
+fn decode_dynamic(r: &mut impl ProtoRead, rows: usize) -> Result<ColumnData> {
+    // Header block: no state prefix, no data.
+    if rows == 0 {
+        return Ok(ColumnData::Dynamic {
+            type_names: Vec::new(),
+            discriminators: Vec::new(),
+            offsets: Vec::new(),
+            columns: Vec::new(),
+        });
+    }
+
+    // State prefix: UInt64 version.
+    let version = r.read_u64()?;
+    if version != DYNAMIC_VERSION_FLATTENED {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "Dynamic serialization version {version} not supported; only FLATTENED ({DYNAMIC_VERSION_FLATTENED})"
+            ),
+        ));
+    }
+
+    // VarUInt num_types, then that many type-name strings.
+    let num_types = r.read_varuint()? as usize;
+    let mut type_names = Vec::with_capacity(num_types);
+    for _ in 0..num_types {
+        type_names.push(r.read_string()?);
+    }
+
+    // Runtime types that are themselves stateful would emit a nested state
+    // prefix this flat decoder can't route — reject up front. (Leaf types
+    // and the integer indexes type have empty prefixes, so there are no more
+    // prefix bytes to read here.)
+    for t in &type_names {
+        if is_stateful_type(t) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "Dynamic runtime type '{t}' is a stateful type (LowCardinality / Variant / \
+                     Dynamic / JSON); nested state prefixes inside Dynamic are not yet supported"
+                ),
+            ));
+        }
+    }
+
+    // Data: discriminators at the width chosen by the type count. The NULL
+    // discriminator is `num_types` (one past the last type).
+    let width = dynamic_discriminator_width(num_types);
+    let null_discr = num_types as u64;
+    let mut discriminators = Vec::with_capacity(rows);
+    let mut offsets = Vec::with_capacity(rows);
+    let mut counts = vec![0usize; num_types];
+    for _ in 0..rows {
+        let d = match width {
+            1 => r.read_u8()? as u64,
+            2 => r.read_u16()? as u64,
+            4 => r.read_u32()? as u64,
+            _ => r.read_u64()?,
+        };
+        if d == null_discr {
+            offsets.push(0);
+        } else if (d as usize) < num_types {
+            offsets.push(counts[d as usize] as u64);
+            counts[d as usize] += 1;
+        } else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Dynamic discriminator {d} > NULL slot {null_discr}"),
+            ));
+        }
+        discriminators.push(d);
+    }
+
+    // Each runtime type's values densely, in wire order.
+    let mut columns = Vec::with_capacity(num_types);
+    for (i, t) in type_names.iter().enumerate() {
+        columns.push(ColumnData::decode(r, t, counts[i])?);
+    }
+
+    Ok(ColumnData::Dynamic {
+        type_names,
+        discriminators,
+        offsets,
+        columns,
+    })
 }
 
 /// Whether a type's serialization carries a per-column state prefix — i.e. it
@@ -2671,6 +2913,167 @@ mod tests {
         let mut cursor = Cursor::new(body.as_slice());
         let err = decode_variant(&mut cursor, "Variant(String, UInt64)", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    // -- Dynamic (Problem 39 / NATIVE_FORMAT.md §3.4.6) --
+
+    #[test]
+    fn test_dynamic_discriminator_width() {
+        assert_eq!(dynamic_discriminator_width(0), 1);
+        assert_eq!(dynamic_discriminator_width(2), 1);
+        assert_eq!(dynamic_discriminator_width(255), 1);
+        assert_eq!(dynamic_discriminator_width(256), 2);
+        assert_eq!(dynamic_discriminator_width(65535), 2);
+        assert_eq!(dynamic_discriminator_width(65536), 4);
+    }
+
+    /// Hand-built FLATTENED (version 3) Dynamic wire for type_names
+    /// ["UInt64", "String"] with rows [42 (UInt64), "hi" (String), NULL].
+    fn build_dynamic_wire() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(3u64.to_le_bytes()); // version = FLATTENED
+        body.extend(varuint_bytes(2)); // num_types
+        body.extend(varuint_bytes(6));
+        body.extend(b"UInt64");
+        body.extend(varuint_bytes(6));
+        body.extend(b"String");
+        body.extend([0u8, 1, 2]); // discriminators (width 1): UInt64, String, NULL(=2)
+        body.extend(42u64.to_le_bytes()); // UInt64 run
+        body.extend(varuint_bytes(2)); // String run: "hi"
+        body.extend(b"hi");
+        body
+    }
+
+    #[test]
+    fn test_dynamic_decode_raw_wire() {
+        let body = build_dynamic_wire();
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_dynamic(&mut cursor, 3).unwrap();
+        assert_eq!(cursor.position() as usize, body.len());
+        match data {
+            ColumnData::Dynamic {
+                type_names,
+                discriminators,
+                offsets,
+                columns,
+            } => {
+                assert_eq!(type_names, vec!["UInt64", "String"]);
+                assert_eq!(discriminators, vec![0, 1, 2]);
+                assert_eq!(offsets, vec![0, 0, 0]);
+                match &columns[0] {
+                    ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64]),
+                    other => panic!("expected UInt64 run, got {other:?}"),
+                }
+                match &columns[1] {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["hi".to_string()]),
+                    other => panic!("expected String run, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dynamic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dynamic_roundtrip_via_column() {
+        let protocol = Feature::PROGRESS_IN_ASYNC_INSERT.version();
+        let col = Column {
+            name: "d".to_string(),
+            data_type: "Dynamic".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Dynamic {
+                type_names: vec!["UInt64".to_string(), "String".to_string()],
+                discriminators: vec![0, 1, 2, 0],
+                offsets: vec![0, 0, 0, 1],
+                columns: vec![
+                    ColumnData::Uint64(vec![42, 7]),
+                    ColumnData::String(vec!["hi".to_string()]),
+                ],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, protocol).unwrap();
+        match decoded.data {
+            ColumnData::Dynamic {
+                type_names,
+                discriminators,
+                columns,
+                ..
+            } => {
+                assert_eq!(type_names, vec!["UInt64", "String"]);
+                assert_eq!(discriminators, vec![0, 1, 2, 0]);
+                match &columns[0] {
+                    ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64, 7]),
+                    other => panic!("expected UInt64 run, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dynamic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dynamic_header_zero_rows() {
+        let body: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_dynamic(&mut cursor, 0).unwrap();
+        match data {
+            ColumnData::Dynamic {
+                discriminators,
+                columns,
+                ..
+            } => {
+                assert!(discriminators.is_empty());
+                assert!(columns.is_empty());
+            }
+            other => panic!("expected Dynamic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dynamic_all_null() {
+        let mut body = Vec::new();
+        body.extend(3u64.to_le_bytes());
+        body.extend(varuint_bytes(1)); // num_types = 1
+        body.extend(varuint_bytes(6));
+        body.extend(b"UInt64");
+        body.extend([1u8, 1, 1]); // all NULL (null = num_types = 1)
+        // UInt64 run is empty.
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_dynamic(&mut cursor, 3).unwrap();
+        match data {
+            ColumnData::Dynamic {
+                discriminators,
+                columns,
+                ..
+            } => {
+                assert_eq!(discriminators, vec![1, 1, 1]);
+                assert_eq!(columns[0].row_count(), 0);
+            }
+            other => panic!("expected Dynamic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dynamic_rejects_unsupported_version() {
+        let mut body = Vec::new();
+        body.extend(2u64.to_le_bytes()); // V2 — server default, not what we request
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_dynamic(&mut cursor, 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_dynamic_rejects_stateful_type() {
+        let mut body = Vec::new();
+        body.extend(3u64.to_le_bytes());
+        body.extend(varuint_bytes(1));
+        body.extend(varuint_bytes(22));
+        body.extend(b"LowCardinality(String)");
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_dynamic(&mut cursor, 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
     #[test]

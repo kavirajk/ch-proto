@@ -129,6 +129,22 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
                 write_value(w, &columns[d as usize], offsets[row] as usize)
             }
         }
+        ColumnData::Dynamic {
+            discriminators,
+            offsets,
+            columns,
+            ..
+        } => {
+            // A Dynamic row renders as its active sub-column's value, or \N
+            // for the NULL discriminator (== columns.len(), one past the
+            // last type).
+            let d = discriminators[row];
+            if d as usize >= columns.len() {
+                w.write_all(b"\\N")
+            } else {
+                write_value(w, &columns[d as usize], offsets[row] as usize)
+            }
+        }
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("tsv: unsupported column type: {}", variant_name(other)),
@@ -507,6 +523,7 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Nested { .. } => "Nested",
         ColumnData::Nothing(_) => "Nothing",
         ColumnData::Variant { .. } => "Variant",
+        ColumnData::Dynamic { .. } => "Dynamic",
     }
 }
 
