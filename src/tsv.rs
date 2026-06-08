@@ -145,6 +145,11 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
                 write_value(w, &columns[d as usize], offsets[row] as usize)
             }
         }
+        ColumnData::JsonObject {
+            typed_paths,
+            dynamic_paths,
+            ..
+        } => write_json_object(w, typed_paths, dynamic_paths, row),
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("tsv: unsupported column type: {}", variant_name(other)),
@@ -524,7 +529,105 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Nothing(_) => "Nothing",
         ColumnData::Variant { .. } => "Variant",
         ColumnData::Dynamic { .. } => "Dynamic",
+        ColumnData::JsonObject { .. } => "JsonObject",
     }
+}
+
+// Best-effort flat JSON-object rendering for a FLATTENED `JSON` (Tier 2)
+// column. NOT guaranteed byte-identical to ClickHouse's JSON text output:
+// dotted paths are emitted flat (not nested), path ordering is wire order,
+// and value formatting covers the common scalar types. The differential
+// harness never reaches this path (it uses the Tier 1 String fallback).
+fn write_json_object<W: Write>(
+    w: &mut W,
+    typed_paths: &[(String, ColumnData)],
+    dynamic_paths: &[(String, ColumnData)],
+    row: usize,
+) -> io::Result<()> {
+    w.write_all(b"{")?;
+    let mut first = true;
+    for (path, col) in typed_paths {
+        if !first {
+            w.write_all(b",")?;
+        }
+        first = false;
+        write_json_string(w, path.as_bytes())?;
+        w.write_all(b":")?;
+        write_json_value(w, col, row)?;
+    }
+    for (path, col) in dynamic_paths {
+        // A dynamic path that is NULL for this row is omitted, matching
+        // ClickHouse's JSON output.
+        if let ColumnData::Dynamic {
+            discriminators,
+            offsets,
+            columns,
+            ..
+        } = col
+        {
+            let d = discriminators[row];
+            if (d as usize) >= columns.len() {
+                continue;
+            }
+            if !first {
+                w.write_all(b",")?;
+            }
+            first = false;
+            write_json_string(w, path.as_bytes())?;
+            w.write_all(b":")?;
+            write_json_value(w, &columns[d as usize], offsets[row] as usize)?;
+        }
+    }
+    w.write_all(b"}")
+}
+
+// Render a single leaf value as JSON. Numbers and bools are bare; strings are
+// double-quoted with JSON escapes; everything else falls back to a
+// double-quoted TSV-escaped form. Best-effort (see `write_json_object`).
+fn write_json_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Result<()> {
+    match col {
+        ColumnData::Uint8(_)
+        | ColumnData::Uint16(_)
+        | ColumnData::Uint32(_)
+        | ColumnData::Uint64(_)
+        | ColumnData::Int8(_)
+        | ColumnData::Int16(_)
+        | ColumnData::Int32(_)
+        | ColumnData::Int64(_)
+        | ColumnData::Int128(_)
+        | ColumnData::Uint128(_)
+        | ColumnData::Float32(_)
+        | ColumnData::Float64(_)
+        | ColumnData::Bool(_) => write_value(w, col, row),
+        ColumnData::String(v) => write_json_string(w, v[row].as_bytes()),
+        other => {
+            // Fall back: render the TSV form, double-quoted.
+            let mut buf = Vec::new();
+            write_value(&mut buf, other, row)?;
+            write_json_string(w, &buf)
+        }
+    }
+}
+
+// Write bytes as a JSON double-quoted string with minimal JSON escapes.
+fn write_json_string<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    w.write_all(b"\"")?;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            _ => continue,
+        };
+        w.write_all(&bytes[start..i])?;
+        w.write_all(esc)?;
+        start = i + 1;
+    }
+    w.write_all(&bytes[start..])?;
+    w.write_all(b"\"")
 }
 
 #[cfg(test)]

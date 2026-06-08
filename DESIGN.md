@@ -31,7 +31,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 5     | Basic data types                             | 20–24  | ✅ |
 | 6     | Composite types (Nullable / Array / Tuple / Map / Nested) | 25–29 | ✅ |
 | 7     | More fixed-width and parameterized types     | 30–36  | ✅ |
-| 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 + Variant BASIC + Dynamic FLATTENED done; JSON Tier 2 deferred) |
+| 8     | Versioned / stateful types                   | 37–41  | ✅ (LowCardinality, JSON Tier 1, Variant BASIC, Dynamic FLATTENED, JSON Tier 2 FLATTENED — all leaf/single-block; COMPACT + nested-stateful + non-flat JSON deferred) |
 | 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
 | 11    | Bring spec up to server v54483               | 46–65  | ✅ |
@@ -39,7 +39,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 | 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 327 unit tests + 95 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
+**Test coverage at the time of writing:** 332 unit tests + 96 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -558,7 +558,7 @@ Straight-up 16 or 32 byte little-endian two's-complement integers.
 
 ### Phase 8: Versioned/stateful types — §8.4 ⚠️
 
-Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state. **Status:** LowCardinality (single-block), JSON Tier 1 (String fallback), Variant (BASIC discriminators mode), and Dynamic (FLATTENED, leaf runtime types) implemented; JSON Tier 2/3 deferred — see §3.4.7 of `NATIVE_FORMAT.md` for the rationale.
+Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state. **Status:** LowCardinality (single-block), JSON Tier 1 (String fallback), Variant (BASIC discriminators mode), Dynamic (FLATTENED, leaf runtime types), and JSON Tier 2 (FLATTENED Object, leaf paths) implemented; non-flat JSON (V2/V3 shared-data) and Tier 3 deferred — see §3.4.8 of `NATIVE_FORMAT.md`.
 
 #### Problem 37: `LowCardinality(T)` — simplest of the versioned types ⚠️ (single-block; multi-block pending)
 
@@ -644,19 +644,19 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 41: `JSON` (Tier 2: FLATTENED mode) ❌ Deferred
+#### Problem 41: `JSON` (Tier 2: FLATTENED mode) ✅ (partial — leaf paths)
 
-**Wire format when version = 3 (FLATTENED) or version = 0 (deprecated, auto-upgraded):**
-- `UInt64 LE` serialization version.
-- Path list (dynamic paths discovered server-side).
-- Per path: a `Dynamic` column encoding.
-- Shared data column at the end.
+**Wire format (version 3, FLATTENED):** `UInt64 version=3`, `VarUInt num_dynamic_paths`, the dynamic path names, then each typed path's state prefix (empty for leaf) and each dynamic path's `Dynamic` state prefix; per block, each typed path's column data then each dynamic path's `Dynamic` data. **No shared-data column** — FLATTENED expands every path into its own full column (the shared-data store belongs to the non-flat V2/V3 Object encodings).
 
-**Implementation:** requires Problems 37 (LowCardinality state-prefix handling helpers), 38 (Variant), 39 (Dynamic) first. This is thousands of lines of recursive decoding.
+**Key structural point:** all path state prefixes come first, then all path data — so a dynamic path's `Dynamic` prefix is separated from its data. This forced a localized two-phase split of the Dynamic decoder (`decode_dynamic_prefix` + `decode_dynamic_data`); the top-level `decode_dynamic` just calls them in sequence.
 
-**Skip if:** Tier 1 is sufficient for target users. Most real clients (ch-go, clickhouse-go v2) took this on; toy clients do not need it.
+**Implementation:** `ColumnData::JsonObject { rows, typed_paths, dynamic_paths }` in `src/proto/column.rs`. `decode_json` dispatches on the JSON version (1 = Tier 1 String, the default; 3 = FLATTENED Object); `decode_json_object` reads the FLATTENED structure; `parse_json_typed_paths`/`split_json_paths` parse `JSON(...)` typed-path declarations (backtick- and bracket-aware). The client must send `output_format_native_write_json_as_string=0` to receive Tier 2 (Tier 1 remains the default so existing behaviour and the differential harness are unaffected). `tsv.rs` renders a best-effort flat JSON object (documented as not byte-identical to ClickHouse).
 
-**Spec work:** §8.4 extended `JSON` coverage with FLATTENED byte-level walkthrough.
+**Partial / deferred (best-effort scope):** typed paths must be leaf types; dynamic paths use the leaf-only Dynamic decoder; single data block; the non-flat V2/V3 (shared-data) encodings and Tier 3 are out of scope; JsonObject is decode-only (no INSERT). See §3.4.8.
+
+**Spec work done:** `NATIVE_FORMAT.md` §3.4.7 (FLATTENED wire format + byte example); §3.4.8 (non-flat / Tier 3 out of scope).
+
+**Tests:** 5 unit (parse typed paths, raw-wire FLATTENED decode matching the spec example, Tier 1 still default, reject unknown version, reject stateful typed path) + 1 integration (`test_json_tier2_flattened_select`). 332 unit + 96 integration pass.
 
 **References:**
 - ClickHouse: `src/DataTypes/DataTypeObject.h`, `DataTypeObject.cpp`, `src/DataTypes/Serializations/SerializationJSON.h`, `SerializationJSON.cpp`, `src/DataTypes/Serializations/SerializationObject.h`, `SerializationObject.cpp`, `SerializationObjectDistinctPaths.cpp`, `SerializationObjectDynamicPath.cpp`, `SerializationObjectSharedData.cpp`
@@ -1146,7 +1146,7 @@ Done as part of Phase 6. `NATIVE_FORMAT.md` §3.3 covers Nullable, Array, Tuple,
 
 #### Problem 71: Fill versioned types section ⚠️
 
-Done in part. `NATIVE_FORMAT.md` §3.4 covers LowCardinality, JSON Tier 1, Variant (BASIC mode), and Dynamic (FLATTENED) with byte-level examples; JSON Tier 2/3 documented as "out of scope for this revision" (§3.4.7) with rationale, pending Problem 41.
+Done. `NATIVE_FORMAT.md` §3.4 covers LowCardinality, JSON Tier 1, Variant (BASIC), Dynamic (FLATTENED), and JSON Tier 2 (FLATTENED Object) with byte-level examples; non-flat JSON (V2/V3) and Tier 3 documented as out of scope (§3.4.8).
 
 ---
 

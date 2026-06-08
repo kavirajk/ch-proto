@@ -2157,3 +2157,62 @@ fn test_dynamic_repeated_type_offsets() {
         other => panic!("expected Dynamic, got {other:?}"),
     }
 }
+
+// -- JSON Tier 2 (FLATTENED Object) (Problem 41, partial) --
+
+#[test]
+fn test_json_tier2_flattened_select() {
+    // Disabling the Tier 1 String fallback makes the server emit the
+    // FLATTENED Object (version 3) serialization. A JSON value with two
+    // scalar paths comes back as two dynamic-path Dynamic columns.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let opts = QueryOptions::new()
+        .with_setting("output_format_native_write_json_as_string", "0");
+    let result = conn
+        .query_with(
+            "SELECT '{\"a\": 1, \"b\": \"hi\"}'::JSON AS j",
+            opts,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+
+    let col = &result.rows[0].columns[0];
+    match &col.data {
+        ColumnData::JsonObject {
+            rows,
+            dynamic_paths,
+            ..
+        } => {
+            assert_eq!(*rows, 1);
+            // Paths "a" and "b" are runtime-discovered (dynamic).
+            let a = dynamic_paths
+                .iter()
+                .find(|(p, _)| p == "a")
+                .expect("path a");
+            let b = dynamic_paths
+                .iter()
+                .find(|(p, _)| p == "b")
+                .expect("path b");
+            // Each is a Dynamic with one non-NULL row.
+            for (path, col) in [a, b] {
+                match col {
+                    ColumnData::Dynamic { discriminators, columns, .. } => {
+                        assert_eq!(discriminators.len(), 1, "path {path}");
+                        // discriminator is a real type index (not NULL).
+                        assert!((discriminators[0] as usize) < columns.len(), "path {path} not null");
+                    }
+                    other => panic!("expected Dynamic at {path}, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected JsonObject, got {other:?}"),
+    }
+
+    // Best-effort JSON rendering contains both paths.
+    let mut out = Vec::new();
+    ch_proto::tsv::write_value(&mut out, &col.data, 0).unwrap();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("\"a\":"), "rendered {s}");
+    assert!(s.contains("\"b\":"), "rendered {s}");
+}

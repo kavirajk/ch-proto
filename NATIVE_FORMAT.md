@@ -1158,9 +1158,54 @@ A column whose value type is discovered at runtime: each row holds a value of on
 
 Reconstructed: row 0 = UInt64 run[0] = `42`; row 1 = String run[0] = `"hi"`; row 2 = NULL.
 
-#### 3.4.7 JSON Tier 2/3 — out of scope for this revision
+#### 3.4.7 JSON (Tier 2: FLATTENED Object)
 
-- **`JSON` Tier 2 (FLATTENED) and Tier 3 (V3)** — `Object`-rooted format: a list of dynamic paths, each path encoded as a `Dynamic` column, plus a shared-data column. The reference client decodes JSON only in Tier 1 (String fallback, §3.4.4). Tier 2/3 introduces multi-path dispatch and (for non-leaf paths) nested stateful serialization; a comprehensive specification is deferred to a future revision.
+The richer JSON encoding: instead of flattening every value to text (Tier 1, §3.4.4), the column is split into one sub-column per JSON path. The client selects it by **not** requesting the Tier 1 fallback (`output_format_native_write_json_as_string = 0`) while the flattened-serialization flag is on (`output_format_native_use_flattened_dynamic_and_json_serialization = 1`, which this client sets by default); the server then emits serialization **version 3**.
+
+Two kinds of path:
+- **Typed paths** are declared in the type string (`JSON(a UInt32, ``b.c`` String, ...)`) and decoded in their declared type.
+- **Dynamic paths** are discovered at runtime and each decoded as a `Dynamic` column (§3.4.6).
+
+In FLATTENED mode there is **no shared-data column** (that overflow store belongs to the non-flat V2/V3 Object encodings). Every path is a full column of `num_rows` values.
+
+**Wire layout (version 3, FLATTENED):**
+
+```
+[8 bytes:  UInt64 LE version = 3]                  ← state prefix, once per column per query
+[VarUInt num_dynamic_paths]
+[num_dynamic_paths × String]                       ← dynamic path names, in wire order
+[per typed path: its column's state prefix]        ← empty for leaf types
+[per dynamic path: a Dynamic state prefix]         ← §3.4.6 (version + type list)
+[per block with rows > 0]:
+  [for each typed path:   its column's data]       ← num_rows values in the declared type
+  [for each dynamic path: its Dynamic data]        ← num_rows values (§3.4.6 discriminators + runs)
+```
+
+Note the two-phase shape: **all** path state prefixes come first, then **all** path data. A dynamic path's `Dynamic` prefix (in the prefix phase) is therefore separated from its data (in the data phase).
+
+**Invariants.**
+
+1. State prefix read once per column per query, before the first block with rows > 0.
+2. Every path column (typed or dynamic) holds exactly `num_rows` values.
+
+**Reconstruction.** Row `r`'s object is assembled by reading each path's value at index `r`; a dynamic path whose `Dynamic` discriminator is NULL for that row contributes no key.
+
+**Byte-level example — `JSON` value `{"a": 1, "b": "hi"}` (one row, both paths dynamic):**
+
+```
+03 00 00 00 00 00 00 00      version = 3 (Object)
+02                           num_dynamic_paths = 2
+01 61                        path "a"
+01 62                        path "b"
+03 00 00 00 00 00 00 00 01 06 55 49 6E 74 36 34   "a" Dynamic prefix: version 3, 1 type, "UInt64"
+03 00 00 00 00 00 00 00 01 06 53 74 72 69 6E 67   "b" Dynamic prefix: version 3, 1 type, "String"
+00 2A 00 00 00 00 00 00 00   "a" data: discriminator 0, UInt64 42
+00 02 68 69                  "b" data: discriminator 0, String "hi"
+```
+
+#### 3.4.8 JSON non-flat (V2/V3) and Tier 3 — out of scope for this revision
+
+The non-flattened `Object` encodings (V2/V3, used by MergeTree on-disk storage and emitted over the protocol when the flattened flag is off) carry a shared-data column and per-variant statistics. The reference client always requests either Tier 1 (String) or the FLATTENED Tier 2 form above, so those encodings are not specified here.
 
 ---
 

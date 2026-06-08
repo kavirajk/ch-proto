@@ -264,6 +264,39 @@ pub enum ColumnData {
         /// One dense sub-column per runtime type, in wire order.
         columns: Vec<ColumnData>,
     },
+    /// `JSON` decoded in the FLATTENED Object serialization (Tier 2, version
+    /// 3). Distinct from [`Json`](Self::Json), which is the Tier 1 String
+    /// fallback the client requests by default.
+    ///
+    /// FLATTENED splits the object into per-path columns — there is no
+    /// shared-data overflow column (that's the non-flat V2/V3 format). Each
+    /// path holds `rows` values:
+    /// - **typed paths** are the paths declared in the type string
+    ///   (`JSON(a UInt32, ...)`), decoded in their declared type;
+    /// - **dynamic paths** are discovered at runtime and each decoded as a
+    ///   [`Dynamic`](Self::Dynamic) column.
+    ///
+    /// Wire format (NATIVE_FORMAT.md §3.4.7): state prefix `UInt64 version=3`,
+    /// `VarUInt num_dynamic_paths`, the dynamic path names, then each typed
+    /// path's state prefix (empty for leaf) and each dynamic path's `Dynamic`
+    /// prefix; per block, each typed column's data then each dynamic column's
+    /// data. Only emitted when the client does **not** request the Tier 1
+    /// String fallback (`output_format_native_write_json_as_string = 0`).
+    ///
+    /// KNOWN LIMITATION (best-effort): single data block; typed paths must be
+    /// leaf types; dynamic paths use the leaf-only [`Dynamic`](Self::Dynamic)
+    /// decoder. TSV rendering is a best-effort flat JSON object, not
+    /// guaranteed byte-identical to ClickHouse's JSON text output.
+    JsonObject {
+        /// Row count (paths may all be empty yet the column still has rows).
+        rows: usize,
+        /// `(path, column)` for each declared typed path; each column has
+        /// `rows` values.
+        typed_paths: Vec<(String, ColumnData)>,
+        /// `(path, Dynamic column)` for each runtime-discovered path; each
+        /// column has `rows` values.
+        dynamic_paths: Vec<(String, ColumnData)>,
+    },
 }
 
 /// `Variant` discriminator marking a NULL row — mirrors
@@ -282,6 +315,13 @@ const VARIANT_DISCRIMINATORS_MODE_BASIC: u64 = 0;
 /// newer than 25.6). The other versions (`V1=1`, `V2=2`, `V3=4`) are the
 /// MergeTree on-disk formats and are not emitted to us.
 const DYNAMIC_VERSION_FLATTENED: u64 = 3;
+
+/// `JSON` serialization versions written as the `UInt64` state prefix.
+/// `1` = the Tier 1 String fallback (`output_format_native_write_json_as_string`);
+/// `3` = the FLATTENED Object format (Tier 2). Mirrors
+/// `JSONStringSerializationVersion` / `JSONObjectSerializationVersion`.
+const JSON_VERSION_STRING: u64 = 1;
+const JSON_VERSION_OBJECT: u64 = 3;
 
 /// Width (in bytes) of a `Dynamic` discriminator given the runtime type
 /// count. Matches `getSmallestIndexesType(num_types + 1)` — the smallest
@@ -904,6 +944,7 @@ impl ColumnData {
             ColumnData::Nothing(rows) => *rows,
             ColumnData::Variant { discriminators, .. } => discriminators.len(),
             ColumnData::Dynamic { discriminators, .. } => discriminators.len(),
+            ColumnData::JsonObject { rows, .. } => *rows,
         }
     }
 
@@ -1225,6 +1266,26 @@ impl ColumnData {
                 }
                 Ok(())
             }
+            ColumnData::JsonObject {
+                rows,
+                typed_paths,
+                dynamic_paths,
+            } => {
+                // Every path column carries exactly `rows` values.
+                for (path, col) in typed_paths.iter().chain(dynamic_paths.iter()) {
+                    if col.row_count() != *rows {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "JsonObject invariant broken: path '{path}' has {} rows but column has {rows}",
+                                col.row_count()
+                            ),
+                        ));
+                    }
+                    col.validate()?;
+                }
+                Ok(())
+            }
             // Flat types: self-consistent by construction.
             _ => Ok(()),
         }
@@ -1519,6 +1580,17 @@ impl ColumnData {
                     }
                 }
             }
+            ColumnData::JsonObject { .. } => {
+                // Decode-only: FLATTENED JSON encoding would require writing
+                // the dynamic paths' Dynamic prefixes and data in separate
+                // phases, which the round-trip path doesn't model. INSERT of
+                // Tier 2 JSON is out of scope (clients can INSERT JSON as text
+                // via the Tier 1 String shape).
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "encoding JSON Tier 2 (FLATTENED Object) columns is not supported (decode-only)",
+                ));
+            }
         }
         Ok(())
     }
@@ -1794,41 +1866,7 @@ impl ColumnData {
                     key_width,
                 })
             }
-            "JSON" => {
-                // JSON Tier 1 (String fallback). The client auto-injects
-                // `output_format_native_write_json_as_string=1`; the server
-                // then emits an `Int64 LE = 1` state prefix followed by a
-                // String column.
-                //
-                // KNOWN LIMITATION: the state prefix is per-column-per-query
-                // (not per-block) and the server only emits it before the
-                // first block with rows > 0. The header block (rows = 0) and
-                // any subsequent blocks contain only the String values, no
-                // prefix. We approximate with `rows == 0 → no prefix`, which
-                // covers single-data-block queries (the common case) and the
-                // header block correctly. Multi-block JSON queries are not
-                // yet supported — see SPEC §8.4.
-                if rows == 0 {
-                    return Ok(ColumnData::Json(Vec::new()));
-                }
-                let version = r.read_i64()?;
-                if version != 1 {
-                    return Err(Error::new(
-                        ErrorKind::Unsupported,
-                        format!(
-                            "JSON serialization version {version} not supported \
-                             (this client only handles version 1, the String fallback). \
-                             Ensure `output_format_native_write_json_as_string=1` is set \
-                             on the query — the client should inject it automatically."
-                        ),
-                    ));
-                }
-                let mut v = Vec::with_capacity(rows);
-                for _ in 0..rows {
-                    v.push(r.read_string()?);
-                }
-                Ok(ColumnData::Json(v))
-            }
+            "JSON" => decode_json(r, data_type, rows),
             "Variant" => decode_variant(r, data_type, rows),
             "Dynamic" => decode_dynamic(r, rows),
             "Int32" => {
@@ -2121,8 +2159,25 @@ fn decode_dynamic(r: &mut impl ProtoRead, rows: usize) -> Result<ColumnData> {
             columns: Vec::new(),
         });
     }
+    // A top-level Dynamic emits its prefix immediately before its data, so we
+    // read both in sequence. (When a Dynamic is nested inside a JSON column,
+    // its prefix and data are in separate phases — see `decode_dynamic_prefix`
+    // / `decode_dynamic_data`.)
+    let prefix = decode_dynamic_prefix(r)?;
+    decode_dynamic_data(r, &prefix, rows)
+}
 
-    // State prefix: UInt64 version.
+/// The runtime type list carried in a `Dynamic` column's state prefix.
+struct DynamicPrefix {
+    type_names: Vec<String>,
+}
+
+/// Read a `Dynamic` FLATTENED state prefix: `UInt64 version = 3`, then
+/// `VarUInt num_types`, then `num_types` type-name strings. Leaf runtime
+/// types (and the integer indexes type) have empty per-element prefixes, so
+/// nothing more is read; stateful runtime types are rejected because this
+/// flat decoder can't route their nested prefixes.
+fn decode_dynamic_prefix(r: &mut impl ProtoRead) -> Result<DynamicPrefix> {
     let version = r.read_u64()?;
     if version != DYNAMIC_VERSION_FLATTENED {
         return Err(Error::new(
@@ -2132,18 +2187,11 @@ fn decode_dynamic(r: &mut impl ProtoRead, rows: usize) -> Result<ColumnData> {
             ),
         ));
     }
-
-    // VarUInt num_types, then that many type-name strings.
     let num_types = r.read_varuint()? as usize;
     let mut type_names = Vec::with_capacity(num_types);
     for _ in 0..num_types {
         type_names.push(r.read_string()?);
     }
-
-    // Runtime types that are themselves stateful would emit a nested state
-    // prefix this flat decoder can't route — reject up front. (Leaf types
-    // and the integer indexes type have empty prefixes, so there are no more
-    // prefix bytes to read here.)
     for t in &type_names {
         if is_stateful_type(t) {
             return Err(Error::new(
@@ -2155,9 +2203,19 @@ fn decode_dynamic(r: &mut impl ProtoRead, rows: usize) -> Result<ColumnData> {
             ));
         }
     }
+    Ok(DynamicPrefix { type_names })
+}
 
-    // Data: discriminators at the width chosen by the type count. The NULL
-    // discriminator is `num_types` (one past the last type).
+/// Read a `Dynamic` column's per-block data given a previously-read prefix:
+/// `rows` discriminators (width chosen by the type count, NULL = `num_types`),
+/// then each runtime type's values densely.
+fn decode_dynamic_data(
+    r: &mut impl ProtoRead,
+    prefix: &DynamicPrefix,
+    rows: usize,
+) -> Result<ColumnData> {
+    let type_names = &prefix.type_names;
+    let num_types = type_names.len();
     let width = dynamic_discriminator_width(num_types);
     let null_discr = num_types as u64;
     let mut discriminators = Vec::with_capacity(rows);
@@ -2184,18 +2242,175 @@ fn decode_dynamic(r: &mut impl ProtoRead, rows: usize) -> Result<ColumnData> {
         discriminators.push(d);
     }
 
-    // Each runtime type's values densely, in wire order.
     let mut columns = Vec::with_capacity(num_types);
     for (i, t) in type_names.iter().enumerate() {
         columns.push(ColumnData::decode(r, t, counts[i])?);
     }
 
     Ok(ColumnData::Dynamic {
-        type_names,
+        type_names: type_names.clone(),
         discriminators,
         offsets,
         columns,
     })
+}
+
+/// Decode a `JSON` column, dispatching on the serialization version in the
+/// state prefix: `1` = Tier 1 String fallback (the client's default, see
+/// [`ColumnData::Json`]); `3` = FLATTENED Object (Tier 2, see
+/// [`ColumnData::JsonObject`]). The single-data-block convention matches the
+/// other versioned types: the prefix is read only when `rows > 0`.
+fn decode_json(r: &mut impl ProtoRead, data_type: &str, rows: usize) -> Result<ColumnData> {
+    // Header block: tier-agnostic empty column (no prefix on the wire).
+    if rows == 0 {
+        return Ok(ColumnData::Json(Vec::new()));
+    }
+    let version = r.read_u64()?;
+    match version {
+        JSON_VERSION_STRING => {
+            // Tier 1: a plain String column of JSON text.
+            let mut v = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                v.push(r.read_string()?);
+            }
+            Ok(ColumnData::Json(v))
+        }
+        JSON_VERSION_OBJECT => decode_json_object(r, data_type, rows),
+        other => Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "JSON serialization version {other} not supported (only 1 = String fallback, \
+                 3 = FLATTENED Object). For Tier 1 ensure \
+                 `output_format_native_write_json_as_string=1`; for Tier 2 ensure \
+                 `output_format_native_use_flattened_dynamic_and_json_serialization=1`."
+            ),
+        )),
+    }
+}
+
+/// Decode a FLATTENED `JSON` Object column (version 3). The `UInt64` version
+/// has already been read by [`decode_json`]. See [`ColumnData::JsonObject`]
+/// and NATIVE_FORMAT.md §3.4.7.
+fn decode_json_object(r: &mut impl ProtoRead, data_type: &str, rows: usize) -> Result<ColumnData> {
+    let typed = parse_json_typed_paths(data_type)?;
+    // Typed paths whose serialization is stateful would carry a nested state
+    // prefix this flat decoder can't route — reject up front.
+    for (path, t) in &typed {
+        if is_stateful_type(t) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "JSON typed path '{path}' has stateful type '{t}'; nested state prefixes \
+                     inside JSON are not yet supported"
+                ),
+            ));
+        }
+    }
+
+    // --- State-prefix phase ---
+    // VarUInt num_dynamic_paths, then the dynamic path names.
+    let num_dynamic = r.read_varuint()? as usize;
+    let mut dynamic_names = Vec::with_capacity(num_dynamic);
+    for _ in 0..num_dynamic {
+        dynamic_names.push(r.read_string()?);
+    }
+    // Typed paths' state prefixes come next on the wire; for leaf types
+    // (the only kind we accept) they are empty, so nothing to read.
+    // Then each dynamic path's Dynamic state prefix.
+    let mut dynamic_prefixes = Vec::with_capacity(num_dynamic);
+    for _ in 0..num_dynamic {
+        dynamic_prefixes.push(decode_dynamic_prefix(r)?);
+    }
+
+    // --- Data phase ---
+    // Each typed path's column (rows values), in declared order.
+    let mut typed_paths = Vec::with_capacity(typed.len());
+    for (path, t) in &typed {
+        typed_paths.push((path.clone(), ColumnData::decode(r, t, rows)?));
+    }
+    // Each dynamic path's Dynamic column (rows values), in wire order.
+    let mut dynamic_paths = Vec::with_capacity(num_dynamic);
+    for (name, prefix) in dynamic_names.into_iter().zip(dynamic_prefixes.iter()) {
+        dynamic_paths.push((name, decode_dynamic_data(r, prefix, rows)?));
+    }
+
+    Ok(ColumnData::JsonObject {
+        rows,
+        typed_paths,
+        dynamic_paths,
+    })
+}
+
+/// Parse the typed-path declarations from a `JSON(...)` type string into
+/// `(path, type)` pairs. Plain `JSON` has none. Parameters
+/// (`max_dynamic_paths=`, `max_dynamic_types=`, `SKIP ...`) are ignored.
+/// Backtick-quoted path names are unquoted. Mirrors clickhouse-go's JSON
+/// `parse`.
+fn parse_json_typed_paths(data_type: &str) -> Result<Vec<(String, String)>> {
+    let trimmed = data_type.trim();
+    if trimmed == "JSON" {
+        return Ok(Vec::new());
+    }
+    let inner = match parse_composite_inner_type(trimmed) {
+        Ok(s) => s,
+        // `JSON` with no parens already handled; anything else without parens
+        // is treated as no typed paths.
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for part in split_json_paths(&inner) {
+        let part = part.trim();
+        if part.is_empty()
+            || part.starts_with("max_dynamic_paths=")
+            || part.starts_with("max_dynamic_types=")
+            || part.starts_with("SKIP")
+        {
+            continue;
+        }
+        // A typed path is `name Type` (name may be backtick-quoted). Split on
+        // the first whitespace; the type may itself contain spaces.
+        let Some(ws) = part.find(char::is_whitespace) else {
+            continue;
+        };
+        let path = part[..ws].trim().trim_matches('`').to_string();
+        let type_name = part[ws..].trim().to_string();
+        out.push((path, type_name));
+    }
+    Ok(out)
+}
+
+/// Split a `JSON(...)` parameter list at top-level commas, respecting nested
+/// brackets and backtick-quoted identifiers (which may contain commas).
+fn split_json_paths(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_backticks = false;
+    for ch in inner.chars() {
+        match ch {
+            '`' => {
+                in_backticks = !in_backticks;
+                cur.push(ch);
+            }
+            '(' if !in_backticks => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' if !in_backticks => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if !in_backticks && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    parts
 }
 
 /// Whether a type's serialization carries a per-column state prefix — i.e. it
@@ -3073,6 +3288,116 @@ mod tests {
         body.extend(b"LowCardinality(String)");
         let mut cursor = Cursor::new(body.as_slice());
         let err = decode_dynamic(&mut cursor, 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    // -- JSON Tier 2 (FLATTENED Object) (Problem 41 / NATIVE_FORMAT.md §3.4.7) --
+
+    #[test]
+    fn test_parse_json_typed_paths() {
+        assert_eq!(parse_json_typed_paths("JSON").unwrap(), Vec::new());
+        assert_eq!(
+            parse_json_typed_paths("JSON(a UInt32, `b.c` String, max_dynamic_paths=16, SKIP d)")
+                .unwrap(),
+            vec![
+                ("a".to_string(), "UInt32".to_string()),
+                ("b.c".to_string(), "String".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_tier2_decode_raw_wire() {
+        // FLATTENED JSON (version 3), plain `JSON` (no typed paths), with two
+        // dynamic paths: a = UInt64 42, b = String "hi", one row.
+        let mut body = Vec::new();
+        body.extend(3u64.to_le_bytes()); // JSON version = 3 (Object)
+        body.extend(varuint_bytes(2)); // num dynamic paths
+        body.extend(varuint_bytes(1));
+        body.extend(b"a");
+        body.extend(varuint_bytes(1));
+        body.extend(b"b");
+        // dynamic prefixes: a -> Dynamic[UInt64], b -> Dynamic[String]
+        body.extend(3u64.to_le_bytes());
+        body.extend(varuint_bytes(1));
+        body.extend(varuint_bytes(6));
+        body.extend(b"UInt64");
+        body.extend(3u64.to_le_bytes());
+        body.extend(varuint_bytes(1));
+        body.extend(varuint_bytes(6));
+        body.extend(b"String");
+        // data: a discriminators [0] + UInt64 42; b discriminators [0] + "hi"
+        body.push(0);
+        body.extend(42u64.to_le_bytes());
+        body.push(0);
+        body.extend(varuint_bytes(2));
+        body.extend(b"hi");
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_json(&mut cursor, "JSON", 1).unwrap();
+        assert_eq!(cursor.position() as usize, body.len());
+        match data {
+            ColumnData::JsonObject {
+                rows,
+                typed_paths,
+                dynamic_paths,
+            } => {
+                assert_eq!(rows, 1);
+                assert!(typed_paths.is_empty());
+                assert_eq!(dynamic_paths.len(), 2);
+                assert_eq!(dynamic_paths[0].0, "a");
+                assert_eq!(dynamic_paths[1].0, "b");
+                match &dynamic_paths[0].1 {
+                    ColumnData::Dynamic {
+                        type_names,
+                        discriminators,
+                        columns,
+                        ..
+                    } => {
+                        assert_eq!(type_names, &vec!["UInt64".to_string()]);
+                        assert_eq!(discriminators, &vec![0]);
+                        match &columns[0] {
+                            ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64]),
+                            other => panic!("expected UInt64, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Dynamic at a, got {other:?}"),
+                }
+            }
+            other => panic!("expected JsonObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_json_tier1_still_default_path() {
+        // version 1 still decodes to the Tier 1 String column.
+        let mut body = Vec::new();
+        body.extend(1u64.to_le_bytes());
+        body.extend(varuint_bytes(2));
+        body.extend(b"{}");
+        let mut cursor = Cursor::new(body.as_slice());
+        match decode_json(&mut cursor, "JSON", 1).unwrap() {
+            ColumnData::Json(v) => assert_eq!(v, vec!["{}".to_string()]),
+            other => panic!("expected Json (Tier 1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_json_rejects_unknown_version() {
+        let mut body = Vec::new();
+        body.extend(99u64.to_le_bytes());
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_json(&mut cursor, "JSON", 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_json_tier2_rejects_stateful_typed_path() {
+        let mut body = Vec::new();
+        body.extend(3u64.to_le_bytes());
+        let mut cursor = Cursor::new(body.as_slice());
+        let err =
+            decode_json(&mut cursor, "JSON(a LowCardinality(String))", 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unsupported);
     }
 
