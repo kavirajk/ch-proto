@@ -31,7 +31,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 5     | Basic data types                             | 20–24  | ✅ |
 | 6     | Composite types (Nullable / Array / Tuple / Map / Nested) | 25–29 | ✅ |
 | 7     | More fixed-width and parameterized types     | 30–36  | ✅ |
-| 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 done; Variant / Dynamic / JSON Tier 2 deferred) |
+| 8     | Versioned / stateful types                   | 37–41  | ⚠️ (LowCardinality + JSON Tier 1 + Variant BASIC done; Dynamic / JSON Tier 2 deferred) |
 | 9     | Compression                                  | 42–43  | ⚠️ (frame primitives done; connection-level integration pending) |
 | 10    | INSERT path                                  | 44–45  | ✅ |
 | 11    | Bring spec up to server v54483               | 46–65  | ✅ |
@@ -39,7 +39,7 @@ Status legend: ✅ complete · ⚠️ partial · ⏳ pending · ❌ deferred
 | 13    | Spec completion                              | 70–73  | ✅ (chunked protocol spec'd in §4.1) |
 | 14    | Post-54483 protocol catch-up                 | 74–    | ⏳ (Problem 74 v54484 done) |
 
-**Test coverage at the time of writing:** 312 unit tests + 91 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
+**Test coverage at the time of writing:** 320 unit tests + 93 integration tests, all passing. Declared client protocol is now **54484** (`PROGRESS_IN_ASYNC_INSERT`, the current server target — upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484).
 
 Differential harness against ClickHouse's `tests/queries/0_stateless` corpus, via the `ch-tsv` wrapper binary, parallel-8 execution (`make test-differential-full`):
 
@@ -558,7 +558,7 @@ Straight-up 16 or 32 byte little-endian two's-complement integers.
 
 ### Phase 8: Versioned/stateful types — §8.4 ⚠️
 
-Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state. **Status:** LowCardinality (single-block) and JSON Tier 1 (String fallback) implemented; Variant, Dynamic, and JSON Tier 2/3 deferred — see §8.4.5 of `NATIVE_FORMAT.md` for the rationale.
+Implementation effort jumps significantly here. Each of these types has a serialization-version prefix and may maintain cross-block state. **Status:** LowCardinality (single-block), JSON Tier 1 (String fallback), and Variant (BASIC discriminators mode) implemented; Dynamic and JSON Tier 2/3 deferred — see §3.4.6 of `NATIVE_FORMAT.md` for the rationale.
 
 #### Problem 37: `LowCardinality(T)` — simplest of the versioned types ⚠️ (single-block; multi-block pending)
 
@@ -580,25 +580,25 @@ Implementation effort jumps significantly here. Each of these types has a serial
 
 ---
 
-#### Problem 38: `Variant(T1, T2, ...)` ❌ Deferred
+#### Problem 38: `Variant(T1, T2, ...)` ✅ (BASIC mode)
 
-**Wire format:**
-- State prefix: `UInt64 LE` discriminators mode (0=BASIC, 1=COMPACT).
-- Per block:
-  - BASIC: `num_rows × UInt8` discriminators; then each sub-column's values.
-  - COMPACT: per-granule marker + optimized encoding.
-- `NULL_DISCRIMINATOR = 255`.
+**Wire format (BASIC discriminators mode — the server's native-protocol default, `use_compact_variant_discriminators_serialization = false`):**
+- State prefix (once per column, at the first block with rows > 0): `UInt64 LE` discriminators mode (0 = BASIC), then each variant element's own state prefix (empty for leaf types).
+- Per block: `num_rows × UInt8` global discriminators (`255` = NULL), then each variant type's values densely in declared order — count = #rows whose discriminator selects it.
+- The server canonicalises (sorts) the variant type order, so the discriminator is the index into the type list as written in the received type string.
 
-**Implementation:**
-- Parse type string to get variant type list.
-- Decode discriminators, dispatch each row to the right sub-column.
+**Implementation:** `ColumnData::Variant { discriminators, offsets, columns }` in `src/proto/column.rs`. `decode_variant` reads the mode prefix, the per-row discriminators (computing per-type counts + per-row offsets in one pass), then each element's dense run via `ColumnData::decode`. `parse_variant_inner_types` splits the type list (no name-stripping — Variant elements are unnamed). `encode` mirrors it for round-trips. `tsv.rs` renders the active sub-column's value, `\N` for the NULL discriminator.
 
-**Spec work:** §8.4 subsection with BASIC mode example first.
+**Deferred:** COMPACT discriminators mode (rejected with a clear error — server doesn't emit it over native by default); variant elements that are themselves stateful (`LowCardinality`/`Variant`/`Dynamic`/`JSON`) — they'd carry a nested state prefix the flat decoder doesn't route, rejected via `is_stateful_type`. Single-data-block convention, same as LowCardinality/JSON.
+
+**Spec work done:** `NATIVE_FORMAT.md` §3.4.5 (full BASIC wire format + byte-level example); §3.4.6 demoted to Dynamic + JSON Tier 2/3 only.
+
+**Tests:** 8 unit (raw-wire decode matching the spec example, Column round-trip, header/zero-rows, all-NULL, reject COMPACT, reject stateful element, reject bad discriminator, parse type list) + 2 integration (`test_variant_select` mixed String/UInt64/NULL; `test_variant_with_array_element_and_offsets` composite element + repeated discriminators). 320 unit + 93 integration pass.
 
 **References:**
-- ClickHouse: `src/DataTypes/DataTypeVariant.cpp`, `src/DataTypes/Serializations/SerializationVariant.h`, `SerializationVariant.cpp`, `SerializationVariantElement.cpp`
-- clickhouse-go: `lib/column/variant.go`
-- ch-go: no direct implementation (ch-go predates Variant)
+- ClickHouse: `src/DataTypes/Serializations/SerializationVariant.cpp` (state prefix `:180`, BASIC bulk deserialize `:556`); `use_compact_variant_discriminators_serialization` default `false` at `ISerialization.h:389`.
+- clickhouse-go: `lib/column/variant.go` (`ReadStatePrefix`/`Decode` — the practical wire reference).
+- ch-go: no direct implementation (ch-go predates Variant).
 
 ---
 
@@ -1146,7 +1146,7 @@ Done as part of Phase 6. `NATIVE_FORMAT.md` §3.3 covers Nullable, Array, Tuple,
 
 #### Problem 71: Fill versioned types section ⚠️
 
-Done in part. `NATIVE_FORMAT.md` §3.4 covers LowCardinality and JSON Tier 1 with byte-level examples; Variant, Dynamic, JSON Tier 2/3 documented as "out of scope for this revision" (§3.4.5) with rationale, pending Problems 38–41.
+Done in part. `NATIVE_FORMAT.md` §3.4 covers LowCardinality, JSON Tier 1, and Variant (BASIC mode) with byte-level examples; Dynamic and JSON Tier 2/3 documented as "out of scope for this revision" (§3.4.6) with rationale, pending Problems 39–41.
 
 ---
 

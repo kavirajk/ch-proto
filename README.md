@@ -169,7 +169,7 @@ The two tracks below are signposts into the existing spec, not a re-explanation.
 | Wire primitives, Block & Column structure | `NATIVE_FORMAT.md` §1–§2 | ✅ Complete |
 | Connection lifecycle (Hello, Ping, Query, INSERT) | `NATIVE_PROTOCOL.md` §5 | ✅ Complete |
 | Fixed-width + variable-length + composite types | `NATIVE_FORMAT.md` §3.1–§3.3 | ✅ Complete |
-| Versioned / stateful types | `NATIVE_FORMAT.md` §3.4 | ⚠️ LowCardinality + JSON Tier 1 spec'd; Variant, Dynamic, JSON Tier 2/3 deferred (rationale in §3.4.5) |
+| Versioned / stateful types | `NATIVE_FORMAT.md` §3.4 | ⚠️ LowCardinality + JSON Tier 1 + Variant (BASIC) spec'd; Dynamic, JSON Tier 2/3 deferred (rationale in §3.4.6) |
 | Compression frame | `NATIVE_FORMAT.md` §4 | ✅ Frame format spec'd; client-side connection integration pending |
 | v54461–v54483 feature additions | `NATIVE_PROTOCOL.md` §3.3 + various | ✅ Complete — feature table extends to v54482; v54483 (nullable sparse) in `NATIVE_FORMAT.md` §2.3.1. See [`DESIGN.md`](DESIGN.md) Phase 11 (Problems 46–65) |
 | Chunked protocol (v54470) | `NATIVE_PROTOCOL.md` §4.1 | ✅ Spec'd (framing + negotiation) and fully implemented |
@@ -205,13 +205,13 @@ cargo run --example events
 
 The spec and client now declare protocol version **`54484`** — the current server target (`PROGRESS_IN_ASYNC_INSERT`; upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484). The v54461 → v54484 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54484; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place.
 
-**Test coverage:** 312 unit + 91 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)**. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
+**Test coverage:** 320 unit + 93 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)**. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
 
 What's left:
 
 ### Native format — versioned types (`NATIVE_FORMAT.md` §3.4), Phase 8 ⚠️
 
-- [ ] **`Variant(T1, T2, …)`** — BASIC + COMPACT discriminator modes, sub-column dispatch
+- [x] **`Variant(T1, T2, …)`** — BASIC discriminator mode + sub-column dispatch (COMPACT mode and stateful elements deferred)
 - [ ] **`Dynamic`** — version prefix, runtime-discovered type list, cross-block growth (depends on Variant)
 - [ ] **`JSON` Tier 2** (FLATTENED mode) — path list + per-path Dynamic + shared-data column (depends on LowCardinality + Variant + Dynamic)
 

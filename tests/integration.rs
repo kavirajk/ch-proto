@@ -1955,3 +1955,104 @@ fn test_insert_async_reports_progress() {
         },
     );
 }
+
+// -- Variant(T1, T2, ...) (Problem 38) --
+
+#[test]
+fn test_variant_select() {
+    // arrayJoin over a 3-element array yields one block of 3 rows in array
+    // order: 42 (UInt64), "hi" (String), NULL. The server canonicalises the
+    // type to Variant(String, UInt64), so String = discriminator 0,
+    // UInt64 = 1, NULL = 255.
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                CAST(42::UInt64, 'Variant(String, UInt64)'), \
+                CAST('hi'::String, 'Variant(String, UInt64)'), \
+                CAST(NULL, 'Variant(String, UInt64)')]) AS v",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    let col = &result.rows[0].columns[0];
+    assert!(
+        col.data_type.starts_with("Variant"),
+        "expected a Variant column, got type {}",
+        col.data_type
+    );
+    match &col.data {
+        ColumnData::Variant {
+            discriminators,
+            columns,
+            ..
+        } => {
+            assert_eq!(discriminators, &vec![1u8, 0, 255]);
+            match &columns[0] {
+                ColumnData::String(v) => assert_eq!(v, &vec!["hi".to_string()]),
+                other => panic!("expected String run, got {other:?}"),
+            }
+            match &columns[1] {
+                ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64]),
+                other => panic!("expected UInt64 run, got {other:?}"),
+            }
+        }
+        other => panic!("expected Variant, got {other:?}"),
+    }
+
+    // End-to-end TSV rendering: active value per row, \N for NULL.
+    let mut out = Vec::new();
+    for row in 0..col.data.row_count() {
+        ch_proto::tsv::write_value(&mut out, &col.data, row).unwrap();
+        out.push(b'\n');
+    }
+    assert_eq!(String::from_utf8(out).unwrap(), "42\nhi\n\\N\n");
+}
+
+#[test]
+fn test_variant_with_array_element_and_offsets() {
+    // A composite variant element (Array) plus a repeated discriminator,
+    // exercising the dense per-type reconstruction and offsets. Canonical
+    // order sorts "Array(UInt8)" before "String": Array = 0, String = 1.
+    // Rows: [1,2,3] (Array), "x" (String), [9] (Array) → discriminators
+    // [0, 1, 0], Array run [[1,2,3],[9]], offsets [0, 0, 1].
+    require_server();
+    let mut conn = Connection::connect(ADDR, None, None, None).unwrap();
+    let result = conn
+        .query(
+            "SELECT arrayJoin([\
+                CAST([1,2,3]::Array(UInt8), 'Variant(Array(UInt8), String)'), \
+                CAST('x'::String, 'Variant(Array(UInt8), String)'), \
+                CAST([9]::Array(UInt8), 'Variant(Array(UInt8), String)')]) AS v",
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    match &result.rows[0].columns[0].data {
+        ColumnData::Variant {
+            discriminators,
+            offsets,
+            columns,
+        } => {
+            assert_eq!(discriminators, &vec![0u8, 1, 0]);
+            assert_eq!(offsets, &vec![0u64, 0, 1]);
+            // columns[0] is Array(UInt8) holding two arrays: [1,2,3] and [9].
+            match &columns[0] {
+                ColumnData::Array { inner, offsets } => {
+                    assert_eq!(offsets, &vec![3u64, 4]);
+                    match inner.as_ref() {
+                        ColumnData::Uint8(v) => assert_eq!(v, &vec![1u8, 2, 3, 9]),
+                        other => panic!("expected UInt8 array inner, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Array run, got {other:?}"),
+            }
+            match &columns[1] {
+                ColumnData::String(v) => assert_eq!(v, &vec!["x".to_string()]),
+                other => panic!("expected String run, got {other:?}"),
+            }
+        }
+        other => panic!("expected Variant, got {other:?}"),
+    }
+}

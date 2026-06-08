@@ -9,7 +9,7 @@
 // and form-feed are escaped with a leading backslash. NULL in Nullable
 // values renders as the literal two bytes `\N`.
 
-use crate::proto::column::{Column, ColumnData};
+use crate::proto::column::{Column, ColumnData, NULL_DISCRIMINATOR};
 use std::io::{self, Write};
 
 pub fn write_row<W: Write>(w: &mut W, columns: &[Column], row: usize) -> io::Result<()> {
@@ -112,6 +112,21 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
                 w.write_all(b"\\N")
             } else {
                 write_value(w, inner, row)
+            }
+        }
+        ColumnData::Variant {
+            discriminators,
+            offsets,
+            columns,
+        } => {
+            // A Variant row renders as its active sub-column's value, or \N
+            // for the NULL discriminator. The selected sub-column is dense,
+            // so we index it by the precomputed per-row offset.
+            let d = discriminators[row];
+            if d == NULL_DISCRIMINATOR {
+                w.write_all(b"\\N")
+            } else {
+                write_value(w, &columns[d as usize], offsets[row] as usize)
             }
         }
         other => Err(io::Error::new(
@@ -491,6 +506,7 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Map { .. } => "Map",
         ColumnData::Nested { .. } => "Nested",
         ColumnData::Nothing(_) => "Nothing",
+        ColumnData::Variant { .. } => "Variant",
     }
 }
 

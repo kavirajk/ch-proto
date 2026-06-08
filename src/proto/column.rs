@@ -194,7 +194,51 @@ pub enum ColumnData {
     /// without inspecting them. We follow the deserializer: read `rows` bytes
     /// and ignore them, store only the row count.
     Nothing(usize),
+    /// `Variant(T1, T2, ...)` — a discriminated union. Each row holds a value
+    /// of one of the variant types, or NULL.
+    ///
+    /// Wire format (BASIC discriminators mode — the only mode the server
+    /// emits over the native protocol by default,
+    /// `use_compact_variant_discriminators_serialization = false`):
+    /// - State prefix (once per column, at the first block with rows > 0):
+    ///   `UInt64 LE` discriminators mode (`0` = BASIC), followed by each
+    ///   variant element's own state prefix (empty for leaf types).
+    /// - Per block: `num_rows × UInt8` global discriminators (`255` = NULL),
+    ///   then each variant type's values densely, in declared order, with a
+    ///   count equal to the number of rows whose discriminator selects it.
+    ///
+    /// The server canonicalises the type order, so the discriminator is the
+    /// index into the type list as written in the type string. See
+    /// NATIVE_FORMAT.md §3.4.5.
+    ///
+    /// KNOWN LIMITATION: single data block per column (like LowCardinality /
+    /// JSON), and variant elements that are themselves stateful
+    /// (LowCardinality / Variant / Dynamic / JSON) are rejected — they would
+    /// carry a nested state prefix this flat decoder doesn't route.
+    Variant {
+        /// Per-row global discriminator; index into `columns`, or
+        /// [`NULL_DISCRIMINATOR`] (255) for a NULL row.
+        discriminators: Vec<u8>,
+        /// Per-row index into `columns[discriminators[r]]`. Unused (0) for
+        /// NULL rows. Derivable from `discriminators` but stored for O(1)
+        /// row access and clean round-trips.
+        offsets: Vec<u64>,
+        /// One dense sub-column per variant type, in global-discriminator
+        /// order. `columns[i]` holds exactly the values for rows whose
+        /// discriminator is `i`.
+        columns: Vec<ColumnData>,
+    },
 }
+
+/// `Variant` discriminator marking a NULL row — mirrors
+/// `ColumnVariant::NULL_DISCRIMINATOR` in ClickHouse.
+pub const NULL_DISCRIMINATOR: u8 = 255;
+
+/// `Variant` discriminators serialization mode written as the `UInt64` state
+/// prefix. `0` = BASIC (every row's discriminator literal), `1` = COMPACT
+/// (run-length granule encoding). We only handle BASIC, the native-protocol
+/// default. Mirrors `SerializationVariant::DiscriminatorsSerializationMode`.
+const VARIANT_DISCRIMINATORS_MODE_BASIC: u64 = 0;
 
 impl Column {
     pub fn encode(&self, w: &mut impl ProtoWrite, protocol: u32) -> Result<()> {
@@ -800,6 +844,7 @@ impl ColumnData {
             ColumnData::Json(v) => v.len(),
             ColumnData::LowCardinality { keys, .. } => keys.len(),
             ColumnData::Nothing(rows) => *rows,
+            ColumnData::Variant { discriminators, .. } => discriminators.len(),
         }
     }
 
@@ -1012,6 +1057,56 @@ impl ColumnData {
                     }
                 }
                 dict.validate()
+            }
+            ColumnData::Variant {
+                discriminators,
+                offsets,
+                columns,
+            } => {
+                if offsets.len() != discriminators.len() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "Variant invariant broken: offsets.len()={} != discriminators.len()={}",
+                            offsets.len(),
+                            discriminators.len()
+                        ),
+                    ));
+                }
+                // Each non-NULL discriminator must index a real sub-column,
+                // and each sub-column must hold exactly as many values as the
+                // number of rows selecting it.
+                let mut counts = vec![0usize; columns.len()];
+                for &d in discriminators {
+                    if d == NULL_DISCRIMINATOR {
+                        continue;
+                    }
+                    let di = d as usize;
+                    if di >= columns.len() {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Variant discriminator {di} >= variant count {}",
+                                columns.len()
+                            ),
+                        ));
+                    }
+                    counts[di] += 1;
+                }
+                for (i, col) in columns.iter().enumerate() {
+                    if col.row_count() != counts[i] {
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "Variant invariant broken: column {i} has {} rows but {} discriminators select it",
+                                col.row_count(),
+                                counts[i]
+                            ),
+                        ));
+                    }
+                    col.validate()?;
+                }
+                Ok(())
             }
             // Flat types: self-consistent by construction.
             _ => Ok(()),
@@ -1252,6 +1347,27 @@ impl ColumnData {
                 // bytes round-trip identically.
                 for _ in 0..*rows {
                     w.write_u8(b'0')?;
+                }
+            }
+            ColumnData::Variant {
+                discriminators,
+                columns,
+                ..
+            } => {
+                // Skip everything for an empty column (header block) — matches
+                // the server emitting no state prefix or data for 0 rows.
+                if !discriminators.is_empty() {
+                    // State prefix: UInt64 discriminators mode = BASIC.
+                    // (Leaf variant elements have empty per-element prefixes.)
+                    w.write_u64(VARIANT_DISCRIMINATORS_MODE_BASIC)?;
+                    // Discriminators: one byte per row.
+                    for &d in discriminators {
+                        w.write_u8(d)?;
+                    }
+                    // Each variant type's values densely, in declared order.
+                    for col in columns {
+                        col.encode(w)?;
+                    }
                 }
             }
         }
@@ -1564,6 +1680,7 @@ impl ColumnData {
                 }
                 Ok(ColumnData::Json(v))
             }
+            "Variant" => decode_variant(r, data_type, rows),
             "Int32" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
@@ -1742,6 +1859,111 @@ impl ColumnData {
             )),
         }
     }
+}
+
+/// Decode a `Variant(T1, T2, ...)` column in BASIC discriminators mode.
+/// See [`ColumnData::Variant`] and NATIVE_FORMAT.md §3.4.5 for the wire
+/// format. The single-data-block convention matches LowCardinality / JSON:
+/// the state prefix is read only when `rows > 0`.
+fn decode_variant(r: &mut impl ProtoRead, data_type: &str, rows: usize) -> Result<ColumnData> {
+    let inner_types = parse_variant_inner_types(data_type)?;
+
+    // Variant elements that are themselves stateful would emit a nested
+    // state prefix in the per-element prefix phase, which this flat decoder
+    // doesn't route. Reject them up front with a clear error rather than
+    // misaligning the stream.
+    for t in &inner_types {
+        if is_stateful_type(t) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "Variant element '{t}' is a stateful type (LowCardinality / Variant / \
+                     Dynamic / JSON); nested state prefixes inside Variant are not yet supported"
+                ),
+            ));
+        }
+    }
+
+    // Header block: no state prefix, no discriminators. Decode each element
+    // with 0 rows so the sub-columns carry the right ColumnData kind.
+    if rows == 0 {
+        let columns = inner_types
+            .iter()
+            .map(|t| ColumnData::decode(r, t, 0))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(ColumnData::Variant {
+            discriminators: Vec::new(),
+            offsets: Vec::new(),
+            columns,
+        });
+    }
+
+    // State prefix: UInt64 discriminators mode.
+    let mode = r.read_u64()?;
+    if mode != VARIANT_DISCRIMINATORS_MODE_BASIC {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "Variant COMPACT discriminators mode ({mode}) not supported; only BASIC (0)"
+            ),
+        ));
+    }
+
+    // Discriminators: one byte per row. Compute per-type counts and per-row
+    // offsets in the same pass.
+    let mut discriminators = Vec::with_capacity(rows);
+    let mut offsets = Vec::with_capacity(rows);
+    let mut counts = vec![0usize; inner_types.len()];
+    for _ in 0..rows {
+        let d = r.read_u8()?;
+        if d == NULL_DISCRIMINATOR {
+            offsets.push(0);
+        } else {
+            let di = d as usize;
+            if di >= inner_types.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "Variant discriminator {di} >= variant count {}",
+                        inner_types.len()
+                    ),
+                ));
+            }
+            offsets.push(counts[di] as u64);
+            counts[di] += 1;
+        }
+        discriminators.push(d);
+    }
+
+    // Each variant type's values densely, in declared order.
+    let mut columns = Vec::with_capacity(inner_types.len());
+    for (i, t) in inner_types.iter().enumerate() {
+        columns.push(ColumnData::decode(r, t, counts[i])?);
+    }
+
+    Ok(ColumnData::Variant {
+        discriminators,
+        offsets,
+        columns,
+    })
+}
+
+/// Split the inner type list of a `Variant(T1, T2, ...)` type string into the
+/// individual variant types, respecting nested brackets. Unlike Tuple,
+/// Variant elements never carry field names, so no name-stripping is applied.
+fn parse_variant_inner_types(data_type: &str) -> Result<Vec<String>> {
+    let inner = parse_composite_inner_type(data_type)?;
+    split_with_composite(&inner)
+}
+
+/// Whether a type's serialization carries a per-column state prefix — i.e. it
+/// belongs to the stateful/versioned family (LowCardinality, Variant,
+/// Dynamic, JSON/Object). Used to reject nested-stateful Variant elements
+/// that this flat decoder can't route. Checks the whole type string so that
+/// wrappers like `Array(LowCardinality(String))` are also caught.
+fn is_stateful_type(data_type: &str) -> bool {
+    const STATEFUL: [&str; 5] = ["LowCardinality", "Variant", "Dynamic", "JSON", "Object"];
+    STATEFUL.iter().any(|kw| data_type.contains(kw))
 }
 
 /// Parse the field list of a `Nested(name1 T1, name2 T2, ...)` type string
@@ -2284,6 +2506,173 @@ mod tests {
         }
     }
 
+    // -- Variant(T1, T2, ...) (Problem 38 / NATIVE_FORMAT.md §3.4.5) --
+
+    #[test]
+    fn test_parse_variant_inner_types() {
+        assert_eq!(
+            parse_variant_inner_types("Variant(String, UInt64)").unwrap(),
+            vec!["String", "UInt64"]
+        );
+        // Nested brackets must not be split at their inner commas.
+        assert_eq!(
+            parse_variant_inner_types("Variant(Array(UInt8), Map(String, UInt8), String)").unwrap(),
+            vec!["Array(UInt8)", "Map(String, UInt8)", "String"]
+        );
+    }
+
+    #[test]
+    fn test_variant_decode_raw_wire() {
+        // The NATIVE_FORMAT.md §3.4.5 byte-level example:
+        // Variant(String, UInt64) with [42 (UInt64), "hi" (String), NULL].
+        // discriminators: 1, 0, 255 → String run ["hi"], UInt64 run [42].
+        let mut body = Vec::new();
+        body.extend(0u64.to_le_bytes()); // state prefix: mode = BASIC
+        body.extend([1u8, 0, 255]); // discriminators
+        body.extend(varuint_bytes(2)); // String "hi": len 2
+        body.extend(b"hi");
+        body.extend(42u64.to_le_bytes()); // UInt64 42
+
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_variant(&mut cursor, "Variant(String, UInt64)", 3).unwrap();
+        // Cursor fully consumed.
+        assert_eq!(cursor.position() as usize, body.len());
+        match data {
+            ColumnData::Variant {
+                discriminators,
+                offsets,
+                columns,
+            } => {
+                assert_eq!(discriminators, vec![1, 0, 255]);
+                assert_eq!(offsets, vec![0, 0, 0]);
+                assert_eq!(columns.len(), 2);
+                match &columns[0] {
+                    ColumnData::String(v) => assert_eq!(v, &vec!["hi".to_string()]),
+                    other => panic!("expected String run, got {other:?}"),
+                }
+                match &columns[1] {
+                    ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64]),
+                    other => panic!("expected UInt64 run, got {other:?}"),
+                }
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_variant_roundtrip_via_column() {
+        // Build a Variant column, encode it through Column::encode, decode it
+        // back, and check the structure round-trips.
+        let protocol = Feature::NULLABLE_SPARSE_SERIALIZATION.version();
+        let col = Column {
+            name: "v".to_string(),
+            data_type: "Variant(String, UInt64)".to_string(),
+            serialization: Serialization::Default,
+            data: ColumnData::Variant {
+                discriminators: vec![1, 0, 255, 1],
+                offsets: vec![0, 0, 0, 1],
+                columns: vec![
+                    ColumnData::String(vec!["hi".to_string()]),
+                    ColumnData::Uint64(vec![42, 7]),
+                ],
+            },
+        };
+        let mut buf = Vec::new();
+        col.encode(&mut buf, protocol).unwrap();
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let decoded = Column::decode(&mut cursor, 4, protocol).unwrap();
+        match decoded.data {
+            ColumnData::Variant {
+                discriminators,
+                offsets,
+                columns,
+            } => {
+                assert_eq!(discriminators, vec![1, 0, 255, 1]);
+                assert_eq!(offsets, vec![0, 0, 0, 1]);
+                match &columns[1] {
+                    ColumnData::Uint64(v) => assert_eq!(v, &vec![42u64, 7]),
+                    other => panic!("expected UInt64 run, got {other:?}"),
+                }
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_variant_header_block_zero_rows() {
+        // rows == 0: no state prefix, no discriminators on the wire. The
+        // sub-columns are decoded empty so they carry the right kind.
+        let body: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_variant(&mut cursor, "Variant(String, UInt64)", 0).unwrap();
+        match data {
+            ColumnData::Variant {
+                discriminators,
+                columns,
+                ..
+            } => {
+                assert!(discriminators.is_empty());
+                assert_eq!(columns.len(), 2);
+                assert_eq!(columns[0].row_count(), 0);
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_variant_all_null() {
+        let mut body = Vec::new();
+        body.extend(0u64.to_le_bytes());
+        body.extend([255u8, 255, 255]); // all NULL
+        // No values for either run.
+        let mut cursor = Cursor::new(body.as_slice());
+        let data = decode_variant(&mut cursor, "Variant(String, UInt64)", 3).unwrap();
+        match data {
+            ColumnData::Variant {
+                discriminators,
+                columns,
+                ..
+            } => {
+                assert_eq!(discriminators, vec![255, 255, 255]);
+                assert_eq!(columns[0].row_count(), 0);
+                assert_eq!(columns[1].row_count(), 0);
+            }
+            other => panic!("expected Variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_variant_rejects_compact_mode() {
+        let mut body = Vec::new();
+        body.extend(1u64.to_le_bytes()); // mode = COMPACT
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_variant(&mut cursor, "Variant(String, UInt64)", 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_variant_rejects_stateful_element() {
+        // A Variant whose element is itself stateful would carry a nested
+        // state prefix this flat decoder can't route — reject up front.
+        let mut body = Vec::new();
+        body.extend(0u64.to_le_bytes());
+        let mut cursor = Cursor::new(body.as_slice());
+        let err =
+            decode_variant(&mut cursor, "Variant(LowCardinality(String), UInt8)", 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_variant_rejects_bad_discriminator() {
+        let mut body = Vec::new();
+        body.extend(0u64.to_le_bytes());
+        body.push(5); // discriminator 5, but only 2 variant types
+        let mut cursor = Cursor::new(body.as_slice());
+        let err = decode_variant(&mut cursor, "Variant(String, UInt64)", 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
     #[test]
     fn test_column_full_sparse_decode_via_header() {
         // Full Column::decode path: hand-craft a header (name, type, has_custom=1,
@@ -2414,12 +2803,12 @@ mod tests {
 
     #[test]
     fn test_column_unsupported_type() {
-        // Manually encode: name="x", type="Variant(UInt8, String)" (not yet
-        // supported — versioned type with discriminator scheme, see SPEC
-        // §8.4), has_custom=0
+        // Manually encode: name="x", type="AggregateFunction(sum, UInt64)"
+        // (not implemented — aggregate-state serialization is out of scope),
+        // has_custom=0.
         let mut buf = Vec::new();
         buf.write_string("x").unwrap();
-        buf.write_string("Variant(UInt8, String)").unwrap();
+        buf.write_string("AggregateFunction(sum, UInt64)").unwrap();
         buf.write_u8(0).unwrap();
 
         let mut cursor = Cursor::new(buf.as_slice());
