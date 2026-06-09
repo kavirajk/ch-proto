@@ -361,6 +361,20 @@ This pitfall affects every type in `NATIVE_FORMAT.md` §4.4 (versioned types). T
 
 ---
 
+### 2.9 Float text uses double-conversion ECMAScript notation, not `ryu`
+
+**Symptom.** A value like `2.0988e19` rendered as `2.0988295479420645e19` (scientific) while ClickHouse prints `20988295479420645000` (fixed).
+
+**Cause.** ClickHouse's `writeFloatText` uses the double-conversion library in ECMAScript mode (`decimal_in_shortest_low = -6`, `decimal_in_shortest_high = 21`): fixed notation when the decimal-point position `n` satisfies `-5 <= n <= 21`, scientific otherwise (and no `+` on positive exponents). `ryu`'s threshold for switching to scientific is different.
+
+**Fix.** Take the shortest *normalized* digits from Rust's `{:e}` formatter (itself a shortest-round-trip algorithm) and re-render under the ECMAScript rules (`write_float_ecma` in `src/tsv.rs`). The `ryu` dependency was removed.
+
+### 2.10 DateTime / DateTime64 text is UTC and version-faithful
+
+`DateTime`/`DateTime64` are rendered in **UTC** (per-column timezone strings like `DateTime('Europe/Berlin')` are not yet applied — a tz database is needed) and `DateTime64` prints **all `scale` fractional digits** (e.g. `00:00:00.000000`). This matches the connected server: ClickHouse 26.5 `FORMAT TabSeparated` produces the same bytes. Differential `.reference` files captured on a server with a non-UTC session timezone, or on a ClickHouse version that trims zero fractions, will differ — that is timezone/version skew, **not** a client defect, so the formatter is deliberately left faithful to the server we talk to.
+
+---
+
 ## Reference Rust client status
 
 This repository contains a Rust implementation of the client side of the protocol. The status of each spec area in that implementation is documented here.

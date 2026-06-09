@@ -157,11 +157,15 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
 }
 
 // Match `writeFloatText` in `ClickHouse/src/IO/WriteHelpers.cpp`. The C++
-// fast path emits integer-valued floats as integers (no decimal point) and
-// otherwise uses a dragonbox-equivalent shortest-decimal formatter. We
-// reproduce that with the `ryu` crate (also dragonbox-equivalent) plus a
-// `.0` suffix strip for integer-valued non-exponent forms — ryu's natural
-// output for `1.0` is `1.0`; ClickHouse's is `1`.
+// fast path emits the shortest round-tripping decimal, choosing fixed vs
+// scientific notation the way ClickHouse's `writeFloatText` does — it uses the
+// double-conversion library in ECMAScript mode (`decimal_in_shortest_low = -6`,
+// `decimal_in_shortest_high = 21`). So `2.09e19` prints as `20988295479420645000`
+// (fixed) while `1e308` and `1e-302` print in scientific form.
+//
+// We obtain the shortest *normalized* digits from Rust's `{:e}` formatter
+// (also a shortest-round-trip algorithm) and re-render them under the
+// ECMAScript notation rules. ClickHouse omits the `+` on positive exponents.
 fn write_f32<W: Write>(w: &mut W, f: f32) -> io::Result<()> {
     if f.is_nan() {
         return w.write_all(b"nan");
@@ -169,8 +173,7 @@ fn write_f32<W: Write>(w: &mut W, f: f32) -> io::Result<()> {
     if f.is_infinite() {
         return w.write_all(if f.is_sign_negative() { b"-inf" } else { b"inf" });
     }
-    let mut buf = ryu::Buffer::new();
-    write_ryu_stripped(w, buf.format(f).as_bytes())
+    write_float_ecma(w, &format!("{:e}", f))
 }
 
 fn write_f64<W: Write>(w: &mut W, f: f64) -> io::Result<()> {
@@ -180,17 +183,63 @@ fn write_f64<W: Write>(w: &mut W, f: f64) -> io::Result<()> {
     if f.is_infinite() {
         return w.write_all(if f.is_sign_negative() { b"-inf" } else { b"inf" });
     }
-    let mut buf = ryu::Buffer::new();
-    write_ryu_stripped(w, buf.format(f).as_bytes())
+    write_float_ecma(w, &format!("{:e}", f))
 }
 
-fn write_ryu_stripped<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
-    let stripped = if bytes.ends_with(b".0") && !bytes.contains(&b'e') && !bytes.contains(&b'E') {
-        &bytes[..bytes.len() - 2]
-    } else {
-        bytes
+// Re-render Rust's normalized scientific form (`[-]d[.ddd]e[-]EXP`, shortest)
+// under ECMAScript Number→String notation rules, matching ClickHouse.
+//
+// Let the significant digits be `s` (k of them) and `n = EXP + 1` the position
+// of the decimal point (value = s × 10^(n−k)). Fixed notation is used when
+// −5 ≤ n ≤ 21, scientific otherwise.
+fn write_float_ecma<W: Write>(w: &mut W, e_form: &str) -> io::Result<()> {
+    let (neg, rest) = match e_form.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, e_form),
     };
-    w.write_all(stripped)
+    // `{:e}` always contains an 'e'.
+    let (mant, exp_str) = rest.split_once('e').expect("{:e} form has exponent");
+    let exp: i32 = exp_str.parse().expect("{:e} exponent is an integer");
+    // Significant digits with the point removed. The mantissa is normalized to
+    // one leading digit, has no trailing zeros, and (for non-zero values) no
+    // leading zero — so `digits` is exactly the shortest digit string.
+    let digits: Vec<u8> = mant.bytes().filter(|b| *b != b'.').collect();
+    let k = digits.len() as i32;
+    let n = exp + 1;
+
+    if neg {
+        w.write_all(b"-")?;
+    }
+
+    if n > 21 || n <= -6 {
+        // Scientific: d[.ddd]e{n-1}  (no '+' on positive exponents).
+        w.write_all(&digits[..1])?;
+        if k > 1 {
+            w.write_all(b".")?;
+            w.write_all(&digits[1..])?;
+        }
+        write!(w, "e{}", n - 1)
+    } else if n <= 0 {
+        // 0.000…digits  with (−n) leading zeros after the point.
+        w.write_all(b"0.")?;
+        for _ in 0..(-n) {
+            w.write_all(b"0")?;
+        }
+        w.write_all(&digits)
+    } else if n >= k {
+        // Integer with (n−k) trailing zeros.
+        w.write_all(&digits)?;
+        for _ in 0..(n - k) {
+            w.write_all(b"0")?;
+        }
+        Ok(())
+    } else {
+        // Point falls inside the digits.
+        let n = n as usize;
+        w.write_all(&digits[..n])?;
+        w.write_all(b".")?;
+        w.write_all(&digits[n..])
+    }
 }
 
 fn write_string_escaped<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
@@ -897,9 +946,8 @@ mod tests {
 
     #[test]
     fn float_extreme_magnitudes_use_scientific() {
-        // The whole reason we depend on ryu: Rust's stdlib `Display` produces
-        // a 300+ character decimal expansion for these. ClickHouse uses the
-        // shortest representation, which is scientific for extreme exponents.
+        // ClickHouse (double-conversion, ECMAScript mode) switches to
+        // scientific only when the decimal point position n>21 or n<=-6.
         assert_eq!(val(ColumnData::Float64(vec![1e308])), "1e308");
         assert_eq!(val(ColumnData::Float64(vec![-1e-307])), "-1e-307");
         assert_eq!(val(ColumnData::Float64(vec![1e-302])), "1e-302");
@@ -912,6 +960,24 @@ mod tests {
             val(ColumnData::Float64(vec![-2.2250738585072014e-308])),
             "-2.2250738585072014e-308"
         );
+    }
+
+    #[test]
+    fn float_mid_magnitude_uses_fixed_notation() {
+        // Regression for 00031/02862: magnitudes with point position n<=21 are
+        // fixed, NOT scientific (ryu would have emitted `2.09…e19`).
+        assert_eq!(
+            val(ColumnData::Float64(vec![20988295479420645000.0])),
+            "20988295479420645000"
+        );
+        assert_eq!(val(ColumnData::Float64(vec![403229640000000000.0])), "403229640000000000");
+        // Boundaries and fractions.
+        assert_eq!(val(ColumnData::Float64(vec![1e21])), "1e21"); // n=22 → scientific
+        assert_eq!(val(ColumnData::Float64(vec![1e20])), "100000000000000000000"); // n=21 → fixed
+        assert_eq!(val(ColumnData::Float64(vec![0.0001])), "0.0001"); // n=-3 → fixed
+        assert_eq!(val(ColumnData::Float64(vec![1e-7])), "1e-7"); // n=-6 → scientific
+        assert_eq!(val(ColumnData::Float64(vec![1234.5])), "1234.5");
+        assert_eq!(val(ColumnData::Float32(vec![0.1])), "0.1");
     }
 
     #[test]
