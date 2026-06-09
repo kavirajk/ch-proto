@@ -176,9 +176,10 @@ The two tracks below are signposts into the existing spec, not a re-explanation.
 
 **Known gaps to focus review on:**
 
+- [`NESTED_STATEFUL_DESIGN.md`](NESTED_STATEFUL_DESIGN.md) — the largest open item: versioned types (LowCardinality/Variant/Dynamic/JSON) **nested in composites**, **multi-block**, or **replicated/const-wrapped**. The flat decoder reads state-prefix-then-data inline, but ClickHouse batches all prefixes first; design + ~106 target tests (`tests/differential/nested_stateful.txt`) are written, implementation is pending. Allocation guards make the desync fail cleanly instead of aborting.
 - `NATIVE_FORMAT.md` §3.4 — the deferred-types rationale. Are the boundaries between Tier 1/2/3 JSON drawn correctly?
 - `NATIVE_FORMAT.md` §4 — compression read path is integrated; compressed INSERT (write path) is deferred (§4.6).
-- Anything marked ⚠️ above (versioned types, compression integration).
+- `AggregateFunction` and `QBit` raw state are undecoded (`NATIVE_FORMAT.md` §3.1.15).
 
 **Verifying a spec claim — cross-reference order:**
 
