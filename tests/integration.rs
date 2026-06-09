@@ -1334,7 +1334,9 @@ fn test_enum16_select() {
         .unwrap();
     assert_eq!(result.row_count(), 1);
     match &result.rows[0].columns[0].data {
-        ch_proto::proto::column::ColumnData::Enum16(v) => assert_eq!(v, &vec![30000i16]),
+        ch_proto::proto::column::ColumnData::Enum16 { values, .. } => {
+            assert_eq!(values, &vec![30000i16])
+        }
         other => panic!("expected Enum16, got {other:?}"),
     }
 }
