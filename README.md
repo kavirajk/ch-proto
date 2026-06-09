@@ -202,11 +202,90 @@ cargo run --example events
 
 ---
 
+## How the specifications are validated
+
+The spec is not validated by reading — it's validated by a Rust client (`src/`) that implements it against a real ClickHouse server. Two layers:
+
+**1. Hand-written tests.** 351 unit tests pin individual encodings and message bodies (VarUInt round-trips, each data-type codec, handshake and feature-gate logic); 100 integration tests run real queries against a live container (`make test-integration`). These reach corners a query corpus can't — REPLICATED inner types the server only emits in narrow cases, empty `Tuple()`, and so on.
+
+**2. Differential harness against ClickHouse's own test suite.** The strongest signal: replay ClickHouse's `tests/queries/0_stateless` query corpus through our client and diff the rendered output, byte-for-byte, against the `.reference` file the ClickHouse team commits next to each test. If our decode of any type or packet is wrong, the rows diverge from the reference and the test fails. `ch-tsv` (`src/bin/ch-tsv.rs`) is the wrapper — it runs a `.sql` file through the client and prints TSV; `run.sh` wraps each test in a per-test ephemeral database (`CREATE DATABASE test_<pid>_<n>; USE …; DROP DATABASE` — the same envelope the canonical `clickhouse-test` runner uses), diffs stdout against the reference, and buckets the result (PASS / MISMATCH / SERVER_ERROR / IO_ERROR / CRASH). It runs parallel-8; each test has its own database, so there's no cross-test state.
+
+### How the 4,463 tests were chosen
+
+Most stateless tests don't exercise *our* code. They depend on the environment, the SQL dialect, the server version, or a `clickhouse-client` CLI feature, and would pass or fail no matter what our client does — so they carry no signal about the protocol or format. The selection criterion throughout is one rule: **a test earns its place only if its pass/fail depends on our native-protocol/native-format code.** Two passes apply it.
+
+| Stage | Tests | What happens |
+|-------|------:|--------------|
+| `0_stateless` `.sql` corpus | 8,522 | Every SQL test in the suite (the `.sh`/`.py`/`.expect` tests aren't SQL and aren't run). |
+| Static filter — `make corpus-filter` | 4,947 | Drop the tests whose outcome can't depend on our code, judged from the SQL text alone. |
+| Runtime prune — `classify.sh` | 4,481 | Drop the no-value failures that only surface at runtime (−466, recorded in `corpus_excluded.tsv`). |
+| Scored | **4,463** | Minus 18 tests that ship without a `.reference` to diff against. |
+
+The **static filter** (rules inline in the `Makefile`) drops, by grepping the SQL: `FORMAT JSON/CSV/Pretty/…` clauses (they test the *server's* output formatters, not our client); `ATTACH`/`DETACH`/`GRANT`/`REVOKE`/`EXPLAIN`; `-- Tags:` tests (need the `test.hits`/`visits` datasets or a cluster); instance-specific `system.*` tables and non-deterministic functions (`now()`, `rand()`, `generateUUIDv4()`, `currentDatabase()`, …) whose output isn't reproducible; `ENGINE = Replicated*` (needs ZooKeeper); `dialect = 'kusto'|'prql'` (a different parser, not native format); `{CLICKHOUSE_DATABASE}`-style parameter substitutions (the official runner fills these, our harness can't); and `-- { echo }` / `-- { echoOn }` (a CLI feature that echoes query text into the output).
+
+The **runtime prune** catches what only the *failure reason* reveals — cluster-not-found, functions missing on this server version, server-side analyzer crashes, non-UTF-8 test files. `classify.sh` tags every non-PASS by root cause and moves the no-value ones (466) into `corpus_excluded.tsv`; the largest bucket there is `-- { echo }` artifacts (224) that slipped past the text filter.
+
+### Why the remaining tests fail
+
+Current score: **4,201 / 4,463 = 94.1%**. The 262 remaining failures, by `classify.sh` root cause:
+
+| Bucket | Count | Verdict |
+|--------|------:|---------|
+| `REAL_FORMAT_MISMATCH`    | 126 | Rendered output differs — the nested-stateful decode gap, plus known best-effort TSV-formatting differences |
+| `CLIENT_TYPE_UNSUPPORTED` |  40 | Types we deliberately don't decode yet (`AggregateFunction`, `QBit`) |
+| `ENV_SERVER_ANALYZER`     |  23 | Server-side analyzer/version difference — no protocol/format value |
+| `CLIENT_UTF8_DECODE`      |  19 | Non-UTF-8 `String` payload; the TSV path assumes UTF-8 |
+| `CLIENT_LC_PREFIX`        |  18 | `LowCardinality` state prefix in a nested / multi-block layout |
+| `ARTIFACT_ECHO`           |  15 | `clickhouse-client` echo artifact the static filter missed — no value |
+| `CLIENT_DECODE_BUG`       |   9 | Array-offset / replicated decode edge cases |
+| `CLIENT_JSON_VER`         |   8 | JSON serialization version not yet handled (non-flat / Tier 3) |
+| `TIMEOUT`                 |   3 | Slow or hung query (e.g. the INSERT-no-data hang) |
+| `ENV_ZK`                  |   1 | Needs ZooKeeper — no value |
+| **Total**                 | **262** | |
+
+Of these, **39** are environment/CLI noise that merely leaked past the filters (`ENV_SERVER_ANALYZER` + `ARTIFACT_ECHO` + `ENV_ZK`) and carry no signal. The genuine ~223 client gaps are dominated by:
+
+- **Nested-stateful decode** — the single largest open item. Versioned types (LowCardinality / Variant / Dynamic / JSON) nested inside composites, spanning multiple blocks, or const/replicated-wrapped. The flat decoder reads *state-prefix-then-data* inline, but ClickHouse batches all prefixes first; design and ~106 target tests are written ([`NESTED_STATEFUL_DESIGN.md`](NESTED_STATEFUL_DESIGN.md), `tests/differential/nested_stateful.txt`), implementation pending. Surfaces as `REAL_FORMAT_MISMATCH`, `CLIENT_LC_PREFIX`, `CLIENT_JSON_VER`, and some `CLIENT_DECODE_BUG`.
+- **Deliberately deferred types** — `AggregateFunction` intermediate state and `QBit`, whose wire forms are function/codec-specific (`NATIVE_FORMAT.md`, "Type aliases").
+- **Non-UTF-8 `String` rendering** — the TSV formatter assumes UTF-8; binary String payloads need raw-byte output.
+- **A few timeouts** — e.g. the INSERT-with-no-data hang documented in [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+
+`REAL_FORMAT_MISMATCH` also folds in best-effort TSV-formatting differences (flat JSON objects, some float/edge cases) that are documented as not byte-identical to ClickHouse and are independent of decode correctness. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage history.
+
+### Reproducing these numbers
+
+Every count above comes from a local run — nothing is hand-maintained. The figures track the ClickHouse checkout you point `CLICKHOUSE_QUERIES` at (default `~/src/ClickHouse/tests/queries/0_stateless`); they're measured against ClickHouse `26.5`, and a different revision shifts the absolute totals. You need Docker and that source checkout.
+
+```sh
+# 1. Unit + integration tests (351 + 100). `test-integration` boots the server.
+make test-unit
+make test-integration
+
+# 2. Differential score (4,201 PASS → 94.1%). Builds ch-tsv, boots the server,
+#    runs the committed (already-pruned) corpus_filtered.txt parallel-8, and prints
+#    the PASS / MISMATCH / SERVER_ERROR / IO_ERROR / CRASH summary.
+make test-differential-full
+
+# 3. Root-cause breakdown of the failures (the 262-row table above). Per-test tags
+#    go to stdout; the summary table is printed to stderr.
+tests/differential/classify.sh \
+    "$HOME/src/ClickHouse/tests/queries/0_stateless" \
+    tests/differential/corpus_filtered.txt > /dev/null
+```
+
+To reproduce the **selection funnel** (the `8,522 → 4,947` static-filter step), regenerate the list from your checkout:
+
+```sh
+make corpus-filter   # walks the .sql corpus, applies the static filter, reports the kept count
+```
+
+> `corpus-filter` overwrites `tests/differential/corpus_filtered.txt` with the raw static-filtered list (4,947), *before* the runtime prune. The committed `corpus_filtered.txt` (4,481) already has the 466 no-value tests removed — `git checkout tests/differential/corpus_filtered.txt` restores it if you only wanted to inspect the count. A leftover `test_*` database from an interrupted run can be swept with `make test-differential-cleanup`.
+
+---
+
 ## Status & remaining work
 
-The spec and client now declare protocol version **`54484`** — the current server target (`PROGRESS_IN_ASYNC_INSERT`; upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484). The v54461 → v54484 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54484; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place.
-
-**Test coverage:** 351 unit + 100 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8), after pruning tests whose outcome is independent of our protocol/format code (env/dialect/version-skew/echoOn — see `classify.sh`): **94.1% (4201 / 4463)**. The remaining failures are the nested-stateful decode rework ([`NESTED_STATEFUL_DESIGN.md`](NESTED_STATEFUL_DESIGN.md)), deferred types (`AggregateFunction`, `QBit`), and timezone/version skew. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
+The spec and client declare protocol version **`54484`** — the current server target (`PROGRESS_IN_ASYNC_INSERT`; upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484). The v54461 → v54484 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54484; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place. Test coverage stands at **351 unit + 100 integration** tests passing and **94.1%** on the differential harness (see above).
 
 What's left:
 
