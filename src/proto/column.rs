@@ -1415,6 +1415,11 @@ impl ColumnData {
                 inner.encode(w)?;
             }
             ColumnData::Tuple(values) => {
+                // NOTE: an empty `Tuple()` carries no element columns, so this
+                // writes zero bytes — but the wire form is one placeholder byte
+                // per row (see the decode side). Re-encoding an empty tuple is
+                // therefore not byte-symmetric. Only the read path is exercised
+                // (SELECT results); empty-tuple INSERT is not supported.
                 for v in values {
                     v.encode(w)?;
                 }
@@ -1996,6 +2001,15 @@ impl ColumnData {
             }
             "Tuple" => {
                 let inner_dts = parse_tuple_inner_types(data_type)?;
+                if inner_dts.is_empty() {
+                    // Empty `Tuple()` serializes like Nothing: one placeholder
+                    // byte ('0') per row, which the deserializer discards. The
+                    // row count comes from the block header, so the in-memory
+                    // shape is just an element-less tuple.
+                    let mut placeholder = vec![0u8; rows];
+                    r.read_exact(&mut placeholder)?;
+                    return Ok(ColumnData::Tuple(Vec::new()));
+                }
                 let mut dts: Vec<ColumnData> = Vec::with_capacity(inner_dts.len());
 
                 for dt in &inner_dts {
@@ -2581,12 +2595,20 @@ fn parse_tuple_inner_types(data_type: &str) -> Result<Vec<String>> {
     };
     let begin = data_type.find('(').ok_or_else(err)?;
     let end = data_type.rfind(')').ok_or_else(err)?;
-    if begin + 1 >= end {
+    // `)` must come at or after `(` + 1. Equal-adjacent (`Tuple()`) is the
+    // valid *empty* tuple — zero elements — not a parse error; only a `)`
+    // before `(` is malformed. This guard also keeps the slice below in range.
+    if end < begin + 1 {
         return Err(err());
     }
 
-    let inner = data_type[begin + 1..end].trim().to_string();
-    let dts: Vec<String> = split_with_composite(&inner)?;
+    let inner = data_type[begin + 1..end].trim();
+    // `Tuple()` — a zero-element tuple. Its wire encoding is zero bytes (no
+    // element sub-columns); row count comes from the block header.
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dts: Vec<String> = split_with_composite(inner)?;
     // Named-tuple support: `Tuple(name1 UInt64, name2 String)`. After the
     // depth-aware split each piece may carry a leading identifier; strip it
     // so the recursive decoder sees only the type. The wire format is the
@@ -4675,6 +4697,23 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_tuple_decode_consumes_placeholder_bytes() {
+        // `Tuple()` (zero elements) serializes like Nothing: one placeholder
+        // byte per row. Decode must consume exactly `rows` bytes so the stream
+        // stays aligned for the next column (regression: it previously read
+        // zero, desyncing the block — see 02494_query_cache_empty_tuple).
+        let wire = [0x30u8, 0x30, 0x30, 0xAB]; // 3 placeholders + 1 sentinel
+        let mut cursor = Cursor::new(&wire[..]);
+        let data = ColumnData::decode(&mut cursor, "Tuple()", 3).unwrap();
+        match data {
+            ColumnData::Tuple(elems) => assert!(elems.is_empty()),
+            _ => panic!("expected empty Tuple"),
+        }
+        // Exactly 3 bytes consumed; the sentinel remains for the next column.
+        assert_eq!(cursor.position(), 3);
+    }
+
+    #[test]
     fn test_tuple_single_element() {
         // Tuple(Int32) — single-element tuple is legal in ClickHouse.
         let col = Column {
@@ -4919,8 +4958,14 @@ mod tests {
 
     #[test]
     fn test_parse_tuple_inner_types_invalid() {
+        // No parentheses at all is malformed.
         assert!(parse_tuple_inner_types("Tuple").is_err());
-        assert!(parse_tuple_inner_types("Tuple()").is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_tuple_is_zero_elements() {
+        // `Tuple()` is the valid empty tuple — zero element types, not an error.
+        assert_eq!(parse_tuple_inner_types("Tuple()").unwrap(), Vec::<String>::new());
     }
 
     // -- Map(K, V) --

@@ -750,9 +750,10 @@ Each stream encodes exactly `num_rows` values. There is no length prefix, no off
 
 **Invariants.**
 
-1. Tuple has at least one element (`n >= 1`). Empty tuples are rejected at type-parse time.
-2. Every element stream encodes exactly `num_rows` values.
-3. An empty column (`num_rows == 0`) writes zero bytes per stream.
+1. Every element stream encodes exactly `num_rows` values.
+2. An empty column (`num_rows == 0`) writes zero bytes per stream.
+
+**Empty tuple — `Tuple()`.** A zero-element tuple is legal (e.g. `SELECT tuple()`, `CAST(x AS Tuple())`). It has no element streams; instead it serializes like `Nothing` (§3.1.11) — **one placeholder byte (`0x30`, ASCII `'0'`) per row** — and the deserializer discards them. The row count comes from the block header. (Reference decoder: `parse_tuple_inner_types` returns an empty list and the decoder then consumes `num_rows` placeholder bytes.)
 
 **Composes with.** Element types may be any type, including other composites. `Tuple(Tuple(...), ...)`, `Tuple(Array(...), ...)`, `Tuple(Nullable(T1), T2)` are all legal. The depth-aware comma splitter described in Implementation Notes §2.6 is required to parse the element list.
 
