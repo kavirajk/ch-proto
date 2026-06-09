@@ -76,6 +76,15 @@ run_one() {
     local rc=$?
     rm -f "$tmpfile"
 
+    # Normalize the per-test database name back to `default`. The reference
+    # files were captured in the canonical `default` database, so DDL echoes
+    # (SHOW CREATE TABLE, etc.) embed `default.<table>` while our wrapped run
+    # uses an ephemeral `test_<pid>_<seq>` database. This substitution only
+    # affects tests that print the db name; all others are untouched.
+    if [[ $rc -eq 0 && -s "$out_path" ]]; then
+        sed -i "s/${db}/default/g" "$out_path"
+    fi
+
     local bucket
     case $rc in
         0)

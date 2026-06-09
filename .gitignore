@@ -1,3 +1,7 @@
 /target
 tests/differential/out/
 tests/differential/corpus_filtered.txt
+
+# Differential harness scratch
+tests/differential/corpus_filtered.txt.bak
+tests/differential/corpus_excluded.tsv
