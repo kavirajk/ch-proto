@@ -42,6 +42,12 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
         ColumnData::DateTime64 { scale, values } => {
             write_datetime64(w, values[row], *scale)
         }
+        // bfloat16 widens to Float32 (bit pattern in the high half) then formats.
+        ColumnData::BFloat16(v) => write_f32(w, f32::from_bits((v[row] as u32) << 16)),
+        ColumnData::Time(v) => write_time(w, v[row] as i64),
+        ColumnData::Time64 { scale, values } => write_time64(w, values[row], *scale),
+        // Interval renders as a bare integer count (the unit is type-string only).
+        ColumnData::Interval(v) => write!(w, "{}", v[row]),
         ColumnData::FixedString { n, data } => {
             // FixedString: exactly N bytes per row, NUL-padded on the right
             // if the stored string was shorter. C++ uses
@@ -336,6 +342,41 @@ fn write_datetime64<W: Write>(w: &mut W, ticks: i64, scale: u8) -> io::Result<()
     write_datetime(w, seconds, fraction, scale)
 }
 
+// `Time` / `Time64` render as a clock duration `[-]HH:MM:SS[.fraction]`. Unlike
+// DateTime the hour field is not wrapped to a day — it counts total hours (so
+// it can exceed 23). Matches `SerializationTime`/`SerializationTime64`.
+fn write_hms<W: Write>(w: &mut W, neg: bool, total_seconds: u64, fraction: u64, scale: u8) -> io::Result<()> {
+    // ClickHouse caps the *displayed* clock at ±999:59:59 (3599999s); beyond
+    // that the fraction is shown as zeros (e.g. `999:59:59.000`).
+    const TIME_MAX_SECONDS: u64 = 999 * 3600 + 59 * 60 + 59;
+    let (total_seconds, fraction) = if total_seconds > TIME_MAX_SECONDS {
+        (TIME_MAX_SECONDS, 0)
+    } else {
+        (total_seconds, fraction)
+    };
+    if neg {
+        w.write_all(b"-")?;
+    }
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let secs = total_seconds % 60;
+    write!(w, "{:02}:{:02}:{:02}", hours, minutes, secs)?;
+    if scale > 0 {
+        write!(w, ".{:0width$}", fraction, width = scale as usize)?;
+    }
+    Ok(())
+}
+
+fn write_time<W: Write>(w: &mut W, seconds: i64) -> io::Result<()> {
+    write_hms(w, seconds < 0, seconds.unsigned_abs(), 0, 0)
+}
+
+fn write_time64<W: Write>(w: &mut W, ticks: i64, scale: u8) -> io::Result<()> {
+    let factor = 10u64.pow(scale as u32);
+    let abs = ticks.unsigned_abs();
+    write_hms(w, ticks < 0, abs / factor, abs % factor, scale)
+}
+
 // Decimal formatter. Matches `writeText(Decimal<T>, scale, ostr,
 // trailing_zeros=false)` in `ClickHouse/src/IO/WriteHelpers.h`. Whole and
 // fractional parts share a sign — write the leading `-` once (even when the
@@ -562,7 +603,20 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         | ColumnData::Decimal64 { .. }
         | ColumnData::Decimal128 { .. }
         | ColumnData::Decimal256 { .. }
+        | ColumnData::BFloat16(_)
+        | ColumnData::Interval(_)
         | ColumnData::Bool(_) => write_value(w, col, row),
+        // Time/Time64 quote their clock form inside composites: `'12:34:56'`.
+        ColumnData::Time(v) => {
+            w.write_all(b"'")?;
+            write_time(w, v[row] as i64)?;
+            w.write_all(b"'")
+        }
+        ColumnData::Time64 { scale, values } => {
+            w.write_all(b"'")?;
+            write_time64(w, values[row], *scale)?;
+            w.write_all(b"'")
+        }
         // Enums quote their label inside composites: `'hello'`.
         ColumnData::Enum8 { values, names } => write_enum_quoted(w, values[row] as i16, names),
         ColumnData::Enum16 { values, names } => write_enum_quoted(w, values[row], names),
@@ -709,6 +763,10 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Date32(_) => "Date32",
         ColumnData::DateTime(_) => "DateTime",
         ColumnData::DateTime64 { .. } => "DateTime64",
+        ColumnData::BFloat16(_) => "BFloat16",
+        ColumnData::Time(_) => "Time",
+        ColumnData::Time64 { .. } => "Time64",
+        ColumnData::Interval(_) => "Interval",
         ColumnData::Uuid(_) => "UUID",
         ColumnData::Ipv4(_) => "IPv4",
         ColumnData::Ipv6(_) => "IPv6",
@@ -896,6 +954,26 @@ mod tests {
         let mut neg = [0xffu8; 32];
         neg[0] = 0xff - 11 + 1; // two's complement of 11
         assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![neg] }), "-1.1");
+    }
+
+    #[test]
+    fn new_fixed_width_types_render() {
+        // BFloat16: 1.5 → bits 0x3FC0; renders via Float32 widening.
+        assert_eq!(val(ColumnData::BFloat16(vec![0x3FC0])), "1.5");
+        // Time: signed seconds → [-]HH:MM:SS, hours can exceed 23.
+        assert_eq!(val(ColumnData::Time(vec![45296])), "12:34:56");
+        assert_eq!(val(ColumnData::Time(vec![-3661])), "-01:01:01");
+        // Time cap at 999:59:59 on display.
+        assert_eq!(val(ColumnData::Time(vec![999999999])), "999:59:59");
+        // Time64(3): ticks at scale 3.
+        assert_eq!(val(ColumnData::Time64 { scale: 3, values: vec![45296789] }), "12:34:56.789");
+        // Over-cap Time64 → 999:59:59 with zeroed fraction.
+        assert_eq!(
+            val(ColumnData::Time64 { scale: 3, values: vec![9_999_999_999_000] }),
+            "999:59:59.000"
+        );
+        // Interval renders as a bare integer.
+        assert_eq!(val(ColumnData::Interval(vec![5, -2])), "5");
     }
 
     #[test]

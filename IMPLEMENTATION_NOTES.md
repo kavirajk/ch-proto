@@ -384,9 +384,9 @@ This repository contains a Rust implementation of the client side of the protoco
 - **Protocol:** Handshake (with addendum), Ping/Pong, Query, INSERT (single-block and streaming), response stream loop.
 - **Messages:** Hello, Query, ClientInfo, Setting, Parameter, Block, Progress, ProfileInfo, Totals, Extremes, Log, ProfileEvents, TableColumns, Exception, EndOfStream.
 - **Format primitives:** VarUInt, fixed-width integers (8/16/32/64/128/256 bit, both signed and unsigned), String, FixedString, Bool, Float32, Float64.
-- **Date/time:** Date, Date32, DateTime, DateTime64.
-- **Domain types:** UUID (with the byte-swap quirk handled at the boundary), IPv4, IPv6, Enum8, Enum16, Decimal(P, S) at all four widths.
-- **Composites:** Nullable, Array, Tuple, Map, Nested.
+- **Date/time:** Date, Date32, DateTime, DateTime64, Time, Time64 (experimental; `[-]HH:MM:SS[.frac]`, capped at ±999:59:59).
+- **Domain types:** UUID (with the byte-swap quirk handled at the boundary), IPv4, IPv6, Enum8, Enum16 (rendered as labels), Decimal(P, S) at all four widths, BFloat16, Interval (all units).
+- **Composites:** Nullable, Array, Tuple (including empty `Tuple()`), Map, Nested.
 - **Versioned types (Tier 1 only):** LowCardinality, JSON Tier 1 (String fallback). Both subject to the single-data-block limitation (§2.8).
 - **Compression frame primitives:** LZ4, ZSTD, NONE encode/decode with CityHash102 verification. Connection-level integration is not yet wired up — `with_compression(true)` sets the wire flag but the response decoder cannot consume compressed blocks.
 
@@ -401,7 +401,7 @@ This repository contains a Rust implementation of the client side of the protoco
 - **SSH challenge-response authentication** (v54466+).
 - **Query plan serialization** (v54477+).
 - **Chunked protocol** (v54470+).
-- **AggregateFunction**, **SimpleAggregateFunction**, **Interval**, **Geo types** (Point, Ring, Polygon, MultiPolygon).
+- **AggregateFunction**, **SimpleAggregateFunction**, **QBit**, **Geo types** (Point, Ring, Polygon, MultiPolygon).
 
 ### Library and dependency choices
 

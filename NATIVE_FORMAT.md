@@ -526,6 +526,27 @@ The `Nothing` type carries no values. It appears in practice only as the inner t
 
 The null-map prefix is the standard `Nullable` framing (§3.3); the inner three bytes are the `Nothing` payload and would be skipped by the decoder.
 
+#### 3.1.12 BFloat16
+
+`BFloat16` is the brain-floating-point format: the high 16 bits of an IEEE-754 `Float32` (1 sign, 8 exponent, 7 mantissa bits). **Wire format:** 2 bytes LE per row — the raw 16-bit pattern. To obtain the value, widen to `Float32` by shifting the pattern into the high half (`f32::from_bits((bits as u32) << 16)`); text output uses the same float formatting as `Float32` (§2.9 of Implementation Notes). Example: `1.5` → bits `0x3FC0` → wire `c0 3f`.
+
+#### 3.1.13 Time and Time64(scale)
+
+`Time` is a signed clock duration in **seconds**, `Int32` LE (4 bytes). `Time64(scale)` is signed **ticks** at the given decimal scale (0–9), `Int64` LE (8 bytes) — same shape as `DateTime64`.
+
+**Text format:** `[-]HH:MM:SS[.fraction]`. Unlike `DateTime` the hour field is *not* wrapped to a day — it is the total hour count and may exceed 23. The displayed value is **capped to ±999:59:59** (`3599999` seconds); a magnitude beyond the cap renders as `999:59:59` with a zeroed fraction (`999:59:59.000`). `CAST` also clamps the stored value to this range, but arithmetic can produce out-of-range values that are only clamped on display.
+
+```
+Time         value 45296            → 12:34:56     wire: f0 b0 00 00
+Time64(3)    value 45296789 ticks   → 12:34:56.789 wire: 95 2c b3 02 00 00 00 00
+```
+
+> Requires `allow_experimental_time_time64_type = 1` on the server (these types are experimental as of v26.x).
+
+#### 3.1.14 Interval
+
+`Interval<Unit>` — `IntervalNanosecond`, `IntervalSecond`, `IntervalMinute`, `IntervalHour`, `IntervalDay`, `IntervalWeek`, `IntervalMonth`, `IntervalQuarter`, `IntervalYear`, etc. **Wire format:** the count as `Int64` LE (8 bytes). The unit lives **only in the type string** — it affects neither the wire encoding nor the text output, which is the bare integer (`5`). A single decoder path handles every unit.
+
 ### 3.2 Variable-length Types
 
 Each value carries its own length on the wire.

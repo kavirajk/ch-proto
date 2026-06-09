@@ -121,6 +121,21 @@ pub enum ColumnData {
     Int256(Vec<[u8; 32]>),
     /// 256-bit unsigned integer, raw 32-byte LE bytes.
     Uint256(Vec<[u8; 32]>),
+    /// `BFloat16` — bfloat16 (the high 16 bits of an IEEE-754 `Float32`),
+    /// 2 bytes LE per row. Stored as the raw 16-bit pattern; rendering widens
+    /// it back to `Float32` (`bits << 16`) and formats as a float.
+    BFloat16(Vec<u16>),
+    /// `Time` — signed seconds of a clock value, `Int32` LE (4 bytes). Renders
+    /// as `[-]HH:MM:SS` where the hour field may exceed 23 (range ±999h).
+    Time(Vec<i32>),
+    /// `Time64(scale)` — `Int64` LE ticks at the given decimal `scale`, like
+    /// `DateTime64` but rendered as `[-]HH:MM:SS[.fraction]`.
+    Time64 { scale: u8, values: Vec<i64> },
+    /// `Interval<Unit>` (IntervalSecond, IntervalDay, IntervalMonth, …) — the
+    /// count as `Int64` LE. The unit lives only in the type string and does not
+    /// affect the wire form or the rendered value (a bare integer), so a single
+    /// variant covers every unit.
+    Interval(Vec<i64>),
     /// `LowCardinality(T)` — Tier 1 single-block-aware support.
     ///
     /// Wire format (per column):
@@ -658,6 +673,16 @@ fn materialize_replicated(
             }
             Ok(ColumnData::DateTime64 { scale, values: out })
         }
+        ColumnData::BFloat16(v) => lookup!(BFloat16, v),
+        ColumnData::Time(v) => lookup!(Time, v),
+        ColumnData::Interval(v) => lookup!(Interval, v),
+        ColumnData::Time64 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Time64 { scale, values: out })
+        }
         ColumnData::Decimal32 { scale, values } => {
             let mut out = Vec::with_capacity(indexes.len());
             for &idx in indexes {
@@ -928,6 +953,16 @@ fn materialize_sparse(
             }
             Ok(ColumnData::Ipv6(dense))
         }
+        ColumnData::BFloat16(v) => expand_vec!(BFloat16, v, 0u16),
+        ColumnData::Time(v) => expand_vec!(Time, v, 0i32),
+        ColumnData::Interval(v) => expand_vec!(Interval, v, 0i64),
+        ColumnData::Time64 { scale, values } => {
+            let mut dense = vec![0i64; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense[pos] = values[i];
+            }
+            Ok(ColumnData::Time64 { scale, values: dense })
+        }
         ColumnData::DateTime64 { scale, values } => {
             let mut dense = vec![0i64; rows];
             for (i, val) in values.into_iter().enumerate() {
@@ -1025,6 +1060,10 @@ impl ColumnData {
             ColumnData::Date(v) => v.len(),
             ColumnData::Date32(v) => v.len(),
             ColumnData::DateTime64 { values, .. } => values.len(),
+            ColumnData::BFloat16(v) => v.len(),
+            ColumnData::Time(v) => v.len(),
+            ColumnData::Time64 { values, .. } => values.len(),
+            ColumnData::Interval(v) => v.len(),
             ColumnData::Uuid(v) => v.len(),
             ColumnData::Ipv4(v) => v.len(),
             ColumnData::Ipv6(v) => v.len(),
@@ -1521,6 +1560,26 @@ impl ColumnData {
                     w.write_i64(x)?;
                 }
             }
+            ColumnData::BFloat16(v) => {
+                for &x in v {
+                    w.write_u16(x)?;
+                }
+            }
+            ColumnData::Time(v) => {
+                for &x in v {
+                    w.write_i32(x)?;
+                }
+            }
+            ColumnData::Time64 { values, .. } => {
+                for &x in values {
+                    w.write_i64(x)?;
+                }
+            }
+            ColumnData::Interval(v) => {
+                for &x in v {
+                    w.write_i64(x)?;
+                }
+            }
             ColumnData::Uuid(v) => {
                 for u in v {
                     // Wire format: two byte-swapped LE UInt64 halves.
@@ -1812,6 +1871,38 @@ impl ColumnData {
                     values.push(r.read_i64()?);
                 }
                 Ok(ColumnData::DateTime64 { scale, values })
+            }
+            "BFloat16" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u16()?);
+                }
+                Ok(ColumnData::BFloat16(v))
+            }
+            "Time" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i32()?);
+                }
+                Ok(ColumnData::Time(v))
+            }
+            "Time64" => {
+                // Same scale param shape as DateTime64; ticks are Int64 LE.
+                let scale = parse_datetime64_scale(data_type)?;
+                let mut values = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    values.push(r.read_i64()?);
+                }
+                Ok(ColumnData::Time64 { scale, values })
+            }
+            // Interval<Unit> — every unit (Second, Day, Month, …) is an Int64
+            // count on the wire; the unit is carried by the type string only.
+            base if base.starts_with("Interval") => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i64()?);
+                }
+                Ok(ColumnData::Interval(v))
             }
             "UUID" => {
                 let mut v = Vec::with_capacity(rows);
