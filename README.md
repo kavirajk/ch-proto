@@ -206,7 +206,7 @@ cargo run --example events
 
 The spec and client now declare protocol version **`54484`** — the current server target (`PROGRESS_IN_ASYNC_INSERT`; upstream bumped `DBMS_TCP_PROTOCOL_VERSION` from 54483 to 54484). The v54461 → v54484 feature additions are complete (`NATIVE_PROTOCOL.md` §3.3 feature table extends to v54484; v54483 nullable-sparse is in `NATIVE_FORMAT.md` §2.3.1), the v54470 chunked protocol is fully implemented and spec'd (§4.1), and the REPLICATED column decoder (kind_stack `0x04`, v54482) is in place.
 
-**Test coverage:** 339 unit + 100 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8): **80.2% (3935 / 4909)**. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
+**Test coverage:** 351 unit + 100 integration tests passing. Differential harness against ClickHouse's `0_stateless` corpus (via the `ch-tsv` wrapper, parallel-8), after pruning tests whose outcome is independent of our protocol/format code (env/dialect/version-skew/echoOn — see `classify.sh`): **94.1% (4201 / 4463)**. The remaining failures are the nested-stateful decode rework ([`NESTED_STATEFUL_DESIGN.md`](NESTED_STATEFUL_DESIGN.md)), deferred types (`AggregateFunction`, `QBit`), and timezone/version skew. See [`DESIGN.md`](DESIGN.md) for the full stage-by-stage breakdown.
 
 What's left:
 
