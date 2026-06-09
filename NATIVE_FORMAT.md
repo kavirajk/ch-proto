@@ -462,7 +462,7 @@ Enum8('active' = 1, 'inactive' = 2, 'banned' = -1)
 Enum16('a' = 1, 'b' = 30000)
 ```
 
-A decoder may strip the `(...)` parameter suffix and dispatch as `Int8` / `Int16`. Clients that need the human-readable label parse the type string.
+A decoder may strip the `(...)` parameter suffix and dispatch as `Int8` / `Int16`. Clients that need the human-readable label parse the label↔value map out of the type string and keep it alongside the values — text output (TabSeparated, etc.) renders the **label** (`active`), not the integer; inside composites it is single-quoted (`'active'`). Because the map is not recoverable from the integer column alone, it must be retained for nested enums such as `Array(Enum8(...))` or `Map(Enum16(...), V)`.
 
 **Byte-level example — `Enum8('active' = 1, 'inactive' = 2)` column `[active, inactive, active]`:**
 

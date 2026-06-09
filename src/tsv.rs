@@ -77,15 +77,10 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
             let addr = std::net::Ipv6Addr::from(v[row]);
             write!(w, "{}", addr)
         }
-        ColumnData::Enum16(v) => {
-            // KNOWN STAGE 1 LIMITATION: C++ writes the enum's *label*
-            // (`'active'`) rather than its integer. The label lives in the
-            // type string and isn't reachable from ColumnData alone — we'd
-            // need to thread the data_type through write_value, which is
-            // deferred. Output the integer instead, accepting mismatches on
-            // tests whose .reference uses the name form.
-            write!(w, "{}", v[row])
-        }
+        // Enums render as their *label* (e.g. `hello`), TSV-escaped, no quotes.
+        // The label↔value map is decoded from the type string into `names`.
+        ColumnData::Enum8 { values, names } => write_enum(w, values[row] as i16, names),
+        ColumnData::Enum16 { values, names } => write_enum(w, values[row], names),
         ColumnData::Decimal32 { scale, values } => write_decimal(w, values[row] as i128, *scale),
         ColumnData::Decimal64 { scale, values } => write_decimal(w, values[row] as i128, *scale),
         ColumnData::Decimal128 { scale, values } => write_decimal(w, values[row], *scale),
@@ -448,6 +443,28 @@ fn write_nested<W: Write>(
     w.write_all(b"]")
 }
 
+// Enum rendering. ClickHouse writes the *label* for the row's value (via
+// `writeEscapedString` in TabSeparated), falling back to the raw integer only
+// if the value isn't in the map (which a well-formed column never hits).
+fn write_enum<W: Write>(w: &mut W, value: i16, names: &[(i16, String)]) -> io::Result<()> {
+    match names.iter().find(|(v, _)| *v == value) {
+        Some((_, label)) => write_string_escaped(w, label.as_bytes()),
+        None => write!(w, "{}", value),
+    }
+}
+
+// Quoted enum label for composite contexts (Array/Tuple/Map): `'hello'`.
+fn write_enum_quoted<W: Write>(w: &mut W, value: i16, names: &[(i16, String)]) -> io::Result<()> {
+    match names.iter().find(|(v, _)| *v == value) {
+        Some((_, label)) => {
+            w.write_all(b"'")?;
+            write_string_escaped(w, label.as_bytes())?;
+            w.write_all(b"'")
+        }
+        None => write!(w, "{}", value),
+    }
+}
+
 // Howard Hinnant's `civil_from_days` algorithm. Given a count of days since
 // 1970-01-01 (negative for earlier dates), return (year, month, day) in the
 // proleptic Gregorian calendar. Domain: any i64 days, output years in i64.
@@ -496,8 +513,10 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         | ColumnData::Decimal64 { .. }
         | ColumnData::Decimal128 { .. }
         | ColumnData::Decimal256 { .. }
-        | ColumnData::Enum16(_)
         | ColumnData::Bool(_) => write_value(w, col, row),
+        // Enums quote their label inside composites: `'hello'`.
+        ColumnData::Enum8 { values, names } => write_enum_quoted(w, values[row] as i16, names),
+        ColumnData::Enum16 { values, names } => write_enum_quoted(w, values[row], names),
         // Strings: 'wrapped with backslash escapes including \''.
         ColumnData::String(v) => {
             w.write_all(b"'")?;
@@ -644,7 +663,8 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Uuid(_) => "UUID",
         ColumnData::Ipv4(_) => "IPv4",
         ColumnData::Ipv6(_) => "IPv6",
-        ColumnData::Enum16(_) => "Enum16",
+        ColumnData::Enum8 { .. } => "Enum8",
+        ColumnData::Enum16 { .. } => "Enum16",
         ColumnData::Decimal32 { .. } => "Decimal32",
         ColumnData::Decimal64 { .. } => "Decimal64",
         ColumnData::Decimal128 { .. } => "Decimal128",
@@ -827,6 +847,20 @@ mod tests {
         let mut neg = [0xffu8; 32];
         neg[0] = 0xff - 11 + 1; // two's complement of 11
         assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![neg] }), "-1.1");
+    }
+
+    #[test]
+    fn enums_render_labels() {
+        let names = vec![(1i16, "hello".to_string()), (2i16, "world".to_string())];
+        // Top level: bare label, TSV-escaped, no quotes.
+        assert_eq!(val(ColumnData::Enum8 { values: vec![1, 2], names: names.clone() }), "hello");
+        assert_eq!(val(ColumnData::Enum16 { values: vec![2], names: names.clone() }), "world");
+        // Inside a composite: quoted label.
+        let arr = ColumnData::Array {
+            inner: Box::new(ColumnData::Enum8 { values: vec![1, 2], names }),
+            offsets: vec![2],
+        };
+        assert_eq!(val(arr), "['hello','world']");
     }
 
     #[test]

@@ -224,7 +224,9 @@ Pass the negotiated protocol version through the Block encode and decode functio
 
 **Cause.** The server sends types like `Enum8('increment' = 1, 'gauge' = 2)` for columns the spec describes as `Int8` (e.g., the ProfileEvents `type` column). The wire bytes are identical to `Int8` — one byte per row — but the type string on the wire differs.
 
-**Fix.** Treat `Enum8` as `Int8` and `Enum16` as `Int16` during column decoding. The preferred approach is to strip the `(...)` parameter suffix from the type string and dispatch on the base name (see §2.3 below).
+**Fix.** Decode `Enum8`/`Enum16` with the same wire reader as `Int8`/`Int16` (strip the `(...)` suffix and dispatch on the base name, see §2.3), but keep them as distinct `ColumnData::Enum8`/`Enum16` variants.
+
+**Rendering.** A TabSeparated value of an Enum is its *label*, not the integer (e.g. `hello`, or `'hello'` quoted inside a composite). The label↔value map lives only in the type string, so the decoder parses it (`parse_enum_names`) and stores it on the variant (`names: Vec<(i16, String)>`); the formatter looks the row's value up there. This is why the integer-only representation was insufficient — `ColumnData` alone must carry the map for nested cases like `Map(Enum16(...), V)`.
 
 ---
 
