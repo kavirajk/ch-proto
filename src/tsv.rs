@@ -42,6 +42,12 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
         ColumnData::DateTime64 { scale, values } => {
             write_datetime64(w, values[row], *scale)
         }
+        // bfloat16 widens to Float32 (bit pattern in the high half) then formats.
+        ColumnData::BFloat16(v) => write_f32(w, f32::from_bits((v[row] as u32) << 16)),
+        ColumnData::Time(v) => write_time(w, v[row] as i64),
+        ColumnData::Time64 { scale, values } => write_time64(w, values[row], *scale),
+        // Interval renders as a bare integer count (the unit is type-string only).
+        ColumnData::Interval(v) => write!(w, "{}", v[row]),
         ColumnData::FixedString { n, data } => {
             // FixedString: exactly N bytes per row, NUL-padded on the right
             // if the stored string was shorter. C++ uses
@@ -77,23 +83,22 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
             let addr = std::net::Ipv6Addr::from(v[row]);
             write!(w, "{}", addr)
         }
-        ColumnData::Enum16(v) => {
-            // KNOWN STAGE 1 LIMITATION: C++ writes the enum's *label*
-            // (`'active'`) rather than its integer. The label lives in the
-            // type string and isn't reachable from ColumnData alone — we'd
-            // need to thread the data_type through write_value, which is
-            // deferred. Output the integer instead, accepting mismatches on
-            // tests whose .reference uses the name form.
-            write!(w, "{}", v[row])
-        }
+        // Enums render as their *label* (e.g. `hello`), TSV-escaped, no quotes.
+        // The label↔value map is decoded from the type string into `names`.
+        ColumnData::Enum8 { values, names } => write_enum(w, values[row] as i16, names),
+        ColumnData::Enum16 { values, names } => write_enum(w, values[row], names),
         ColumnData::Decimal32 { scale, values } => write_decimal(w, values[row] as i128, *scale),
         ColumnData::Decimal64 { scale, values } => write_decimal(w, values[row] as i128, *scale),
         ColumnData::Decimal128 { scale, values } => write_decimal(w, values[row], *scale),
         ColumnData::Int128(v) => write!(w, "{}", v[row]),
         ColumnData::Uint128(v) => write!(w, "{}", v[row]),
+        ColumnData::Int256(v) => write_i256(w, &v[row]),
+        ColumnData::Uint256(v) => write_u256(w, &v[row]),
+        ColumnData::Decimal256 { scale, values } => write_decimal256(w, &values[row], *scale),
         ColumnData::Array { inner, offsets } => write_array(w, inner, offsets, row),
         ColumnData::Tuple(elems) => write_tuple(w, elems, row),
         ColumnData::Map { keys, values, offsets } => write_map(w, keys, values, offsets, row),
+        ColumnData::Nested { fields, offsets } => write_nested(w, fields, offsets, row),
         ColumnData::LowCardinality { dict, keys, .. } => {
             // LowCardinality(T) renders as T after dictionary lookup. Keys
             // index into the dict; the dict's value at that index is the
@@ -158,11 +163,15 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
 }
 
 // Match `writeFloatText` in `ClickHouse/src/IO/WriteHelpers.cpp`. The C++
-// fast path emits integer-valued floats as integers (no decimal point) and
-// otherwise uses a dragonbox-equivalent shortest-decimal formatter. We
-// reproduce that with the `ryu` crate (also dragonbox-equivalent) plus a
-// `.0` suffix strip for integer-valued non-exponent forms — ryu's natural
-// output for `1.0` is `1.0`; ClickHouse's is `1`.
+// fast path emits the shortest round-tripping decimal, choosing fixed vs
+// scientific notation the way ClickHouse's `writeFloatText` does — it uses the
+// double-conversion library in ECMAScript mode (`decimal_in_shortest_low = -6`,
+// `decimal_in_shortest_high = 21`). So `2.09e19` prints as `20988295479420645000`
+// (fixed) while `1e308` and `1e-302` print in scientific form.
+//
+// We obtain the shortest *normalized* digits from Rust's `{:e}` formatter
+// (also a shortest-round-trip algorithm) and re-render them under the
+// ECMAScript notation rules. ClickHouse omits the `+` on positive exponents.
 fn write_f32<W: Write>(w: &mut W, f: f32) -> io::Result<()> {
     if f.is_nan() {
         return w.write_all(b"nan");
@@ -170,8 +179,7 @@ fn write_f32<W: Write>(w: &mut W, f: f32) -> io::Result<()> {
     if f.is_infinite() {
         return w.write_all(if f.is_sign_negative() { b"-inf" } else { b"inf" });
     }
-    let mut buf = ryu::Buffer::new();
-    write_ryu_stripped(w, buf.format(f).as_bytes())
+    write_float_ecma(w, &format!("{:e}", f))
 }
 
 fn write_f64<W: Write>(w: &mut W, f: f64) -> io::Result<()> {
@@ -181,17 +189,63 @@ fn write_f64<W: Write>(w: &mut W, f: f64) -> io::Result<()> {
     if f.is_infinite() {
         return w.write_all(if f.is_sign_negative() { b"-inf" } else { b"inf" });
     }
-    let mut buf = ryu::Buffer::new();
-    write_ryu_stripped(w, buf.format(f).as_bytes())
+    write_float_ecma(w, &format!("{:e}", f))
 }
 
-fn write_ryu_stripped<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
-    let stripped = if bytes.ends_with(b".0") && !bytes.contains(&b'e') && !bytes.contains(&b'E') {
-        &bytes[..bytes.len() - 2]
-    } else {
-        bytes
+// Re-render Rust's normalized scientific form (`[-]d[.ddd]e[-]EXP`, shortest)
+// under ECMAScript Number→String notation rules, matching ClickHouse.
+//
+// Let the significant digits be `s` (k of them) and `n = EXP + 1` the position
+// of the decimal point (value = s × 10^(n−k)). Fixed notation is used when
+// −5 ≤ n ≤ 21, scientific otherwise.
+fn write_float_ecma<W: Write>(w: &mut W, e_form: &str) -> io::Result<()> {
+    let (neg, rest) = match e_form.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, e_form),
     };
-    w.write_all(stripped)
+    // `{:e}` always contains an 'e'.
+    let (mant, exp_str) = rest.split_once('e').expect("{:e} form has exponent");
+    let exp: i32 = exp_str.parse().expect("{:e} exponent is an integer");
+    // Significant digits with the point removed. The mantissa is normalized to
+    // one leading digit, has no trailing zeros, and (for non-zero values) no
+    // leading zero — so `digits` is exactly the shortest digit string.
+    let digits: Vec<u8> = mant.bytes().filter(|b| *b != b'.').collect();
+    let k = digits.len() as i32;
+    let n = exp + 1;
+
+    if neg {
+        w.write_all(b"-")?;
+    }
+
+    if n > 21 || n <= -6 {
+        // Scientific: d[.ddd]e{n-1}  (no '+' on positive exponents).
+        w.write_all(&digits[..1])?;
+        if k > 1 {
+            w.write_all(b".")?;
+            w.write_all(&digits[1..])?;
+        }
+        write!(w, "e{}", n - 1)
+    } else if n <= 0 {
+        // 0.000…digits  with (−n) leading zeros after the point.
+        w.write_all(b"0.")?;
+        for _ in 0..(-n) {
+            w.write_all(b"0")?;
+        }
+        w.write_all(&digits)
+    } else if n >= k {
+        // Integer with (n−k) trailing zeros.
+        w.write_all(&digits)?;
+        for _ in 0..(n - k) {
+            w.write_all(b"0")?;
+        }
+        Ok(())
+    } else {
+        // Point falls inside the digits.
+        let n = n as usize;
+        w.write_all(&digits[..n])?;
+        w.write_all(b".")?;
+        w.write_all(&digits[n..])
+    }
 }
 
 fn write_string_escaped<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
@@ -288,13 +342,47 @@ fn write_datetime64<W: Write>(w: &mut W, ticks: i64, scale: u8) -> io::Result<()
     write_datetime(w, seconds, fraction, scale)
 }
 
+// `Time` / `Time64` render as a clock duration `[-]HH:MM:SS[.fraction]`. Unlike
+// DateTime the hour field is not wrapped to a day — it counts total hours (so
+// it can exceed 23). Matches `SerializationTime`/`SerializationTime64`.
+fn write_hms<W: Write>(w: &mut W, neg: bool, total_seconds: u64, fraction: u64, scale: u8) -> io::Result<()> {
+    // ClickHouse caps the *displayed* clock at ±999:59:59 (3599999s); beyond
+    // that the fraction is shown as zeros (e.g. `999:59:59.000`).
+    const TIME_MAX_SECONDS: u64 = 999 * 3600 + 59 * 60 + 59;
+    let (total_seconds, fraction) = if total_seconds > TIME_MAX_SECONDS {
+        (TIME_MAX_SECONDS, 0)
+    } else {
+        (total_seconds, fraction)
+    };
+    if neg {
+        w.write_all(b"-")?;
+    }
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let secs = total_seconds % 60;
+    write!(w, "{:02}:{:02}:{:02}", hours, minutes, secs)?;
+    if scale > 0 {
+        write!(w, ".{:0width$}", fraction, width = scale as usize)?;
+    }
+    Ok(())
+}
+
+fn write_time<W: Write>(w: &mut W, seconds: i64) -> io::Result<()> {
+    write_hms(w, seconds < 0, seconds.unsigned_abs(), 0, 0)
+}
+
+fn write_time64<W: Write>(w: &mut W, ticks: i64, scale: u8) -> io::Result<()> {
+    let factor = 10u64.pow(scale as u32);
+    let abs = ticks.unsigned_abs();
+    write_hms(w, ticks < 0, abs / factor, abs % factor, scale)
+}
+
 // Decimal formatter. Matches `writeText(Decimal<T>, scale, ostr,
 // trailing_zeros=false)` in `ClickHouse/src/IO/WriteHelpers.h`. Whole and
 // fractional parts share a sign — write the leading `-` once (even when the
 // whole part rounds to 0), then unsigned magnitude. Trailing zeros in the
 // fractional part are trimmed; if the entire fraction is zero, the decimal
-// point is omitted. Decimal256 (32-byte two's-complement values) is not
-// supported in Stage 1 — it would need 256-bit integer math.
+// point is omitted.
 fn write_decimal<W: Write>(w: &mut W, value: i128, scale: u8) -> io::Result<()> {
     let is_neg = value < 0;
     let abs: u128 = value.unsigned_abs();
@@ -316,6 +404,155 @@ fn write_decimal<W: Write>(w: &mut W, value: i128, scale: u8) -> io::Result<()> 
         w.write_all(trimmed.as_bytes())?;
     }
     Ok(())
+}
+
+// --- 256-bit integer / decimal formatting -------------------------------
+//
+// Rust has no native i256/u256, so Int256/UInt256/Decimal256 are kept as raw
+// 32-byte little-endian two's-complement values (see ColumnData). These
+// helpers render them by long division on the magnitude — adequate for TSV
+// output (called once per value, 32 bytes wide).
+
+/// Decimal string of an unsigned 256-bit magnitude given as 32 LE bytes.
+/// Returns at least one digit ("0" for zero). No sign.
+fn u256_to_decimal(le: &[u8; 32]) -> String {
+    // Work on a big-endian copy so the most-significant byte leads.
+    let mut be = [0u8; 32];
+    for i in 0..32 {
+        be[i] = le[31 - i];
+    }
+    let mut digits: Vec<u8> = Vec::with_capacity(78); // ceil(256*log10(2)) = 78
+    loop {
+        let mut rem: u16 = 0;
+        let mut nonzero = false;
+        for byte in be.iter_mut() {
+            let cur = (rem << 8) | (*byte as u16);
+            *byte = (cur / 10) as u8;
+            rem = cur % 10;
+            if *byte != 0 {
+                nonzero = true;
+            }
+        }
+        digits.push(b'0' + rem as u8);
+        if !nonzero {
+            break;
+        }
+    }
+    digits.reverse();
+    // SAFETY: only ASCII digits were pushed.
+    String::from_utf8(digits).unwrap()
+}
+
+/// Split a 32-byte LE two's-complement value into (is_negative, |value| LE).
+fn i256_sign_magnitude(le: &[u8; 32]) -> (bool, [u8; 32]) {
+    let neg = le[31] & 0x80 != 0;
+    if !neg {
+        return (false, *le);
+    }
+    // Negate: two's complement = invert bytes + 1.
+    let mut mag = [0u8; 32];
+    let mut carry: u16 = 1;
+    for i in 0..32 {
+        let v = (!le[i]) as u16 + carry;
+        mag[i] = v as u8;
+        carry = v >> 8;
+    }
+    (true, mag)
+}
+
+fn write_u256<W: Write>(w: &mut W, le: &[u8; 32]) -> io::Result<()> {
+    w.write_all(u256_to_decimal(le).as_bytes())
+}
+
+fn write_i256<W: Write>(w: &mut W, le: &[u8; 32]) -> io::Result<()> {
+    let (neg, mag) = i256_sign_magnitude(le);
+    if neg {
+        w.write_all(b"-")?;
+    }
+    w.write_all(u256_to_decimal(&mag).as_bytes())
+}
+
+/// Decimal256 formatter — same rules as `write_decimal` but on a 256-bit
+/// signed magnitude. Whole and fractional parts share one sign; trailing
+/// fractional zeros are trimmed and the point omitted if the fraction is zero.
+fn write_decimal256<W: Write>(w: &mut W, le: &[u8; 32], scale: u8) -> io::Result<()> {
+    let (neg, mag) = i256_sign_magnitude(le);
+    let digits = u256_to_decimal(&mag);
+    if neg {
+        w.write_all(b"-")?;
+    }
+    let scale = scale as usize;
+    if scale == 0 {
+        return w.write_all(digits.as_bytes());
+    }
+    // Left-pad so there are at least `scale + 1` digits → at least one whole
+    // digit plus the full fractional part.
+    let padded;
+    let digits = if digits.len() <= scale {
+        padded = format!("{:0>width$}", digits, width = scale + 1);
+        padded.as_str()
+    } else {
+        digits.as_str()
+    };
+    let split = digits.len() - scale;
+    let whole = &digits[..split];
+    let frac = digits[split..].trim_end_matches('0');
+    w.write_all(whole.as_bytes())?;
+    if !frac.is_empty() {
+        w.write_all(b".")?;
+        w.write_all(frac.as_bytes())?;
+    }
+    Ok(())
+}
+
+// `Nested(n1 T1, n2 T2, ...)` renders identically to `Array(Tuple(T1, ...))`:
+// an array of tuples, one tuple per element row. Inner values use the quoted
+// composite form, matching `SerializationArray`/`SerializationTuple`.
+fn write_nested<W: Write>(
+    w: &mut W,
+    fields: &[(String, ColumnData)],
+    offsets: &[u64],
+    row: usize,
+) -> io::Result<()> {
+    let start = if row == 0 { 0 } else { offsets[row - 1] as usize };
+    let end = offsets[row] as usize;
+    w.write_all(b"[")?;
+    for i in start..end {
+        if i > start {
+            w.write_all(b",")?;
+        }
+        w.write_all(b"(")?;
+        for (j, (_, col)) in fields.iter().enumerate() {
+            if j > 0 {
+                w.write_all(b",")?;
+            }
+            write_value_quoted(w, col, i)?;
+        }
+        w.write_all(b")")?;
+    }
+    w.write_all(b"]")
+}
+
+// Enum rendering. ClickHouse writes the *label* for the row's value (via
+// `writeEscapedString` in TabSeparated), falling back to the raw integer only
+// if the value isn't in the map (which a well-formed column never hits).
+fn write_enum<W: Write>(w: &mut W, value: i16, names: &[(i16, String)]) -> io::Result<()> {
+    match names.iter().find(|(v, _)| *v == value) {
+        Some((_, label)) => write_string_escaped(w, label.as_bytes()),
+        None => write!(w, "{}", value),
+    }
+}
+
+// Quoted enum label for composite contexts (Array/Tuple/Map): `'hello'`.
+fn write_enum_quoted<W: Write>(w: &mut W, value: i16, names: &[(i16, String)]) -> io::Result<()> {
+    match names.iter().find(|(v, _)| *v == value) {
+        Some((_, label)) => {
+            w.write_all(b"'")?;
+            write_string_escaped(w, label.as_bytes())?;
+            w.write_all(b"'")
+        }
+        None => write!(w, "{}", value),
+    }
 }
 
 // Howard Hinnant's `civil_from_days` algorithm. Given a count of days since
@@ -358,13 +595,31 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         | ColumnData::Int64(_)
         | ColumnData::Int128(_)
         | ColumnData::Uint128(_)
+        | ColumnData::Int256(_)
+        | ColumnData::Uint256(_)
         | ColumnData::Float32(_)
         | ColumnData::Float64(_)
         | ColumnData::Decimal32 { .. }
         | ColumnData::Decimal64 { .. }
         | ColumnData::Decimal128 { .. }
-        | ColumnData::Enum16(_)
+        | ColumnData::Decimal256 { .. }
+        | ColumnData::BFloat16(_)
+        | ColumnData::Interval(_)
         | ColumnData::Bool(_) => write_value(w, col, row),
+        // Time/Time64 quote their clock form inside composites: `'12:34:56'`.
+        ColumnData::Time(v) => {
+            w.write_all(b"'")?;
+            write_time(w, v[row] as i64)?;
+            w.write_all(b"'")
+        }
+        ColumnData::Time64 { scale, values } => {
+            w.write_all(b"'")?;
+            write_time64(w, values[row], *scale)?;
+            w.write_all(b"'")
+        }
+        // Enums quote their label inside composites: `'hello'`.
+        ColumnData::Enum8 { values, names } => write_enum_quoted(w, values[row] as i16, names),
+        ColumnData::Enum16 { values, names } => write_enum_quoted(w, values[row], names),
         // Strings: 'wrapped with backslash escapes including \''.
         ColumnData::String(v) => {
             w.write_all(b"'")?;
@@ -428,6 +683,7 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         ColumnData::Array { inner, offsets } => write_array(w, inner, offsets, row),
         ColumnData::Tuple(elems) => write_tuple(w, elems, row),
         ColumnData::Map { keys, values, offsets } => write_map(w, keys, values, offsets, row),
+        ColumnData::Nested { fields, offsets } => write_nested(w, fields, offsets, row),
         ColumnData::LowCardinality { dict, keys, .. } => {
             write_value_quoted(w, dict, keys[row] as usize)
         }
@@ -507,10 +763,15 @@ fn variant_name(c: &ColumnData) -> &'static str {
         ColumnData::Date32(_) => "Date32",
         ColumnData::DateTime(_) => "DateTime",
         ColumnData::DateTime64 { .. } => "DateTime64",
+        ColumnData::BFloat16(_) => "BFloat16",
+        ColumnData::Time(_) => "Time",
+        ColumnData::Time64 { .. } => "Time64",
+        ColumnData::Interval(_) => "Interval",
         ColumnData::Uuid(_) => "UUID",
         ColumnData::Ipv4(_) => "IPv4",
         ColumnData::Ipv6(_) => "IPv6",
-        ColumnData::Enum16(_) => "Enum16",
+        ColumnData::Enum8 { .. } => "Enum8",
+        ColumnData::Enum16 { .. } => "Enum16",
         ColumnData::Decimal32 { .. } => "Decimal32",
         ColumnData::Decimal64 { .. } => "Decimal64",
         ColumnData::Decimal128 { .. } => "Decimal128",
@@ -657,6 +918,91 @@ mod tests {
     }
 
     #[test]
+    fn wide_ints_render_decimal() {
+        // UInt256: 0, 1, 256, and 2^256 - 1 (all bytes 0xff).
+        assert_eq!(val(ColumnData::Uint256(vec![[0u8; 32]])), "0");
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert_eq!(val(ColumnData::Uint256(vec![one])), "1");
+        let mut two56 = [0u8; 32];
+        two56[1] = 1;
+        assert_eq!(val(ColumnData::Uint256(vec![two56])), "256");
+        assert_eq!(
+            val(ColumnData::Uint256(vec![[0xffu8; 32]])),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        // Int256: -1 is all-ones two's complement; -256 too.
+        assert_eq!(val(ColumnData::Int256(vec![[0xffu8; 32]])), "-1");
+        assert_eq!(val(ColumnData::Int256(vec![one])), "1");
+    }
+
+    #[test]
+    fn decimal256_renders_with_scale() {
+        // 11 at scale 1 → 1.1
+        let mut v = [0u8; 32];
+        v[0] = 11;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![v] }), "1.1");
+        // 100 at scale 2 → 1 (trailing zeros trimmed, point omitted)
+        let mut v = [0u8; 32];
+        v[0] = 100;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 2, values: vec![v] }), "1");
+        // 5 at scale 3 → 0.005 (whole part padded to a single 0)
+        let mut v = [0u8; 32];
+        v[0] = 5;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 3, values: vec![v] }), "0.005");
+        // negative: -11 at scale 1 → -1.1
+        let mut neg = [0xffu8; 32];
+        neg[0] = 0xff - 11 + 1; // two's complement of 11
+        assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![neg] }), "-1.1");
+    }
+
+    #[test]
+    fn new_fixed_width_types_render() {
+        // BFloat16: 1.5 → bits 0x3FC0; renders via Float32 widening.
+        assert_eq!(val(ColumnData::BFloat16(vec![0x3FC0])), "1.5");
+        // Time: signed seconds → [-]HH:MM:SS, hours can exceed 23.
+        assert_eq!(val(ColumnData::Time(vec![45296])), "12:34:56");
+        assert_eq!(val(ColumnData::Time(vec![-3661])), "-01:01:01");
+        // Time cap at 999:59:59 on display.
+        assert_eq!(val(ColumnData::Time(vec![999999999])), "999:59:59");
+        // Time64(3): ticks at scale 3.
+        assert_eq!(val(ColumnData::Time64 { scale: 3, values: vec![45296789] }), "12:34:56.789");
+        // Over-cap Time64 → 999:59:59 with zeroed fraction.
+        assert_eq!(
+            val(ColumnData::Time64 { scale: 3, values: vec![9_999_999_999_000] }),
+            "999:59:59.000"
+        );
+        // Interval renders as a bare integer.
+        assert_eq!(val(ColumnData::Interval(vec![5, -2])), "5");
+    }
+
+    #[test]
+    fn enums_render_labels() {
+        let names = vec![(1i16, "hello".to_string()), (2i16, "world".to_string())];
+        // Top level: bare label, TSV-escaped, no quotes.
+        assert_eq!(val(ColumnData::Enum8 { values: vec![1, 2], names: names.clone() }), "hello");
+        assert_eq!(val(ColumnData::Enum16 { values: vec![2], names: names.clone() }), "world");
+        // Inside a composite: quoted label.
+        let arr = ColumnData::Array {
+            inner: Box::new(ColumnData::Enum8 { values: vec![1, 2], names }),
+            offsets: vec![2],
+        };
+        assert_eq!(val(arr), "['hello','world']");
+    }
+
+    #[test]
+    fn nested_renders_as_array_of_tuples() {
+        let col = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Int32(vec![1, 2])),
+                ("b".to_string(), ColumnData::String(vec!["x".to_string(), "y".to_string()])),
+            ],
+            offsets: vec![2],
+        };
+        assert_eq!(val(col), "[(1,'x'),(2,'y')]");
+    }
+
+    #[test]
     fn float_specials() {
         assert_eq!(val(ColumnData::Float32(vec![f32::NAN])), "nan");
         assert_eq!(val(ColumnData::Float32(vec![f32::INFINITY])), "inf");
@@ -678,9 +1024,8 @@ mod tests {
 
     #[test]
     fn float_extreme_magnitudes_use_scientific() {
-        // The whole reason we depend on ryu: Rust's stdlib `Display` produces
-        // a 300+ character decimal expansion for these. ClickHouse uses the
-        // shortest representation, which is scientific for extreme exponents.
+        // ClickHouse (double-conversion, ECMAScript mode) switches to
+        // scientific only when the decimal point position n>21 or n<=-6.
         assert_eq!(val(ColumnData::Float64(vec![1e308])), "1e308");
         assert_eq!(val(ColumnData::Float64(vec![-1e-307])), "-1e-307");
         assert_eq!(val(ColumnData::Float64(vec![1e-302])), "1e-302");
@@ -693,6 +1038,24 @@ mod tests {
             val(ColumnData::Float64(vec![-2.2250738585072014e-308])),
             "-2.2250738585072014e-308"
         );
+    }
+
+    #[test]
+    fn float_mid_magnitude_uses_fixed_notation() {
+        // Regression for 00031/02862: magnitudes with point position n<=21 are
+        // fixed, NOT scientific (ryu would have emitted `2.09…e19`).
+        assert_eq!(
+            val(ColumnData::Float64(vec![20988295479420645000.0])),
+            "20988295479420645000"
+        );
+        assert_eq!(val(ColumnData::Float64(vec![403229640000000000.0])), "403229640000000000");
+        // Boundaries and fractions.
+        assert_eq!(val(ColumnData::Float64(vec![1e21])), "1e21"); // n=22 → scientific
+        assert_eq!(val(ColumnData::Float64(vec![1e20])), "100000000000000000000"); // n=21 → fixed
+        assert_eq!(val(ColumnData::Float64(vec![0.0001])), "0.0001"); // n=-3 → fixed
+        assert_eq!(val(ColumnData::Float64(vec![1e-7])), "1e-7"); // n=-6 → scientific
+        assert_eq!(val(ColumnData::Float64(vec![1234.5])), "1234.5");
+        assert_eq!(val(ColumnData::Float32(vec![0.1])), "0.1");
     }
 
     #[test]
@@ -798,15 +1161,14 @@ mod tests {
 
     #[test]
     fn unsupported_returns_unsupported_kind() {
-        // `Nested` is one of the variants still uncovered in Stage 1.
-        let col = ColumnData::Nested {
-            fields: vec![],
-            offsets: vec![0],
-        };
+        // `Nothing` is still uncovered in write_value — it only ever appears
+        // as `Nullable(Nothing)` (always NULL, handled by the Nullable arm),
+        // so a bare Nothing column has no text rendering.
+        let col = ColumnData::Nothing(1);
         let mut buf = Vec::new();
         let err = write_value(&mut buf, &col, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("Nested"));
+        assert!(err.to_string().contains("Nothing"));
     }
 
     #[test]

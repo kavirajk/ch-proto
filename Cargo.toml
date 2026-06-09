@@ -42,11 +42,6 @@ zstd = "0.13"
 # ClickHouse uses CityHash v1.0.2 (NOT modern Google CityHash). This crate
 # is the established Rust binding from the clickhouse-rs ecosystem.
 clickhouse-rs-cityhash-sys = "0.1"
-# Shortest-roundtrip decimal float formatter. Matches the dragonbox-style
-# output that ClickHouse's `writeFloatText` produces in TabSeparated format.
-# Rust's stdlib Display for f32/f64 produces full decimal expansion for
-# values like `1e308`; ryu picks scientific notation when it's shorter.
-ryu = "1"
 # Socket options not exposed by std::net::TcpStream — used to set TCP
 # keepalive (SO_KEEPALIVE + TCP_KEEPIDLE) on the client socket, matching
 # ClickHouse's client (`Connection.cpp`).

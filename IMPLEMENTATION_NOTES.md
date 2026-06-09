@@ -224,7 +224,9 @@ Pass the negotiated protocol version through the Block encode and decode functio
 
 **Cause.** The server sends types like `Enum8('increment' = 1, 'gauge' = 2)` for columns the spec describes as `Int8` (e.g., the ProfileEvents `type` column). The wire bytes are identical to `Int8` — one byte per row — but the type string on the wire differs.
 
-**Fix.** Treat `Enum8` as `Int8` and `Enum16` as `Int16` during column decoding. The preferred approach is to strip the `(...)` parameter suffix from the type string and dispatch on the base name (see §2.3 below).
+**Fix.** Decode `Enum8`/`Enum16` with the same wire reader as `Int8`/`Int16` (strip the `(...)` suffix and dispatch on the base name, see §2.3), but keep them as distinct `ColumnData::Enum8`/`Enum16` variants.
+
+**Rendering.** A TabSeparated value of an Enum is its *label*, not the integer (e.g. `hello`, or `'hello'` quoted inside a composite). The label↔value map lives only in the type string, so the decoder parses it (`parse_enum_names`) and stores it on the variant (`names: Vec<(i16, String)>`); the formatter looks the row's value up there. This is why the integer-only representation was insufficient — `ColumnData` alone must carry the map for nested cases like `Map(Enum16(...), V)`.
 
 ---
 
@@ -359,6 +361,20 @@ This pitfall affects every type in `NATIVE_FORMAT.md` §4.4 (versioned types). T
 
 ---
 
+### 2.9 Float text uses double-conversion ECMAScript notation, not `ryu`
+
+**Symptom.** A value like `2.0988e19` rendered as `2.0988295479420645e19` (scientific) while ClickHouse prints `20988295479420645000` (fixed).
+
+**Cause.** ClickHouse's `writeFloatText` uses the double-conversion library in ECMAScript mode (`decimal_in_shortest_low = -6`, `decimal_in_shortest_high = 21`): fixed notation when the decimal-point position `n` satisfies `-5 <= n <= 21`, scientific otherwise (and no `+` on positive exponents). `ryu`'s threshold for switching to scientific is different.
+
+**Fix.** Take the shortest *normalized* digits from Rust's `{:e}` formatter (itself a shortest-round-trip algorithm) and re-render under the ECMAScript rules (`write_float_ecma` in `src/tsv.rs`). The `ryu` dependency was removed.
+
+### 2.10 DateTime / DateTime64 text is UTC and version-faithful
+
+`DateTime`/`DateTime64` are rendered in **UTC** (per-column timezone strings like `DateTime('Europe/Berlin')` are not yet applied — a tz database is needed) and `DateTime64` prints **all `scale` fractional digits** (e.g. `00:00:00.000000`). This matches the connected server: ClickHouse 26.5 `FORMAT TabSeparated` produces the same bytes. Differential `.reference` files captured on a server with a non-UTC session timezone, or on a ClickHouse version that trims zero fractions, will differ — that is timezone/version skew, **not** a client defect, so the formatter is deliberately left faithful to the server we talk to.
+
+---
+
 ## Reference Rust client status
 
 This repository contains a Rust implementation of the client side of the protocol. The status of each spec area in that implementation is documented here.
@@ -368,9 +384,9 @@ This repository contains a Rust implementation of the client side of the protoco
 - **Protocol:** Handshake (with addendum), Ping/Pong, Query, INSERT (single-block and streaming), response stream loop.
 - **Messages:** Hello, Query, ClientInfo, Setting, Parameter, Block, Progress, ProfileInfo, Totals, Extremes, Log, ProfileEvents, TableColumns, Exception, EndOfStream.
 - **Format primitives:** VarUInt, fixed-width integers (8/16/32/64/128/256 bit, both signed and unsigned), String, FixedString, Bool, Float32, Float64.
-- **Date/time:** Date, Date32, DateTime, DateTime64.
-- **Domain types:** UUID (with the byte-swap quirk handled at the boundary), IPv4, IPv6, Enum8, Enum16, Decimal(P, S) at all four widths.
-- **Composites:** Nullable, Array, Tuple, Map, Nested.
+- **Date/time:** Date, Date32, DateTime, DateTime64, Time, Time64 (experimental; `[-]HH:MM:SS[.frac]`, capped at ±999:59:59).
+- **Domain types:** UUID (with the byte-swap quirk handled at the boundary), IPv4, IPv6, Enum8, Enum16 (rendered as labels), Decimal(P, S) at all four widths, BFloat16, Interval (all units).
+- **Composites:** Nullable, Array, Tuple (including empty `Tuple()`), Map, Nested.
 - **Versioned types (Tier 1 only):** LowCardinality, JSON Tier 1 (String fallback). Both subject to the single-data-block limitation (§2.8).
 - **Compression frame primitives:** LZ4, ZSTD, NONE encode/decode with CityHash102 verification. Connection-level integration is not yet wired up — `with_compression(true)` sets the wire flag but the response decoder cannot consume compressed blocks.
 
@@ -385,7 +401,7 @@ This repository contains a Rust implementation of the client side of the protoco
 - **SSH challenge-response authentication** (v54466+).
 - **Query plan serialization** (v54477+).
 - **Chunked protocol** (v54470+).
-- **AggregateFunction**, **SimpleAggregateFunction**, **Interval**, **Geo types** (Point, Ring, Polygon, MultiPolygon).
+- **AggregateFunction**, **SimpleAggregateFunction**, **QBit**, **Geo types** (Point, Ring, Polygon, MultiPolygon).
 
 ### Library and dependency choices
 
@@ -395,8 +411,8 @@ This repository contains a Rust implementation of the client side of the protoco
 | LZ4 compression | `lz4_flex` crate (pure Rust, block format, not the LZ4 frame format) |
 | ZSTD compression | `zstd` crate |
 | CityHash128 (compression-frame checksum) | `clickhouse-rs-cityhash-sys` crate. ClickHouse uses CityHash v1.0.2, NOT modern Google CityHash; the two produce different outputs. |
-| 256-bit integers (Int256, UInt256) | Raw `[u8; 32]` arrays. Rust has native `i128`/`u128` but no 256-bit integers; callers convert to a big-int type if needed. |
-| 256-bit decimal (Decimal256) | Same — raw `[u8; 32]` plus scale metadata. |
+| 256-bit integers (Int256, UInt256) | Raw `[u8; 32]` LE two's-complement arrays. Rust has native `i128`/`u128` but no 256-bit integers. The `ch-tsv` TabSeparated formatter renders them directly via long division on the magnitude (`u256_to_decimal` in `src/tsv.rs`); other callers convert to a big-int type if needed. |
+| 256-bit decimal (Decimal256) | Same — raw `[u8; 32]` plus scale metadata; `ch-tsv` renders with the shared sign/scale logic (`write_decimal256`). |
 
 ### Where to find each piece
 

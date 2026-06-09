@@ -96,9 +96,15 @@ pub enum ColumnData {
     /// `IPv6`: 16 bytes verbatim in network byte order. Stored as `[u8; 16]`
     /// — same byte order as `std::net::Ipv6Addr::octets()`.
     Ipv6(Vec<[u8; 16]>),
-    /// `Enum16` is wire-compatible with `Int16`. Variant labels live in the
-    /// type string, byte layout is Int16 LE.
-    Enum16(Vec<i16>),
+    /// `Enum8` is wire-compatible with `Int8` (one byte per row). The label
+    /// ↔ value mapping is parsed out of the type string and kept in `names`
+    /// so the formatter can render the label (e.g. `hello`) rather than the
+    /// raw integer. `names` holds `(value, label)` pairs; values fit in i16.
+    Enum8 { values: Vec<i8>, names: Vec<(i16, String)> },
+    /// `Enum16` is wire-compatible with `Int16` (two bytes LE per row). Like
+    /// `Enum8`, the label ↔ value mapping from the type string is kept in
+    /// `names` for rendering.
+    Enum16 { values: Vec<i16>, names: Vec<(i16, String)> },
     /// `Decimal(P, S)`. Width is implied by precision: P ≤ 9 → 4B, ≤ 18 → 8B,
     /// ≤ 38 → 16B, ≤ 76 → 32B. Stored here as the underlying signed integer
     /// in the matching width; scale is metadata for the caller.
@@ -115,6 +121,21 @@ pub enum ColumnData {
     Int256(Vec<[u8; 32]>),
     /// 256-bit unsigned integer, raw 32-byte LE bytes.
     Uint256(Vec<[u8; 32]>),
+    /// `BFloat16` — bfloat16 (the high 16 bits of an IEEE-754 `Float32`),
+    /// 2 bytes LE per row. Stored as the raw 16-bit pattern; rendering widens
+    /// it back to `Float32` (`bits << 16`) and formats as a float.
+    BFloat16(Vec<u16>),
+    /// `Time` — signed seconds of a clock value, `Int32` LE (4 bytes). Renders
+    /// as `[-]HH:MM:SS` where the hour field may exceed 23 (range ±999h).
+    Time(Vec<i32>),
+    /// `Time64(scale)` — `Int64` LE ticks at the given decimal `scale`, like
+    /// `DateTime64` but rendered as `[-]HH:MM:SS[.fraction]`.
+    Time64 { scale: u8, values: Vec<i64> },
+    /// `Interval<Unit>` (IntervalSecond, IntervalDay, IntervalMonth, …) — the
+    /// count as `Int64` LE. The unit lives only in the type string and does not
+    /// affect the wire form or the rendered value (a bare integer), so a single
+    /// variant covers every unit.
+    Interval(Vec<i64>),
     /// `LowCardinality(T)` — Tier 1 single-block-aware support.
     ///
     /// Wire format (per column):
@@ -595,7 +616,20 @@ fn materialize_replicated(
         ColumnData::Date(v) => lookup!(Date, v),
         ColumnData::Date32(v) => lookup!(Date32, v),
         ColumnData::DateTime(v) => lookup!(DateTime, v),
-        ColumnData::Enum16(v) => lookup!(Enum16, v),
+        ColumnData::Enum8 { values, names } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Enum8 { values: out, names })
+        }
+        ColumnData::Enum16 { values, names } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Enum16 { values: out, names })
+        }
         ColumnData::Ipv4(v) => lookup!(Ipv4, v),
         ColumnData::String(v) => {
             let mut out = Vec::with_capacity(indexes.len());
@@ -638,6 +672,16 @@ fn materialize_replicated(
                 out.push(values[check_bounds(idx)?]);
             }
             Ok(ColumnData::DateTime64 { scale, values: out })
+        }
+        ColumnData::BFloat16(v) => lookup!(BFloat16, v),
+        ColumnData::Time(v) => lookup!(Time, v),
+        ColumnData::Interval(v) => lookup!(Interval, v),
+        ColumnData::Time64 { scale, values } => {
+            let mut out = Vec::with_capacity(indexes.len());
+            for &idx in indexes {
+                out.push(values[check_bounds(idx)?]);
+            }
+            Ok(ColumnData::Time64 { scale, values: out })
         }
         ColumnData::Decimal32 { scale, values } => {
             let mut out = Vec::with_capacity(indexes.len());
@@ -858,7 +902,20 @@ fn materialize_sparse(
         ColumnData::Date(v) => expand_vec!(Date, v, 0u16),
         ColumnData::Date32(v) => expand_vec!(Date32, v, 0i32),
         ColumnData::DateTime(v) => expand_vec!(DateTime, v, 0u32),
-        ColumnData::Enum16(v) => expand_vec!(Enum16, v, 0i16),
+        ColumnData::Enum8 { values, names } => {
+            let mut dense = vec![0i8; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense[pos] = values[i];
+            }
+            Ok(ColumnData::Enum8 { values: dense, names })
+        }
+        ColumnData::Enum16 { values, names } => {
+            let mut dense = vec![0i16; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense[pos] = values[i];
+            }
+            Ok(ColumnData::Enum16 { values: dense, names })
+        }
         ColumnData::Ipv4(v) => expand_vec!(Ipv4, v, 0u32),
         ColumnData::String(v) => {
             let mut dense = vec![String::new(); rows];
@@ -895,6 +952,16 @@ fn materialize_sparse(
                 dense[positions[i]] = val;
             }
             Ok(ColumnData::Ipv6(dense))
+        }
+        ColumnData::BFloat16(v) => expand_vec!(BFloat16, v, 0u16),
+        ColumnData::Time(v) => expand_vec!(Time, v, 0i32),
+        ColumnData::Interval(v) => expand_vec!(Interval, v, 0i64),
+        ColumnData::Time64 { scale, values } => {
+            let mut dense = vec![0i64; rows];
+            for (i, &pos) in positions.iter().enumerate() {
+                dense[pos] = values[i];
+            }
+            Ok(ColumnData::Time64 { scale, values: dense })
         }
         ColumnData::DateTime64 { scale, values } => {
             let mut dense = vec![0i64; rows];
@@ -993,10 +1060,15 @@ impl ColumnData {
             ColumnData::Date(v) => v.len(),
             ColumnData::Date32(v) => v.len(),
             ColumnData::DateTime64 { values, .. } => values.len(),
+            ColumnData::BFloat16(v) => v.len(),
+            ColumnData::Time(v) => v.len(),
+            ColumnData::Time64 { values, .. } => values.len(),
+            ColumnData::Interval(v) => v.len(),
             ColumnData::Uuid(v) => v.len(),
             ColumnData::Ipv4(v) => v.len(),
             ColumnData::Ipv6(v) => v.len(),
-            ColumnData::Enum16(v) => v.len(),
+            ColumnData::Enum8 { values, .. } => values.len(),
+            ColumnData::Enum16 { values, .. } => values.len(),
             ColumnData::Decimal32 { values, .. } => values.len(),
             ColumnData::Decimal64 { values, .. } => values.len(),
             ColumnData::Decimal128 { values, .. } => values.len(),
@@ -1385,6 +1457,11 @@ impl ColumnData {
                     w.write_u8(x as u8)?;
                 }
             }
+            ColumnData::Enum8 { values, .. } => {
+                for &x in values {
+                    w.write_u8(x as u8)?;
+                }
+            }
             ColumnData::Int32(v) => {
                 for &x in v {
                     w.write_i32(x)?;
@@ -1415,6 +1492,11 @@ impl ColumnData {
                 inner.encode(w)?;
             }
             ColumnData::Tuple(values) => {
+                // NOTE: an empty `Tuple()` carries no element columns, so this
+                // writes zero bytes — but the wire form is one placeholder byte
+                // per row (see the decode side). Re-encoding an empty tuple is
+                // therefore not byte-symmetric. Only the read path is exercised
+                // (SELECT results); empty-tuple INSERT is not supported.
                 for v in values {
                     v.encode(w)?;
                 }
@@ -1438,8 +1520,13 @@ impl ColumnData {
                     col.encode(w)?;
                 }
             }
-            ColumnData::Int16(v) | ColumnData::Enum16(v) => {
+            ColumnData::Int16(v) => {
                 for &x in v {
+                    w.write_i16(x)?;
+                }
+            }
+            ColumnData::Enum16 { values, .. } => {
+                for &x in values {
                     w.write_i16(x)?;
                 }
             }
@@ -1470,6 +1557,26 @@ impl ColumnData {
             }
             ColumnData::DateTime64 { values, .. } => {
                 for &x in values {
+                    w.write_i64(x)?;
+                }
+            }
+            ColumnData::BFloat16(v) => {
+                for &x in v {
+                    w.write_u16(x)?;
+                }
+            }
+            ColumnData::Time(v) => {
+                for &x in v {
+                    w.write_i32(x)?;
+                }
+            }
+            ColumnData::Time64 { values, .. } => {
+                for &x in values {
+                    w.write_i64(x)?;
+                }
+            }
+            ColumnData::Interval(v) => {
+                for &x in v {
                     w.write_i64(x)?;
                 }
             }
@@ -1694,24 +1801,30 @@ impl ColumnData {
                 }
                 Ok(ColumnData::Uint64(v))
             }
-            // Enum8 is wire-compatible with Int8 (single byte per row).
+            // Enum8 is wire-compatible with Int8 (single byte per row); a plain
+            // Int8 has no label map. We keep Enum8 as its own variant carrying
+            // the parsed label map so the formatter can render labels.
             "Int8" | "Enum8" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     v.push(r.read_u8()? as i8);
                 }
-                Ok(ColumnData::Int8(v))
+                if base_type == "Enum8" {
+                    Ok(ColumnData::Enum8 { values: v, names: parse_enum_names(data_type) })
+                } else {
+                    Ok(ColumnData::Int8(v))
+                }
             }
             // Enum16 is wire-compatible with Int16. We expose Enum16 as its
-            // own variant so the type string round-trips, but the bytes are
-            // identical to Int16. (See SPEC §11.8 / §11.18.)
+            // own variant so the type string round-trips and the label map is
+            // available for rendering; the bytes are identical to Int16.
             "Int16" | "Enum16" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
                     v.push(r.read_i16()?);
                 }
                 if base_type == "Enum16" {
-                    Ok(ColumnData::Enum16(v))
+                    Ok(ColumnData::Enum16 { values: v, names: parse_enum_names(data_type) })
                 } else {
                     Ok(ColumnData::Int16(v))
                 }
@@ -1758,6 +1871,57 @@ impl ColumnData {
                     values.push(r.read_i64()?);
                 }
                 Ok(ColumnData::DateTime64 { scale, values })
+            }
+            "BFloat16" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_u16()?);
+                }
+                Ok(ColumnData::BFloat16(v))
+            }
+            "Time" => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i32()?);
+                }
+                Ok(ColumnData::Time(v))
+            }
+            "Time64" => {
+                // Same scale param shape as DateTime64; ticks are Int64 LE.
+                let scale = parse_datetime64_scale(data_type)?;
+                let mut values = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    values.push(r.read_i64()?);
+                }
+                Ok(ColumnData::Time64 { scale, values })
+            }
+            // Interval<Unit> — every unit (Second, Day, Month, …) is an Int64
+            // count on the wire; the unit is carried by the type string only.
+            base if base.starts_with("Interval") => {
+                let mut v = Vec::with_capacity(rows);
+                for _ in 0..rows {
+                    v.push(r.read_i64()?);
+                }
+                Ok(ColumnData::Interval(v))
+            }
+            // Geo types are aliases over Tuple/Array of Float64 points; the
+            // server sends the geo name but the bytes are the underlying
+            // composite. Dispatch to the underlying type and reuse its decoder
+            // (which recurses back here for the nested geo names).
+            //   Point        = Tuple(Float64, Float64)
+            //   Ring/LineString          = Array(Point)
+            //   Polygon/MultiLineString  = Array(Ring)
+            //   MultiPolygon             = Array(Polygon)
+            "Point" => ColumnData::decode(r, "Tuple(Float64, Float64)", rows),
+            "Ring" | "LineString" => ColumnData::decode(r, "Array(Point)", rows),
+            "Polygon" | "MultiLineString" => ColumnData::decode(r, "Array(Ring)", rows),
+            "MultiPolygon" => ColumnData::decode(r, "Array(Polygon)", rows),
+            // SimpleAggregateFunction(func, T[, ...]) is wire-identical to its
+            // underlying value type T — decode that. (Multi-arg forms whose
+            // physical type isn't a single argument are not supported.)
+            "SimpleAggregateFunction" => {
+                let inner = parse_simple_aggregate_inner(data_type)?;
+                ColumnData::decode(r, &inner, rows)
             }
             "UUID" => {
                 let mut v = Vec::with_capacity(rows);
@@ -1996,6 +2160,15 @@ impl ColumnData {
             }
             "Tuple" => {
                 let inner_dts = parse_tuple_inner_types(data_type)?;
+                if inner_dts.is_empty() {
+                    // Empty `Tuple()` serializes like Nothing: one placeholder
+                    // byte ('0') per row, which the deserializer discards. The
+                    // row count comes from the block header, so the in-memory
+                    // shape is just an element-less tuple.
+                    let mut placeholder = vec![0u8; rows];
+                    r.read_exact(&mut placeholder)?;
+                    return Ok(ColumnData::Tuple(Vec::new()));
+                }
                 let mut dts: Vec<ColumnData> = Vec::with_capacity(inner_dts.len());
 
                 for dt in &inner_dts {
@@ -2569,6 +2742,95 @@ fn parse_map_inner_types(data_type: &str) -> Result<(String, String)> {
     Ok((iter.next().unwrap(), iter.next().unwrap()))
 }
 
+// Extract the underlying value type from a `SimpleAggregateFunction(func, T)`
+// type string. The first depth-aware element is the aggregate function name
+// (which may itself carry parens, e.g. `quantile(0.5)`); the rest is the value
+// type. For the common single-type form this returns `T`.
+fn parse_simple_aggregate_inner(data_type: &str) -> Result<String> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid SimpleAggregateFunction type string: {data_type}"),
+        )
+    };
+    let begin = data_type.find('(').ok_or_else(err)?;
+    let end = data_type.rfind(')').ok_or_else(err)?;
+    if end < begin + 1 {
+        return Err(err());
+    }
+    let inner = data_type[begin + 1..end].trim();
+    let parts = split_with_composite(inner)?;
+    if parts.len() < 2 {
+        return Err(err());
+    }
+    Ok(parts[1..].join(", "))
+}
+
+// Parse the label↔value map out of an `Enum8`/`Enum16` type string, e.g.
+// `Enum8('a' = 1, 'hello' = -2)` → [(1, "a"), (-2, "hello")]. Labels are
+// single-quoted with `\'`/`\\` escapes and may contain commas, spaces and `=`,
+// so we scan char-wise rather than splitting on `,`. Values fit in i16 for
+// both Enum8 and Enum16. Returns an empty map for a malformed string (the
+// formatter then falls back to printing the integer).
+fn parse_enum_names(data_type: &str) -> Vec<(i16, String)> {
+    let mut out = Vec::new();
+    let (begin, end) = match (data_type.find('('), data_type.rfind(')')) {
+        (Some(b), Some(e)) if e > b => (b + 1, e),
+        _ => return out,
+    };
+    let s = data_type[begin..end].as_bytes();
+    let mut i = 0usize;
+    while i < s.len() {
+        // Advance to the opening quote of the next label.
+        while i < s.len() && s[i] != b'\'' {
+            i += 1;
+        }
+        if i >= s.len() {
+            break;
+        }
+        i += 1; // past opening quote
+        let mut label: Vec<u8> = Vec::new();
+        while i < s.len() {
+            match s[i] {
+                b'\\' if i + 1 < s.len() => {
+                    label.push(s[i + 1]);
+                    i += 2;
+                }
+                b'\'' => {
+                    i += 1;
+                    break;
+                }
+                c => {
+                    label.push(c);
+                    i += 1;
+                }
+            }
+        }
+        // Advance past `=` to the integer value.
+        while i < s.len() && s[i] != b'=' {
+            i += 1;
+        }
+        if i >= s.len() {
+            break;
+        }
+        i += 1; // past '='
+        while i < s.len() && s[i] == b' ' {
+            i += 1;
+        }
+        let start = i;
+        if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
+            i += 1;
+        }
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        if let Ok(val) = std::str::from_utf8(&s[start..i]).unwrap_or("").parse::<i16>() {
+            out.push((val, String::from_utf8_lossy(&label).into_owned()));
+        }
+    }
+    out
+}
+
 // Pase the list of different types in Tuple(T1, T2,..). It's different than
 // generic composite type with single inner type. Hence different helper.
 // Tuple(Int8, String, Tuple(Int)) will return ["Int8", "String", "Tuple(Int)"].
@@ -2581,12 +2843,20 @@ fn parse_tuple_inner_types(data_type: &str) -> Result<Vec<String>> {
     };
     let begin = data_type.find('(').ok_or_else(err)?;
     let end = data_type.rfind(')').ok_or_else(err)?;
-    if begin + 1 >= end {
+    // `)` must come at or after `(` + 1. Equal-adjacent (`Tuple()`) is the
+    // valid *empty* tuple — zero elements — not a parse error; only a `)`
+    // before `(` is malformed. This guard also keeps the slice below in range.
+    if end < begin + 1 {
         return Err(err());
     }
 
-    let inner = data_type[begin + 1..end].trim().to_string();
-    let dts: Vec<String> = split_with_composite(&inner)?;
+    let inner = data_type[begin + 1..end].trim();
+    // `Tuple()` — a zero-element tuple. Its wire encoding is zero bytes (no
+    // element sub-columns); row count comes from the block header.
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dts: Vec<String> = split_with_composite(inner)?;
     // Named-tuple support: `Tuple(name1 UInt64, name2 String)`. After the
     // depth-aware split each piece may carry a leading identifier; strip it
     // so the recursive decoder sees only the type. The wire format is the
@@ -4675,6 +4945,23 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_tuple_decode_consumes_placeholder_bytes() {
+        // `Tuple()` (zero elements) serializes like Nothing: one placeholder
+        // byte per row. Decode must consume exactly `rows` bytes so the stream
+        // stays aligned for the next column (regression: it previously read
+        // zero, desyncing the block — see 02494_query_cache_empty_tuple).
+        let wire = [0x30u8, 0x30, 0x30, 0xAB]; // 3 placeholders + 1 sentinel
+        let mut cursor = Cursor::new(&wire[..]);
+        let data = ColumnData::decode(&mut cursor, "Tuple()", 3).unwrap();
+        match data {
+            ColumnData::Tuple(elems) => assert!(elems.is_empty()),
+            _ => panic!("expected empty Tuple"),
+        }
+        // Exactly 3 bytes consumed; the sentinel remains for the next column.
+        assert_eq!(cursor.position(), 3);
+    }
+
+    #[test]
     fn test_tuple_single_element() {
         // Tuple(Int32) — single-element tuple is legal in ClickHouse.
         let col = Column {
@@ -4919,8 +5206,14 @@ mod tests {
 
     #[test]
     fn test_parse_tuple_inner_types_invalid() {
+        // No parentheses at all is malformed.
         assert!(parse_tuple_inner_types("Tuple").is_err());
-        assert!(parse_tuple_inner_types("Tuple()").is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_tuple_is_zero_elements() {
+        // `Tuple()` is the valid empty tuple — zero element types, not an error.
+        assert_eq!(parse_tuple_inner_types("Tuple()").unwrap(), Vec::<String>::new());
     }
 
     // -- Map(K, V) --
@@ -5993,14 +6286,18 @@ mod tests {
             name: "e".to_string(),
             data_type: "Enum16('a' = 1, 'b' = 30000)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::Enum16(vec![1, 30000, -1]),
+            data: ColumnData::Enum16 { values: vec![1, 30000, -1], names: vec![] },
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
         let mut cursor = Cursor::new(buf.as_slice());
         let decoded = Column::decode(&mut cursor, 3, PROTOCOL).unwrap();
         match decoded.data {
-            ColumnData::Enum16(v) => assert_eq!(v, vec![1, 30000, -1]),
+            ColumnData::Enum16 { values, names } => {
+                assert_eq!(values, vec![1, 30000, -1]);
+                // The label map is parsed from the type string on decode.
+                assert_eq!(names, vec![(1i16, "a".to_string()), (30000i16, "b".to_string())]);
+            }
             _ => panic!("expected Enum16"),
         }
     }
@@ -6012,12 +6309,62 @@ mod tests {
             name: "e".to_string(),
             data_type: "Enum16('a' = 1, 'b' = 30000)".to_string(),
             serialization: Serialization::Default,
-            data: ColumnData::Enum16(vec![30000]),
+            data: ColumnData::Enum16 { values: vec![30000], names: vec![] },
         };
         let mut buf = Vec::new();
         col.encode(&mut buf, PROTOCOL).unwrap();
         let tail = &buf[buf.len() - 2..];
         assert_eq!(tail, &[0x30, 0x75]);
+    }
+
+    #[test]
+    fn test_point_decodes_as_tuple_of_float64() {
+        // Geo `Point` is wire-identical to Tuple(Float64, Float64).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&1.0f64.to_le_bytes());
+        wire.extend_from_slice(&2.0f64.to_le_bytes());
+        let mut cur = Cursor::new(wire.as_slice());
+        match ColumnData::decode(&mut cur, "Point", 1).unwrap() {
+            ColumnData::Tuple(elems) => match (&elems[0], &elems[1]) {
+                (ColumnData::Float64(a), ColumnData::Float64(b)) => {
+                    assert_eq!(a, &vec![1.0]);
+                    assert_eq!(b, &vec![2.0]);
+                }
+                _ => panic!("expected two Float64 elements"),
+            },
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_simple_aggregate_inner() {
+        assert_eq!(
+            parse_simple_aggregate_inner("SimpleAggregateFunction(sum, UInt64)").unwrap(),
+            "UInt64"
+        );
+        assert_eq!(
+            parse_simple_aggregate_inner("SimpleAggregateFunction(groupArrayArray, Array(UInt64))")
+                .unwrap(),
+            "Array(UInt64)"
+        );
+    }
+
+    #[test]
+    fn test_parse_enum_names() {
+        assert_eq!(
+            parse_enum_names("Enum8('a' = 1, 'b' = -2)"),
+            vec![(1i16, "a".to_string()), (-2i16, "b".to_string())]
+        );
+        // Labels may contain commas, spaces and '=' inside the quotes.
+        assert_eq!(
+            parse_enum_names("Enum16('a, b = c' = 5, 'x' = 10)"),
+            vec![(5i16, "a, b = c".to_string()), (10i16, "x".to_string())]
+        );
+        // Escaped quote in a label.
+        assert_eq!(
+            parse_enum_names(r"Enum8('it\'s' = 1)"),
+            vec![(1i16, "it's".to_string())]
+        );
     }
 
     // -- Phase 7: Decimal --

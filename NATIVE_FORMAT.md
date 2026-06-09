@@ -462,7 +462,7 @@ Enum8('active' = 1, 'inactive' = 2, 'banned' = -1)
 Enum16('a' = 1, 'b' = 30000)
 ```
 
-A decoder may strip the `(...)` parameter suffix and dispatch as `Int8` / `Int16`. Clients that need the human-readable label parse the type string.
+A decoder may strip the `(...)` parameter suffix and dispatch as `Int8` / `Int16`. Clients that need the human-readable label parse the label↔value map out of the type string and keep it alongside the values — text output (TabSeparated, etc.) renders the **label** (`active`), not the integer; inside composites it is single-quoted (`'active'`). Because the map is not recoverable from the integer column alone, it must be retained for nested enums such as `Array(Enum8(...))` or `Map(Enum16(...), V)`.
 
 **Byte-level example — `Enum8('active' = 1, 'inactive' = 2)` column `[active, inactive, active]`:**
 
@@ -525,6 +525,43 @@ The `Nothing` type carries no values. It appears in practice only as the inner t
 ```
 
 The null-map prefix is the standard `Nullable` framing (§3.3); the inner three bytes are the `Nothing` payload and would be skipped by the decoder.
+
+#### 3.1.12 BFloat16
+
+`BFloat16` is the brain-floating-point format: the high 16 bits of an IEEE-754 `Float32` (1 sign, 8 exponent, 7 mantissa bits). **Wire format:** 2 bytes LE per row — the raw 16-bit pattern. To obtain the value, widen to `Float32` by shifting the pattern into the high half (`f32::from_bits((bits as u32) << 16)`); text output uses the same float formatting as `Float32` (§2.9 of Implementation Notes). Example: `1.5` → bits `0x3FC0` → wire `c0 3f`.
+
+#### 3.1.13 Time and Time64(scale)
+
+`Time` is a signed clock duration in **seconds**, `Int32` LE (4 bytes). `Time64(scale)` is signed **ticks** at the given decimal scale (0–9), `Int64` LE (8 bytes) — same shape as `DateTime64`.
+
+**Text format:** `[-]HH:MM:SS[.fraction]`. Unlike `DateTime` the hour field is *not* wrapped to a day — it is the total hour count and may exceed 23. The displayed value is **capped to ±999:59:59** (`3599999` seconds); a magnitude beyond the cap renders as `999:59:59` with a zeroed fraction (`999:59:59.000`). `CAST` also clamps the stored value to this range, but arithmetic can produce out-of-range values that are only clamped on display.
+
+```
+Time         value 45296            → 12:34:56     wire: f0 b0 00 00
+Time64(3)    value 45296789 ticks   → 12:34:56.789 wire: 95 2c b3 02 00 00 00 00
+```
+
+> Requires `allow_experimental_time_time64_type = 1` on the server (these types are experimental as of v26.x).
+
+#### 3.1.14 Interval
+
+`Interval<Unit>` — `IntervalNanosecond`, `IntervalSecond`, `IntervalMinute`, `IntervalHour`, `IntervalDay`, `IntervalWeek`, `IntervalMonth`, `IntervalQuarter`, `IntervalYear`, etc. **Wire format:** the count as `Int64` LE (8 bytes). The unit lives **only in the type string** — it affects neither the wire encoding nor the text output, which is the bare integer (`5`). A single decoder path handles every unit.
+
+#### 3.1.15 Geo types and SimpleAggregateFunction (type aliases)
+
+Two families are pure **aliases** — the server sends the alias name in the column header, but the bytes on the wire are those of an underlying type, so a decoder maps the name to that type and reuses its codec:
+
+| Type | Underlying wire type |
+|------|----------------------|
+| `Point` | `Tuple(Float64, Float64)` |
+| `Ring`, `LineString` | `Array(Point)` |
+| `Polygon`, `MultiLineString` | `Array(Ring)` |
+| `MultiPolygon` | `Array(Polygon)` |
+| `SimpleAggregateFunction(func, T[, …])` | its value type `T` |
+
+Geo values therefore render as nested tuples/arrays (`(1,2)`, `[(0,0),(1,1)]`, …). `SimpleAggregateFunction` stores a *finalized* value, so its wire form and rendering are exactly those of `T`; only the single-value-type form is supported (multi-argument aggregate state types are not).
+
+> `AggregateFunction(func, …)` (intermediate aggregation **state**, not a finalized value) and `QBit(T, N)` (bit-plane-transposed vector storage) are **not** decoded — their wire formats are function/codec specific. See the nested-types design note.
 
 ### 3.2 Variable-length Types
 
@@ -750,9 +787,10 @@ Each stream encodes exactly `num_rows` values. There is no length prefix, no off
 
 **Invariants.**
 
-1. Tuple has at least one element (`n >= 1`). Empty tuples are rejected at type-parse time.
-2. Every element stream encodes exactly `num_rows` values.
-3. An empty column (`num_rows == 0`) writes zero bytes per stream.
+1. Every element stream encodes exactly `num_rows` values.
+2. An empty column (`num_rows == 0`) writes zero bytes per stream.
+
+**Empty tuple — `Tuple()`.** A zero-element tuple is legal (e.g. `SELECT tuple()`, `CAST(x AS Tuple())`). It has no element streams; instead it serializes like `Nothing` (§3.1.11) — **one placeholder byte (`0x30`, ASCII `'0'`) per row** — and the deserializer discards them. The row count comes from the block header. (Reference decoder: `parse_tuple_inner_types` returns an empty list and the decoder then consumes `num_rows` placeholder bytes.)
 
 **Composes with.** Element types may be any type, including other composites. `Tuple(Tuple(...), ...)`, `Tuple(Array(...), ...)`, `Tuple(Nullable(T1), T2)` are all legal. The depth-aware comma splitter described in Implementation Notes §2.6 is required to parse the element list.
 
