@@ -91,9 +91,13 @@ pub fn write_value<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::Res
         ColumnData::Decimal128 { scale, values } => write_decimal(w, values[row], *scale),
         ColumnData::Int128(v) => write!(w, "{}", v[row]),
         ColumnData::Uint128(v) => write!(w, "{}", v[row]),
+        ColumnData::Int256(v) => write_i256(w, &v[row]),
+        ColumnData::Uint256(v) => write_u256(w, &v[row]),
+        ColumnData::Decimal256 { scale, values } => write_decimal256(w, &values[row], *scale),
         ColumnData::Array { inner, offsets } => write_array(w, inner, offsets, row),
         ColumnData::Tuple(elems) => write_tuple(w, elems, row),
         ColumnData::Map { keys, values, offsets } => write_map(w, keys, values, offsets, row),
+        ColumnData::Nested { fields, offsets } => write_nested(w, fields, offsets, row),
         ColumnData::LowCardinality { dict, keys, .. } => {
             // LowCardinality(T) renders as T after dictionary lookup. Keys
             // index into the dict; the dict's value at that index is the
@@ -293,8 +297,7 @@ fn write_datetime64<W: Write>(w: &mut W, ticks: i64, scale: u8) -> io::Result<()
 // fractional parts share a sign — write the leading `-` once (even when the
 // whole part rounds to 0), then unsigned magnitude. Trailing zeros in the
 // fractional part are trimmed; if the entire fraction is zero, the decimal
-// point is omitted. Decimal256 (32-byte two's-complement values) is not
-// supported in Stage 1 — it would need 256-bit integer math.
+// point is omitted.
 fn write_decimal<W: Write>(w: &mut W, value: i128, scale: u8) -> io::Result<()> {
     let is_neg = value < 0;
     let abs: u128 = value.unsigned_abs();
@@ -316,6 +319,133 @@ fn write_decimal<W: Write>(w: &mut W, value: i128, scale: u8) -> io::Result<()> 
         w.write_all(trimmed.as_bytes())?;
     }
     Ok(())
+}
+
+// --- 256-bit integer / decimal formatting -------------------------------
+//
+// Rust has no native i256/u256, so Int256/UInt256/Decimal256 are kept as raw
+// 32-byte little-endian two's-complement values (see ColumnData). These
+// helpers render them by long division on the magnitude — adequate for TSV
+// output (called once per value, 32 bytes wide).
+
+/// Decimal string of an unsigned 256-bit magnitude given as 32 LE bytes.
+/// Returns at least one digit ("0" for zero). No sign.
+fn u256_to_decimal(le: &[u8; 32]) -> String {
+    // Work on a big-endian copy so the most-significant byte leads.
+    let mut be = [0u8; 32];
+    for i in 0..32 {
+        be[i] = le[31 - i];
+    }
+    let mut digits: Vec<u8> = Vec::with_capacity(78); // ceil(256*log10(2)) = 78
+    loop {
+        let mut rem: u16 = 0;
+        let mut nonzero = false;
+        for byte in be.iter_mut() {
+            let cur = (rem << 8) | (*byte as u16);
+            *byte = (cur / 10) as u8;
+            rem = cur % 10;
+            if *byte != 0 {
+                nonzero = true;
+            }
+        }
+        digits.push(b'0' + rem as u8);
+        if !nonzero {
+            break;
+        }
+    }
+    digits.reverse();
+    // SAFETY: only ASCII digits were pushed.
+    String::from_utf8(digits).unwrap()
+}
+
+/// Split a 32-byte LE two's-complement value into (is_negative, |value| LE).
+fn i256_sign_magnitude(le: &[u8; 32]) -> (bool, [u8; 32]) {
+    let neg = le[31] & 0x80 != 0;
+    if !neg {
+        return (false, *le);
+    }
+    // Negate: two's complement = invert bytes + 1.
+    let mut mag = [0u8; 32];
+    let mut carry: u16 = 1;
+    for i in 0..32 {
+        let v = (!le[i]) as u16 + carry;
+        mag[i] = v as u8;
+        carry = v >> 8;
+    }
+    (true, mag)
+}
+
+fn write_u256<W: Write>(w: &mut W, le: &[u8; 32]) -> io::Result<()> {
+    w.write_all(u256_to_decimal(le).as_bytes())
+}
+
+fn write_i256<W: Write>(w: &mut W, le: &[u8; 32]) -> io::Result<()> {
+    let (neg, mag) = i256_sign_magnitude(le);
+    if neg {
+        w.write_all(b"-")?;
+    }
+    w.write_all(u256_to_decimal(&mag).as_bytes())
+}
+
+/// Decimal256 formatter — same rules as `write_decimal` but on a 256-bit
+/// signed magnitude. Whole and fractional parts share one sign; trailing
+/// fractional zeros are trimmed and the point omitted if the fraction is zero.
+fn write_decimal256<W: Write>(w: &mut W, le: &[u8; 32], scale: u8) -> io::Result<()> {
+    let (neg, mag) = i256_sign_magnitude(le);
+    let digits = u256_to_decimal(&mag);
+    if neg {
+        w.write_all(b"-")?;
+    }
+    let scale = scale as usize;
+    if scale == 0 {
+        return w.write_all(digits.as_bytes());
+    }
+    // Left-pad so there are at least `scale + 1` digits → at least one whole
+    // digit plus the full fractional part.
+    let padded;
+    let digits = if digits.len() <= scale {
+        padded = format!("{:0>width$}", digits, width = scale + 1);
+        padded.as_str()
+    } else {
+        digits.as_str()
+    };
+    let split = digits.len() - scale;
+    let whole = &digits[..split];
+    let frac = digits[split..].trim_end_matches('0');
+    w.write_all(whole.as_bytes())?;
+    if !frac.is_empty() {
+        w.write_all(b".")?;
+        w.write_all(frac.as_bytes())?;
+    }
+    Ok(())
+}
+
+// `Nested(n1 T1, n2 T2, ...)` renders identically to `Array(Tuple(T1, ...))`:
+// an array of tuples, one tuple per element row. Inner values use the quoted
+// composite form, matching `SerializationArray`/`SerializationTuple`.
+fn write_nested<W: Write>(
+    w: &mut W,
+    fields: &[(String, ColumnData)],
+    offsets: &[u64],
+    row: usize,
+) -> io::Result<()> {
+    let start = if row == 0 { 0 } else { offsets[row - 1] as usize };
+    let end = offsets[row] as usize;
+    w.write_all(b"[")?;
+    for i in start..end {
+        if i > start {
+            w.write_all(b",")?;
+        }
+        w.write_all(b"(")?;
+        for (j, (_, col)) in fields.iter().enumerate() {
+            if j > 0 {
+                w.write_all(b",")?;
+            }
+            write_value_quoted(w, col, i)?;
+        }
+        w.write_all(b")")?;
+    }
+    w.write_all(b"]")
 }
 
 // Howard Hinnant's `civil_from_days` algorithm. Given a count of days since
@@ -358,11 +488,14 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         | ColumnData::Int64(_)
         | ColumnData::Int128(_)
         | ColumnData::Uint128(_)
+        | ColumnData::Int256(_)
+        | ColumnData::Uint256(_)
         | ColumnData::Float32(_)
         | ColumnData::Float64(_)
         | ColumnData::Decimal32 { .. }
         | ColumnData::Decimal64 { .. }
         | ColumnData::Decimal128 { .. }
+        | ColumnData::Decimal256 { .. }
         | ColumnData::Enum16(_)
         | ColumnData::Bool(_) => write_value(w, col, row),
         // Strings: 'wrapped with backslash escapes including \''.
@@ -428,6 +561,7 @@ fn write_value_quoted<W: Write>(w: &mut W, col: &ColumnData, row: usize) -> io::
         ColumnData::Array { inner, offsets } => write_array(w, inner, offsets, row),
         ColumnData::Tuple(elems) => write_tuple(w, elems, row),
         ColumnData::Map { keys, values, offsets } => write_map(w, keys, values, offsets, row),
+        ColumnData::Nested { fields, offsets } => write_nested(w, fields, offsets, row),
         ColumnData::LowCardinality { dict, keys, .. } => {
             write_value_quoted(w, dict, keys[row] as usize)
         }
@@ -657,6 +791,57 @@ mod tests {
     }
 
     #[test]
+    fn wide_ints_render_decimal() {
+        // UInt256: 0, 1, 256, and 2^256 - 1 (all bytes 0xff).
+        assert_eq!(val(ColumnData::Uint256(vec![[0u8; 32]])), "0");
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert_eq!(val(ColumnData::Uint256(vec![one])), "1");
+        let mut two56 = [0u8; 32];
+        two56[1] = 1;
+        assert_eq!(val(ColumnData::Uint256(vec![two56])), "256");
+        assert_eq!(
+            val(ColumnData::Uint256(vec![[0xffu8; 32]])),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        // Int256: -1 is all-ones two's complement; -256 too.
+        assert_eq!(val(ColumnData::Int256(vec![[0xffu8; 32]])), "-1");
+        assert_eq!(val(ColumnData::Int256(vec![one])), "1");
+    }
+
+    #[test]
+    fn decimal256_renders_with_scale() {
+        // 11 at scale 1 → 1.1
+        let mut v = [0u8; 32];
+        v[0] = 11;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![v] }), "1.1");
+        // 100 at scale 2 → 1 (trailing zeros trimmed, point omitted)
+        let mut v = [0u8; 32];
+        v[0] = 100;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 2, values: vec![v] }), "1");
+        // 5 at scale 3 → 0.005 (whole part padded to a single 0)
+        let mut v = [0u8; 32];
+        v[0] = 5;
+        assert_eq!(val(ColumnData::Decimal256 { scale: 3, values: vec![v] }), "0.005");
+        // negative: -11 at scale 1 → -1.1
+        let mut neg = [0xffu8; 32];
+        neg[0] = 0xff - 11 + 1; // two's complement of 11
+        assert_eq!(val(ColumnData::Decimal256 { scale: 1, values: vec![neg] }), "-1.1");
+    }
+
+    #[test]
+    fn nested_renders_as_array_of_tuples() {
+        let col = ColumnData::Nested {
+            fields: vec![
+                ("a".to_string(), ColumnData::Int32(vec![1, 2])),
+                ("b".to_string(), ColumnData::String(vec!["x".to_string(), "y".to_string()])),
+            ],
+            offsets: vec![2],
+        };
+        assert_eq!(val(col), "[(1,'x'),(2,'y')]");
+    }
+
+    #[test]
     fn float_specials() {
         assert_eq!(val(ColumnData::Float32(vec![f32::NAN])), "nan");
         assert_eq!(val(ColumnData::Float32(vec![f32::INFINITY])), "inf");
@@ -798,15 +983,14 @@ mod tests {
 
     #[test]
     fn unsupported_returns_unsupported_kind() {
-        // `Nested` is one of the variants still uncovered in Stage 1.
-        let col = ColumnData::Nested {
-            fields: vec![],
-            offsets: vec![0],
-        };
+        // `Nothing` is still uncovered in write_value — it only ever appears
+        // as `Nullable(Nothing)` (always NULL, handled by the Nullable arm),
+        // so a bare Nothing column has no text rendering.
+        let col = ColumnData::Nothing(1);
         let mut buf = Vec::new();
         let err = write_value(&mut buf, &col, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("Nested"));
+        assert!(err.to_string().contains("Nothing"));
     }
 
     #[test]

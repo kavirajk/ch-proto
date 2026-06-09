@@ -395,8 +395,8 @@ This repository contains a Rust implementation of the client side of the protoco
 | LZ4 compression | `lz4_flex` crate (pure Rust, block format, not the LZ4 frame format) |
 | ZSTD compression | `zstd` crate |
 | CityHash128 (compression-frame checksum) | `clickhouse-rs-cityhash-sys` crate. ClickHouse uses CityHash v1.0.2, NOT modern Google CityHash; the two produce different outputs. |
-| 256-bit integers (Int256, UInt256) | Raw `[u8; 32]` arrays. Rust has native `i128`/`u128` but no 256-bit integers; callers convert to a big-int type if needed. |
-| 256-bit decimal (Decimal256) | Same — raw `[u8; 32]` plus scale metadata. |
+| 256-bit integers (Int256, UInt256) | Raw `[u8; 32]` LE two's-complement arrays. Rust has native `i128`/`u128` but no 256-bit integers. The `ch-tsv` TabSeparated formatter renders them directly via long division on the magnitude (`u256_to_decimal` in `src/tsv.rs`); other callers convert to a big-int type if needed. |
+| 256-bit decimal (Decimal256) | Same — raw `[u8; 32]` plus scale metadata; `ch-tsv` renders with the shared sign/scale logic (`write_decimal256`). |
 
 ### Where to find each piece
 
