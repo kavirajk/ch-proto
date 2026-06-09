@@ -1904,6 +1904,25 @@ impl ColumnData {
                 }
                 Ok(ColumnData::Interval(v))
             }
+            // Geo types are aliases over Tuple/Array of Float64 points; the
+            // server sends the geo name but the bytes are the underlying
+            // composite. Dispatch to the underlying type and reuse its decoder
+            // (which recurses back here for the nested geo names).
+            //   Point        = Tuple(Float64, Float64)
+            //   Ring/LineString          = Array(Point)
+            //   Polygon/MultiLineString  = Array(Ring)
+            //   MultiPolygon             = Array(Polygon)
+            "Point" => ColumnData::decode(r, "Tuple(Float64, Float64)", rows),
+            "Ring" | "LineString" => ColumnData::decode(r, "Array(Point)", rows),
+            "Polygon" | "MultiLineString" => ColumnData::decode(r, "Array(Ring)", rows),
+            "MultiPolygon" => ColumnData::decode(r, "Array(Polygon)", rows),
+            // SimpleAggregateFunction(func, T[, ...]) is wire-identical to its
+            // underlying value type T — decode that. (Multi-arg forms whose
+            // physical type isn't a single argument are not supported.)
+            "SimpleAggregateFunction" => {
+                let inner = parse_simple_aggregate_inner(data_type)?;
+                ColumnData::decode(r, &inner, rows)
+            }
             "UUID" => {
                 let mut v = Vec::with_capacity(rows);
                 for _ in 0..rows {
@@ -2721,6 +2740,30 @@ fn parse_map_inner_types(data_type: &str) -> Result<(String, String)> {
     }
     let mut iter = parts.into_iter();
     Ok((iter.next().unwrap(), iter.next().unwrap()))
+}
+
+// Extract the underlying value type from a `SimpleAggregateFunction(func, T)`
+// type string. The first depth-aware element is the aggregate function name
+// (which may itself carry parens, e.g. `quantile(0.5)`); the rest is the value
+// type. For the common single-type form this returns `T`.
+fn parse_simple_aggregate_inner(data_type: &str) -> Result<String> {
+    let err = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid SimpleAggregateFunction type string: {data_type}"),
+        )
+    };
+    let begin = data_type.find('(').ok_or_else(err)?;
+    let end = data_type.rfind(')').ok_or_else(err)?;
+    if end < begin + 1 {
+        return Err(err());
+    }
+    let inner = data_type[begin + 1..end].trim();
+    let parts = split_with_composite(inner)?;
+    if parts.len() < 2 {
+        return Err(err());
+    }
+    Ok(parts[1..].join(", "))
 }
 
 // Parse the label↔value map out of an `Enum8`/`Enum16` type string, e.g.
@@ -6272,6 +6315,38 @@ mod tests {
         col.encode(&mut buf, PROTOCOL).unwrap();
         let tail = &buf[buf.len() - 2..];
         assert_eq!(tail, &[0x30, 0x75]);
+    }
+
+    #[test]
+    fn test_point_decodes_as_tuple_of_float64() {
+        // Geo `Point` is wire-identical to Tuple(Float64, Float64).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&1.0f64.to_le_bytes());
+        wire.extend_from_slice(&2.0f64.to_le_bytes());
+        let mut cur = Cursor::new(wire.as_slice());
+        match ColumnData::decode(&mut cur, "Point", 1).unwrap() {
+            ColumnData::Tuple(elems) => match (&elems[0], &elems[1]) {
+                (ColumnData::Float64(a), ColumnData::Float64(b)) => {
+                    assert_eq!(a, &vec![1.0]);
+                    assert_eq!(b, &vec![2.0]);
+                }
+                _ => panic!("expected two Float64 elements"),
+            },
+            _ => panic!("expected Tuple"),
+        }
+    }
+
+    #[test]
+    fn test_simple_aggregate_inner() {
+        assert_eq!(
+            parse_simple_aggregate_inner("SimpleAggregateFunction(sum, UInt64)").unwrap(),
+            "UInt64"
+        );
+        assert_eq!(
+            parse_simple_aggregate_inner("SimpleAggregateFunction(groupArrayArray, Array(UInt64))")
+                .unwrap(),
+            "Array(UInt64)"
+        );
     }
 
     #[test]

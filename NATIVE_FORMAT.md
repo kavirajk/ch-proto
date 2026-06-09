@@ -547,6 +547,22 @@ Time64(3)    value 45296789 ticks   → 12:34:56.789 wire: 95 2c b3 02 00 00 00 
 
 `Interval<Unit>` — `IntervalNanosecond`, `IntervalSecond`, `IntervalMinute`, `IntervalHour`, `IntervalDay`, `IntervalWeek`, `IntervalMonth`, `IntervalQuarter`, `IntervalYear`, etc. **Wire format:** the count as `Int64` LE (8 bytes). The unit lives **only in the type string** — it affects neither the wire encoding nor the text output, which is the bare integer (`5`). A single decoder path handles every unit.
 
+#### 3.1.15 Geo types and SimpleAggregateFunction (type aliases)
+
+Two families are pure **aliases** — the server sends the alias name in the column header, but the bytes on the wire are those of an underlying type, so a decoder maps the name to that type and reuses its codec:
+
+| Type | Underlying wire type |
+|------|----------------------|
+| `Point` | `Tuple(Float64, Float64)` |
+| `Ring`, `LineString` | `Array(Point)` |
+| `Polygon`, `MultiLineString` | `Array(Ring)` |
+| `MultiPolygon` | `Array(Polygon)` |
+| `SimpleAggregateFunction(func, T[, …])` | its value type `T` |
+
+Geo values therefore render as nested tuples/arrays (`(1,2)`, `[(0,0),(1,1)]`, …). `SimpleAggregateFunction` stores a *finalized* value, so its wire form and rendering are exactly those of `T`; only the single-value-type form is supported (multi-argument aggregate state types are not).
+
+> `AggregateFunction(func, …)` (intermediate aggregation **state**, not a finalized value) and `QBit(T, N)` (bit-plane-transposed vector storage) are **not** decoded — their wire formats are function/codec specific. See the nested-types design note.
+
 ### 3.2 Variable-length Types
 
 Each value carries its own length on the wire.
