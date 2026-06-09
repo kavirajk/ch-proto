@@ -75,6 +75,7 @@ fn main() -> Result<()> {
         info: Some(BlockInfo {
             overflows: false,
             bucket_number: -1,
+            out_of_order_buckets: Vec::new(),
         }),
         columns: vec![
             col(
@@ -140,7 +141,15 @@ fn main() -> Result<()> {
             col(
                 "log_level",
                 "Enum16('debug' = 10, 'info' = 20, 'warn' = 300, 'error' = 500)",
-                ColumnData::Enum16(vec![20, 300, 500]),
+                ColumnData::Enum16 {
+                    values: vec![20, 300, 500],
+                    names: vec![
+                        (10, "debug".into()),
+                        (20, "info".into()),
+                        (300, "warn".into()),
+                        (500, "error".into()),
+                    ],
+                },
             ),
             col("retry_count", "UInt8", ColumnData::Uint8(vec![0, 3, 7])),
             col("user_age", "Int16", ColumnData::Int16(vec![25, -1, 10_000])),

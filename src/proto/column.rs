@@ -2074,11 +2074,17 @@ impl ColumnData {
                         ));
                     }
                 };
-                // Dict size + values.
-                let dict_size = r.read_u64()? as usize;
+                // Dict size + values. Guard the counts against a sanity bound
+                // before allocating: a desynchronized stream (most commonly a
+                // *nested* LowCardinality inside Tuple/Array, whose batched
+                // state prefix this flat decoder does not route — see the
+                // nested-stateful limitation in NATIVE_FORMAT.md §3.4) yields a
+                // garbage 64-bit length that would otherwise abort the process
+                // with a multi-exabyte allocation.
+                let dict_size = checked_count(r.read_u64()?, "LowCardinality dict_size")?;
                 let dict = Box::new(ColumnData::decode(r, &inner_dt, dict_size)?);
                 // Keys count + keys.
-                let keys_count = r.read_u64()? as usize;
+                let keys_count = checked_count(r.read_u64()?, "LowCardinality keys_count")?;
                 let mut keys = Vec::with_capacity(keys_count);
                 for _ in 0..keys_count {
                     let k: u64 = match key_width {
@@ -2209,8 +2215,10 @@ impl ColumnData {
                     }
                 }
 
-                // Total element count = last cumulative offset (or 0 for empty column).
-                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+                // Total element count = last cumulative offset (or 0 for empty
+                // column). Bounded before it sizes the inner allocation.
+                let total_elements =
+                    checked_count(offsets.last().copied().unwrap_or(0), "Array total_elements")?;
 
                 let inner = Box::new(ColumnData::decode(r, &inner_dt, total_elements)?);
 
@@ -2239,7 +2247,8 @@ impl ColumnData {
                         ));
                     }
                 }
-                let total_elements = offsets.last().copied().unwrap_or(0) as usize;
+                let total_elements =
+                    checked_count(offsets.last().copied().unwrap_or(0), "Nested total_elements")?;
                 let mut fields: Vec<(String, ColumnData)> =
                     Vec::with_capacity(field_specs.len());
                 for (name, dt) in field_specs {
@@ -2271,7 +2280,8 @@ impl ColumnData {
                         ));
                     }
                 }
-                let total_pairs = offsets.last().copied().unwrap_or(0) as usize;
+                let total_pairs =
+                    checked_count(offsets.last().copied().unwrap_or(0), "Map total_pairs")?;
                 let keys = Box::new(ColumnData::decode(r, &k_dt, total_pairs)?);
                 let values = Box::new(ColumnData::decode(r, &v_dt, total_pairs)?);
                 Ok(ColumnData::Map {
@@ -2764,6 +2774,30 @@ fn parse_simple_aggregate_inner(data_type: &str) -> Result<String> {
         return Err(err());
     }
     Ok(parts[1..].join(", "))
+}
+
+// Sanity bound for element/dictionary counts read from the wire before they
+// are used to size an allocation. Real blocks never approach this (ClickHouse
+// caps a block at ~max_block_size and cumulative array offsets stay far below
+// 2^32 within one block); a larger value means the stream is misaligned —
+// most often a *nested* versioned/sparse type whose batched state prefix this
+// flat decoder does not route. Erroring here turns what was a multi-exabyte
+// allocation abort into a clean, catchable decode error.
+const MAX_WIRE_COUNT: u64 = 1 << 32;
+
+fn checked_count(raw: u64, what: &str) -> Result<usize> {
+    if raw > MAX_WIRE_COUNT {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{what} {raw} exceeds sanity bound — the stream is misaligned, most \
+                 likely a nested LowCardinality/sparse type whose batched state prefix \
+                 this flat decoder does not route (see the nested-stateful limitation \
+                 in NATIVE_FORMAT.md)"
+            ),
+        ));
+    }
+    Ok(raw as usize)
 }
 
 // Parse the label↔value map out of an `Enum8`/`Enum16` type string, e.g.

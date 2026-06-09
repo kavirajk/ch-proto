@@ -361,6 +361,23 @@ This pitfall affects every type in `NATIVE_FORMAT.md` §4.4 (versioned types). T
 
 ---
 
+### 2.8b INSERT with no data hangs (known limitation)
+
+`conn.query("INSERT INTO t VALUES")` with **no protocol data to send** (an empty
+INSERT, or `FROM INFILE`) blocks: the server replies with a sample/header block
+and waits for the client to stream data blocks + an empty terminator, while the
+SELECT-shaped `query()` path has already sent its terminator and is now blocked
+reading a response that never comes. `clickhouse-client` instead raises the
+client-side `NO_DATA_TO_INSERT` error.
+
+The differential tests that hit this (`02267_insert_empty_data`,
+`03351_client_insert_bad_connection_state`) are `-- { clientError … }` Stage-3
+tests, so they have no value for a stdout-diffing harness regardless; the
+30s `TIMEOUT_S` cap keeps a hung INSERT from blocking the run. A proper fix
+needs the INSERT write-path to detect "no data" and surface `NO_DATA_TO_INSERT`
+rather than block — deferred. INSERTs that carry inline `VALUES` (parsed
+server-side) or a `SELECT` source are unaffected.
+
 ### 2.9 Float text uses double-conversion ECMAScript notation, not `ryu`
 
 **Symptom.** A value like `2.0988e19` rendered as `2.0988295479420645e19` (scientific) while ClickHouse prints `20988295479420645000` (fixed).

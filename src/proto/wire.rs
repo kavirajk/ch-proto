@@ -127,6 +127,17 @@ pub trait ProtoRead: Read {
 
     fn read_string(&mut self) -> io::Result<String> {
         let l = self.read_len()?;
+        // Guard against a corrupt/desynchronized length (e.g. a VarUInt that
+        // carries the sparse end-of-granule marker bit, 1<<62) that would
+        // otherwise abort the process with a multi-exabyte allocation. 4 GiB is
+        // far above any real ClickHouse string.
+        const MAX_STRING_LEN: usize = 1 << 32;
+        if l > MAX_STRING_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("string length {l} exceeds sanity bound — stream is misaligned"),
+            ));
+        }
         let mut buf: Vec<u8> = vec![0; l];
 
         self.read_exact(&mut buf)?;
@@ -232,6 +243,17 @@ mod tests {
     fn decode(bytes: &[u8]) -> u64 {
         let mut cursor = Cursor::new(bytes);
         cursor.read_varuint().unwrap()
+    }
+
+    #[test]
+    fn read_string_rejects_insane_length() {
+        // A VarUInt length carrying the sparse end-of-granule bit (1<<62) must
+        // be rejected, not turned into a multi-exabyte allocation.
+        let mut bytes = Vec::new();
+        bytes.write_varuint(1u64 << 62).unwrap();
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let err = cursor.read_string().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

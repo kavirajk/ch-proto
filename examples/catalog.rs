@@ -73,6 +73,7 @@ fn main() -> Result<()> {
         info: Some(BlockInfo {
             overflows: false,
             bucket_number: -1,
+            out_of_order_buckets: Vec::new(),
         }),
         columns: vec![
             col(
