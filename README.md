@@ -1,3 +1,5 @@
+**This Repository is deprecated and no longer used for any purposes. The specifications that came out of it is [already merged and part of ClickHouse core repository](https://github.com/ClickHouse/ClickHouse/pull/106720)**
+
 # ch-proto
 
 A from-scratch implementation and language-agnostic specification of the **ClickHouse native TCP protocol** and **Native columnar format**, built phase-by-phase against a real ClickHouse server.
